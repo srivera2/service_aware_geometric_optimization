@@ -7,6 +7,8 @@ Helps distinguish between:
 - Poorly configured optimization
 """
 
+# Making a simple change to test uploading to git
+
 import numpy as np
 import matplotlib.pyplot as plt
 
