@@ -13,6 +13,7 @@ import mitsuba as mi
 from sionna.rt import PathSolver, Receiver, cpx_abs_square
 import time
 from shapely.geometry import Point, Polygon
+from tx_placement import TxPlacement
 
 
 def create_optimization_gif(frame_dir, output_path="optimization.gif", duration=200, loop=0):
@@ -86,42 +87,6 @@ def create_optimization_gif(frame_dir, output_path="optimization.gif", duration=
     print(f"  Total duration: {len(images) * duration / 1000:.1f}s")
 
     return output_path
-
-
-def project_to_polygon(x, y, polygon_vertices):
-    """
-    Project point (x, y) to nearest valid point inside/on polygon.
-
-    Parameters:
-    -----------
-    x : float
-        X coordinate
-    y : float
-        Y coordinate
-    polygon_vertices : numpy array
-        Nx3 array of polygon vertices (x, y, z)
-
-    Returns:
-    --------
-    proj_x : float
-        Projected X coordinate
-    proj_y : float
-        Projected Y coordinate
-    """
-    # Extract 2D coordinates from vertices
-    vertices_2d = polygon_vertices[:, :2]  # Take only x, y columns
-
-    point = Point(float(x), float(y))
-    poly = Polygon(vertices_2d)
-
-    # If inside, return as-is
-    if poly.contains(point) or poly.touches(point):
-        return float(x), float(y)
-
-    # If outside, project to nearest point on boundary
-    boundary = poly.boundary
-    nearest_point = boundary.interpolate(boundary.project(point))
-    return float(nearest_point.x), float(nearest_point.y)
 
 
 def estimate_achievable_power(
@@ -600,7 +565,7 @@ def optimize_boresight_pathsolver(
     scene,
     tx_name,
     map_config,
-    building_info,
+    scene_xml_path,
     target_map,
     initial_boresight=[100.0, 100.0, 10.0],
     num_sample_points=100,
@@ -611,6 +576,7 @@ def optimize_boresight_pathsolver(
     normalize_power=False,
     verbose=True,
     seed=42,  # Random seed for reproducible sampling
+    tx_placement_mode="center", # "center", "fixed", "line"
     # If true, the center position of the roof polygon is used
     # Else, use the start position
     Tx_Center=True,
@@ -654,16 +620,24 @@ def optimize_boresight_pathsolver(
     tx = scene.get(tx_name)
     tx_height = float(dr.detach(tx.position[2])[0])
 
-    # Pulls the building from the list of available buildings
-    building = building_info[building_id]
+    # Initialize TxPlacement
+    tx_placement = TxPlacement(scene, tx_name, scene_xml_path, building_id)
 
     # Sets the initial location
-    if Tx_Center == True:
-        x_start_position = building["center"][0]
-        y_start_position = building["center"][1]
-    else:
+    if tx_placement_mode == "center":
+        tx_placement.set_rooftop_center()
+        x_start_position = tx_placement.building["center"][0]
+        y_start_position = tx_placement.building["center"][1]
+    elif tx_placement_mode == "fixed":
         x_start_position = Tx_start_pos[0]
         y_start_position = Tx_start_pos[1]
+        z_pos = tx_placement.building["z_height"]
+        tx.position = mi.Point3f(x_start_position, y_start_position, z_pos)
+    else: # Default to center
+        tx_placement.set_rooftop_center()
+        x_start_position = tx_placement.building["center"][0]
+        y_start_position = tx_placement.building["center"][1]
+
 
     if verbose:
         print(f"TX height: {tx_height:.1f}m")
@@ -1208,10 +1182,9 @@ def optimize_boresight_pathsolver(
             boresight_z.clamp_(min=-10.0, max=tx_height - 0.1)
 
             # Project TX position to stay within roof polygon
-            # proj_x, proj_y = project_to_polygon(
+            # proj_x, proj_y = tx_placement.project_to_polygon(
             #    tx_x.item(),
-            #    tx_y.item(),
-            #    building["vertices"]
+            #    tx_y.item()
             # )
             # tx_x.fill_(proj_x)
             # tx_y.fill_(proj_y)
