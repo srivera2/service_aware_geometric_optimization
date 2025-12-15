@@ -16,9 +16,10 @@ from shapely.geometry import Point, Polygon
 from tx_placement import TxPlacement
 
 
-def create_optimization_gif(frame_dir, output_path="optimization.gif", duration=200, loop=0):
+def create_optimization_gif(frame_dir, output_path="optimization.gif", duration=200, loop=0,
+                           sector_angles=None, tx_position=None, map_config=None):
     """
-    Create GIF from saved optimization frames
+    Create GIF from saved optimization frames with optional sector coverage overlay
 
     Parameters:
     -----------
@@ -30,6 +31,17 @@ def create_optimization_gif(frame_dir, output_path="optimization.gif", duration=
         Duration of each frame in milliseconds (default: 200ms)
     loop : int
         Number of times to loop (0 = infinite)
+    sector_angles : list of dict or None
+        List of sector definitions to overlay on frames. Each dict should contain:
+        - 'angle_start': Start angle in degrees (0° = East, counter-clockwise)
+        - 'angle_end': End angle in degrees
+        - 'color': (Optional) Color for the sector overlay (default: 'red')
+        - 'alpha': (Optional) Transparency for the sector (default: 0.2)
+        Example: [{'angle_start': 0, 'angle_end': 120, 'color': 'red', 'alpha': 0.2}]
+    tx_position : tuple or None
+        (x, y, z) position of transmitter for sector overlay origin
+    map_config : dict or None
+        Map configuration with 'center', 'size'. Required if sector_angles is provided.
 
     Returns:
     --------
@@ -39,8 +51,12 @@ def create_optimization_gif(frame_dir, output_path="optimization.gif", duration=
     import glob
     try:
         from PIL import Image
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as patches
+        from matplotlib.patches import Wedge
+        import io
     except ImportError:
-        print("PIL not found, trying imageio...")
+        print("PIL or matplotlib not found, trying imageio...")
         import imageio
 
         # Get all frame files in order
@@ -68,8 +84,100 @@ def create_optimization_gif(frame_dir, output_path="optimization.gif", duration=
 
     print(f"Creating GIF from {len(frame_files)} frames...")
 
-    # Load images
-    images = [Image.open(f) for f in frame_files]
+    # Process frames with sector overlay if requested
+    if sector_angles is not None and tx_position is not None and map_config is not None:
+        print(f"Adding sector overlays to frames...")
+        processed_images = []
+
+        for frame_file in frame_files:
+            # Load the frame
+            img = Image.open(frame_file)
+
+            # Create figure from image
+            fig, ax = plt.subplots(figsize=(img.width/100, img.height/100), dpi=100)
+            ax.imshow(img)
+            ax.axis('off')
+
+            # Calculate sector overlay position
+            # Map tx_position to image coordinates
+            center_x, center_y, _ = map_config['center']
+            width_m, height_m = map_config['size']
+
+            # Image extent (data coordinates)
+            extent = [
+                center_x - width_m / 2,
+                center_x + width_m / 2,
+                center_y - height_m / 2,
+                center_y + height_m / 2,
+            ]
+
+            # TX position in data coordinates
+            # Convert to float to handle numpy arrays or mitsuba objects
+            tx_x = float(tx_position[0])
+            tx_y = float(tx_position[1])
+
+            # Calculate radius for sector visualization (should cover the map)
+            max_radius = float(np.sqrt(width_m**2 + height_m**2))
+
+            # Draw each sector
+            for sector in sector_angles:
+                angle_start = sector['angle_start']
+                angle_end = sector['angle_end']
+                color = sector.get('color', 'red')
+                alpha = sector.get('alpha', 0.2)
+
+                # Convert angles: matplotlib uses degrees counter-clockwise from East
+                # Our convention: 0° = East, counter-clockwise
+                # matplotlib Wedge: theta1 is start, theta2 is end (counter-clockwise from East)
+
+                # Handle wraparound case (e.g., sector from 350° to 10°)
+                if angle_end < angle_start:
+                    # Draw two wedges: one from angle_start to 360, another from 0 to angle_end
+                    wedge1 = Wedge((tx_x, tx_y), max_radius, angle_start, 360,
+                                  facecolor=color, edgecolor=color, alpha=alpha, linewidth=2)
+                    wedge2 = Wedge((tx_x, tx_y), max_radius, 0, angle_end,
+                                  facecolor=color, edgecolor=color, alpha=alpha, linewidth=2)
+                    ax.add_patch(wedge1)
+                    ax.add_patch(wedge2)
+
+                    # Draw boundary lines
+                    for angle_deg in [angle_start, angle_end]:
+                        angle_rad = np.radians(angle_deg)
+                        dx = max_radius * np.cos(angle_rad)
+                        dy = max_radius * np.sin(angle_rad)
+                        ax.plot([tx_x, tx_x + dx], [tx_y, tx_y + dy],
+                               color=color, linewidth=2, alpha=0.8)
+                else:
+                    # Normal sector
+                    wedge = Wedge((tx_x, tx_y), max_radius, angle_start, angle_end,
+                                 facecolor=color, edgecolor=color, alpha=alpha, linewidth=2)
+                    ax.add_patch(wedge)
+
+                    # Draw boundary lines to make sector more visible
+                    for angle_deg in [angle_start, angle_end]:
+                        angle_rad = np.radians(angle_deg)
+                        dx = max_radius * np.cos(angle_rad)
+                        dy = max_radius * np.sin(angle_rad)
+                        ax.plot([tx_x, tx_x + dx], [tx_y, tx_y + dy],
+                               color=color, linewidth=2, alpha=0.8)
+
+            # Set the correct limits to match the original image
+            ax.set_xlim(extent[0], extent[1])
+            ax.set_ylim(extent[2], extent[3])
+
+            # Save to buffer
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png', dpi=100, bbox_inches='tight', pad_inches=0)
+            buf.seek(0)
+            processed_img = Image.open(buf)
+            processed_images.append(processed_img.copy())
+            buf.close()
+            plt.close(fig)
+
+        images = processed_images
+    else:
+        # Load images without modification
+        images = [Image.open(f) for f in frame_files]
 
     # Save as GIF
     images[0].save(
@@ -134,6 +242,16 @@ def estimate_achievable_power(
     tx_x, tx_y, tx_z = tx_position
     center_x, center_y, center_z = map_config["center"]
     width_m, height_m = map_config["size"]
+
+    # Convert to scalars to avoid numpy array propagation
+    tx_x = float(tx_x)
+    tx_y = float(tx_y)
+    tx_z = float(tx_z)
+    center_x = float(center_x)
+    center_y = float(center_y)
+    center_z = float(center_z)
+    width_m = float(width_m)
+    height_m = float(height_m)
 
     # Compute distances to key map locations
     # Center of map (ground level)
@@ -576,7 +694,7 @@ def optimize_boresight_pathsolver(
     normalize_power=False,
     verbose=True,
     seed=42,  # Random seed for reproducible sampling
-    tx_placement_mode="center", # "center", "fixed", "line"
+    tx_placement_mode="skip", # "center", "fixed", "line", "skip" (skip = don't move TX)
     # If true, the center position of the roof polygon is used
     # Else, use the start position
     Tx_Center=True,
@@ -594,6 +712,15 @@ def optimize_boresight_pathsolver(
     - Use @dr.wrap to enable PyTorch-DrJit AD
     - Use PathSolver (not RadioMapSolver) for gradient computation
     - Sample grid points as receivers
+
+    Parameters:
+    -----------
+    tx_placement_mode : str, default="skip"
+        How to handle transmitter placement:
+        - "skip": Don't move TX (use current position from scene)
+        - "center": Place TX at center of building_id roof
+        - "fixed": Place TX at Tx_start_pos on building_id roof
+        - "line": Use line manifold optimization (not fully implemented)
     """
 
     if verbose:
@@ -620,23 +747,31 @@ def optimize_boresight_pathsolver(
     tx = scene.get(tx_name)
     tx_height = float(dr.detach(tx.position[2])[0])
 
-    # Initialize TxPlacement
-    tx_placement = TxPlacement(scene, tx_name, scene_xml_path, building_id)
+    # Handle TX placement based on mode
+    if tx_placement_mode == "skip":
+        # Don't move the TX - use its current position
+        # This is useful when TX was already placed correctly before calling optimization
+        x_start_position = float(dr.detach(tx.position[0])[0])
+        y_start_position = float(dr.detach(tx.position[1])[0])
+        if verbose:
+            print(f"TX placement mode: skip (using current position)")
+            print(f"  Current TX position: ({x_start_position:.2f}, {y_start_position:.2f}, {tx_height:.2f})")
+    else:
+        # Initialize TxPlacement for modes that need to move the TX
+        tx_placement = TxPlacement(scene, tx_name, scene_xml_path, building_id)
 
-    # Sets the initial location
-    if tx_placement_mode == "center":
-        tx_placement.set_rooftop_center()
-        x_start_position = tx_placement.building["center"][0]
-        y_start_position = tx_placement.building["center"][1]
-    elif tx_placement_mode == "fixed":
-        x_start_position = Tx_start_pos[0]
-        y_start_position = Tx_start_pos[1]
-        z_pos = tx_placement.building["z_height"]
-        tx.position = mi.Point3f(x_start_position, y_start_position, z_pos)
-    else: # Default to center
-        tx_placement.set_rooftop_center()
-        x_start_position = tx_placement.building["center"][0]
-        y_start_position = tx_placement.building["center"][1]
+        # Sets the initial location based on mode
+        if tx_placement_mode == "center":
+            tx_placement.set_rooftop_center()
+            x_start_position = tx_placement.building["center"][0]
+            y_start_position = tx_placement.building["center"][1]
+        elif tx_placement_mode == "fixed":
+            x_start_position = Tx_start_pos[0]
+            y_start_position = Tx_start_pos[1]
+            z_pos = tx_placement.building["z_height"]
+            tx.position = mi.Point3f(x_start_position, y_start_position, z_pos)
+        else:
+            raise ValueError(f"Unknown tx_placement_mode: {tx_placement_mode}. Must be 'skip', 'center', 'fixed', or 'line'")
 
 
     if verbose:
@@ -673,14 +808,19 @@ def optimize_boresight_pathsolver(
             f"Target values range: [{target_values.min():.1f}, {target_values.max():.1f}] dB"
         )
 
+    # CRITICAL: Remove ALL existing receivers from the scene first
+    # This ensures paths.a indexing matches our optimization receivers exactly
+    existing_receivers = list(scene.receivers.keys())
+    if verbose and existing_receivers:
+        print(f"Removing {len(existing_receivers)} existing receiver(s): {existing_receivers}")
+    for rx_name in existing_receivers:
+        scene.remove(rx_name)
+
     # Add receivers to scene
     rx_names = []
     for idx, position in enumerate(sample_points):
         rx_name = f"opt_rx_{idx}"
         rx_names.append(rx_name)
-        # Remove if exists
-        if rx_name in [obj.name for obj in scene.receivers.values()]:
-            scene.remove(rx_name)
         # Convert to float32 to avoid type errors with Mitsuba
         position_f32 = [float(position[0]), float(position[1]), float(position[2])]
         rx = Receiver(name=rx_name, position=position_f32)
@@ -735,6 +875,27 @@ def optimize_boresight_pathsolver(
 
         # Extract channel coefficients
         h_real, h_imag = paths.a
+
+        # DEBUG: Verify channel coefficient shapes match expectations
+        # Expected shape: (num_receivers, num_tx_antennas, num_rx_antennas, num_paths)
+        h_real_shape = dr.shape(h_real)
+        if verbose and h_real_shape[0] != num_sample_points:
+            print(f"  [WARNING] Channel coefficient shape mismatch!")
+            print(f"    Expected {num_sample_points} receivers, got {h_real_shape[0]}")
+            print(f"    Full h_real shape: {h_real_shape}")
+
+        # DEBUG: Check if any paths were found (only print on first call)
+        # We use a simple flag via a mutable default to track first call
+        if not hasattr(compute_loss, '_first_call_done'):
+            compute_loss._first_call_done = False
+
+        if verbose and not compute_loss._first_call_done:
+            compute_loss._first_call_done = True
+            # Compute total power across all receivers as a quick check
+            total_power = dr.sum(dr.sum(cpx_abs_square((h_real, h_imag))))
+            print(f"  [DEBUG] Total path power (linear): {total_power}")
+            if total_power < 1e-25:
+                print(f"  [WARNING] Very low or zero path power - PathSolver may not be finding paths!")
 
         # Store values for logging (optional)
         loss_target = []
@@ -1081,14 +1242,24 @@ def optimize_boresight_pathsolver(
 
     start_time = time.time()
 
+    # Verify scene state before optimization
+    if verbose:
+        print(f"\nScene verification before optimization:")
+        print(f"  Number of receivers: {len(scene.receivers)}")
+        print(f"  Number of transmitters: {len(scene.transmitters)}")
+        tx = scene.get(tx_name)
+        print(f"  TX '{tx_name}' position: {tx.position}")
+        print(f"  TX '{tx_name}' orientation: {tx.orientation}")
+        print()
+
     # Run the optimization for the specified number of iterations
     for iteration in range(num_iterations):
 
-        # if verbose:
-        #    print(f"\nIteration {iteration+1}/{num_iterations}:")
-        #    print(
-        #        f"  Boresight: ({boresight_x.item():.2f}, {boresight_y.item():.2f}, {boresight_z.item():.2f})"
-        #    )
+        if verbose and iteration == 0:
+            print(f"\nIteration {iteration+1}/{num_iterations}:")
+            print(
+                f"  Boresight: ({boresight_x.item():.2f}, {boresight_y.item():.2f}, {boresight_z.item():.2f})"
+            )
 
         # Forward pass
         loss = compute_loss(boresight_x, boresight_y, boresight_z)
