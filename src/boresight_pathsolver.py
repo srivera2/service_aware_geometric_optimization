@@ -740,17 +740,48 @@ def compare_boresight_performance(
         # Extract power values in zone only
         zone_power = signal_strength_dBm[zone_mask == 1.0]
 
+        # Filter out dead zones (values below -200 dBm are likely numerical artifacts)
+        # Dead zones occur when PathSolver finds no propagation paths
+        DEAD_ZONE_THRESHOLD = -200.0  # dBm
+        live_zone_power = zone_power[zone_power > DEAD_ZONE_THRESHOLD]
+
+        # Compute statistics on live points only (exclude dead zones)
+        # This gives more meaningful metrics for coverage quality
+        if len(live_zone_power) > 0:
+            mean_val = np.mean(live_zone_power)
+            median_val = np.median(live_zone_power)
+            std_val = np.std(live_zone_power)
+            min_val = np.min(live_zone_power)
+            max_val = np.max(live_zone_power)
+            p10_val = np.percentile(live_zone_power, 10)
+            p90_val = np.percentile(live_zone_power, 90)
+            coverage_fraction = len(live_zone_power) / len(zone_power)
+        else:
+            # All points are dead zones - use raw values
+            mean_val = np.mean(zone_power)
+            median_val = np.median(zone_power)
+            std_val = np.std(zone_power)
+            min_val = np.min(zone_power)
+            max_val = np.max(zone_power)
+            p10_val = np.percentile(zone_power, 10)
+            p90_val = np.percentile(zone_power, 90)
+            coverage_fraction = 0.0
+
         # Store results
         results[config_name] = {
-            'power_values': zone_power,
+            'power_values': zone_power,  # Keep all values for plotting
+            'live_power_values': live_zone_power,  # Only live points
             'radiomap': signal_strength_dBm,
-            'mean': np.mean(zone_power),
-            'median': np.median(zone_power),
-            'std': np.std(zone_power),
-            'min': np.min(zone_power),
-            'max': np.max(zone_power),
-            'p10': np.percentile(zone_power, 10),
-            'p90': np.percentile(zone_power, 90),
+            'mean': mean_val,
+            'median': median_val,
+            'std': std_val,
+            'min': min_val,
+            'max': max_val,
+            'p10': p10_val,
+            'p90': p90_val,
+            'coverage_fraction': coverage_fraction,  # Fraction of zone with actual coverage
+            'num_live_points': len(live_zone_power),
+            'num_total_points': len(zone_power),
         }
 
     # Calculate improvement
@@ -763,6 +794,7 @@ def compare_boresight_performance(
     # Determine data range for better visualization
     all_power = np.concatenate([results['Naive Baseline']['power_values'],
                                  results['Optimized']['power_values']])
+    
     # Filter out dead zones for range calculation
     live_power = all_power[all_power > -269]
     if len(live_power) > 0:
@@ -780,10 +812,10 @@ def compare_boresight_performance(
     ax.hist(results['Optimized']['power_values'], bins=bins, alpha=0.6,
             label='Optimized', color='green', density=True)
     ax.axvline(results['Naive Baseline']['mean'], color='orange', linestyle='--',
-               linewidth=2, label=f"Naive Mean: {results['Naive Baseline']['mean']:.1f} dBm")
+               linewidth=2, label=f"Naive Mean: {results['Naive Baseline']['mean']:.1f} dB")
     ax.axvline(results['Optimized']['mean'], color='green', linestyle='--',
-               linewidth=2, label=f"Optimized Mean: {results['Optimized']['mean']:.1f} dBm")
-    ax.set_xlabel('Signal Strength (dBm)')
+               linewidth=2, label=f"Optimized Mean: {results['Optimized']['mean']:.1f} dB")
+    ax.set_xlabel('Signal Strength (dB)')
     ax.set_ylabel('Probability Density')
     ax.set_title('Power Distribution in Coverage Zone (PDF)')
     ax.legend(fontsize=9)
@@ -802,9 +834,9 @@ def compare_boresight_performance(
         # Mark median
         median = results[config_name]['median']
         ax.axvline(median, color=color, linestyle='--', alpha=0.5,
-                   label=f"{config_name} Median: {median:.1f} dBm")
+                   label=f"{config_name} Median: {median:.1f} dB")
 
-    ax.set_xlabel('Signal Strength (dBm)')
+    ax.set_xlabel('Signal Strength (dB)')
     ax.set_ylabel('Cumulative Probability')
     ax.set_title('Cumulative Distribution Function (CDF)')
     ax.legend(fontsize=9)
@@ -820,7 +852,7 @@ def compare_boresight_performance(
                     patch_artist=True, showmeans=True)
     bp['boxes'][0].set_facecolor('orange')
     bp['boxes'][1].set_facecolor('green')
-    ax.set_ylabel('Signal Strength (dBm)')
+    ax.set_ylabel('Signal Strength (dB)')
     ax.set_title('Power Distribution Comparison (Box Plot)')
     ax.grid(True, alpha=0.3, axis='y')
 
@@ -843,23 +875,23 @@ def compare_boresight_performance(
 
     stats_data = [
         ['Metric', 'Naive Baseline', 'Optimized', 'Improvement'],
-        ['Mean (dBm)', f"{results['Naive Baseline']['mean']:.2f}",
+        ['Mean (dB)', f"{results['Naive Baseline']['mean']:.2f}",
          f"{results['Optimized']['mean']:.2f}", format_improvement(improvement_mean)],
-        ['Median (dBm)', f"{results['Naive Baseline']['median']:.2f}",
+        ['Median (dB)', f"{results['Naive Baseline']['median']:.2f}",
          f"{results['Optimized']['median']:.2f}", format_improvement(improvement_median)],
         ['Std Dev (dB)', f"{results['Naive Baseline']['std']:.2f}",
          f"{results['Optimized']['std']:.2f}",
          format_improvement(results['Optimized']['std'] - results['Naive Baseline']['std'])],
-        ['Min (dBm)', f"{results['Naive Baseline']['min']:.2f}",
+        ['Min (dB)', f"{results['Naive Baseline']['min']:.2f}",
          f"{results['Optimized']['min']:.2f}",
          format_improvement(results['Optimized']['min'] - results['Naive Baseline']['min'])],
-        ['Max (dBm)', f"{results['Naive Baseline']['max']:.2f}",
+        ['Max (dB)', f"{results['Naive Baseline']['max']:.2f}",
          f"{results['Optimized']['max']:.2f}",
          format_improvement(results['Optimized']['max'] - results['Naive Baseline']['max'])],
-        ['10th %ile (dBm)', f"{results['Naive Baseline']['p10']:.2f}",
+        ['10th %ile (dB)', f"{results['Naive Baseline']['p10']:.2f}",
          f"{results['Optimized']['p10']:.2f}",
          format_improvement(results['Optimized']['p10'] - results['Naive Baseline']['p10'])],
-        ['90th %ile (dBm)', f"{results['Naive Baseline']['p90']:.2f}",
+        ['90th %ile (dB)', f"{results['Naive Baseline']['p90']:.2f}",
          f"{results['Optimized']['p90']:.2f}",
          format_improvement(results['Optimized']['p90'] - results['Naive Baseline']['p90'])],
     ]
@@ -900,8 +932,8 @@ def compare_boresight_performance(
     print(f"\n{'='*70}")
     print("COMPARISON SUMMARY")
     print(f"{'='*70}")
-    print(f"Naive Baseline Mean:  {results['Naive Baseline']['mean']:.2f} dBm")
-    print(f"Optimized Mean:       {results['Optimized']['mean']:.2f} dBm")
+    print(f"Naive Baseline Mean:  {results['Naive Baseline']['mean']:.2f} dB")
+    print(f"Optimized Mean:       {results['Optimized']['mean']:.2f} dB")
     print(f"Improvement:          +{improvement_mean:.2f} dB ({stats['improvement_percent']:.1f}%)")
     print(f"{'='*70}\n")
 
@@ -1058,7 +1090,7 @@ def grid_search_initial_boresight(
                 specular_reflection=True,
                 diffuse_reflection=True,
                 diffraction=True,
-                edge_diffraction=False
+                edge_diffraction=True
             )
 
             # Compute mean power in zone
@@ -1087,7 +1119,7 @@ def grid_search_initial_boresight(
                 'azimuth_deg': azimuth_deg,
                 'elevation_deg': elevation_deg,
                 'boresight': [target_x, target_y, target_z],
-                'mean_power_dbm': mean_power,
+                'mean_power_db': mean_power,
             })
 
             if mean_power > best_mean_power:
@@ -1095,9 +1127,9 @@ def grid_search_initial_boresight(
                 best_boresight = [target_x, target_y, target_z]
 
                 if verbose:
-                    print(f"[{test_idx}/{total_tests}] NEW BEST: Az={azimuth_deg:.0f}°, El={elevation_deg:.0f}° → {mean_power:.1f} dBm")
+                    print(f"[{test_idx}/{total_tests}] NEW BEST: Az={azimuth_deg:.0f}°, El={elevation_deg:.0f}° → {mean_power:.1f} dB")
             elif verbose and test_idx % 5 == 0:
-                print(f"[{test_idx}/{total_tests}] Az={azimuth_deg:.0f}°, El={elevation_deg:.0f}° → {mean_power:.1f} dBm")
+                print(f"[{test_idx}/{total_tests}] Az={azimuth_deg:.0f}°, El={elevation_deg:.0f}° → {mean_power:.1f} dB")
 
     # Cleanup receivers
     for rx_name in rx_names:
@@ -1109,7 +1141,7 @@ def grid_search_initial_boresight(
         print("Grid Search Complete!")
         print(f"{'='*70}")
         print(f"Best boresight: ({best_boresight[0]:.1f}, {best_boresight[1]:.1f}, {best_boresight[2]:.1f})")
-        print(f"Best mean power: {best_mean_power:.1f} dBm")
+        print(f"Best mean power: {best_mean_power:.1f} dB")
         print(f"{'='*70}\n")
 
     return best_boresight, best_mean_power, grid_results
@@ -1131,15 +1163,10 @@ def optimize_boresight_pathsolver(
     use_grid_search_init=False,
     grid_search_params=None,
     verbose=True,
-<<<<<<< HEAD
-    seed=42,
-    tx_placement_mode="center",
-=======
     seed=42,  # Random seed for reproducible sampling
     tx_placement_mode="skip", # "center", "fixed", "line", "skip" (skip = don't move TX)
     # If true, the center position of the roof polygon is used
     # Else, use the start position
->>>>>>> a438e78f34c4717a1d3ce99fffabe08efc07375e
     Tx_Center=True,
     Tx_start_pos=[0.0, 0.0],
     save_radiomap_frames=False,
@@ -1147,151 +1174,13 @@ def optimize_boresight_pathsolver(
     output_dir="./optimization_frames",
 ):
     """
-    Optimize boresight to maximize coverage in a target zone using binary mask.
+    Optimize boresight using PathSolver with automatic differentiation
 
-<<<<<<< HEAD
-    NEW APPROACH (Binary Mask):
-    ---------------------------
-    Instead of matching target power levels, this optimizer maximizes coverage
-    within a user-defined zone (created by create_zone_mask). The goal is to
-    lift the median/mean power level in the zone as high as possible.
-
-    Loss Functions:
-    ---------------
-    1. 'coverage_maximize' (RECOMMENDED):
-       Maximizes mean power in zone while penalizing variance.
-       Loss = -mean(power_in_zone_dBm) + 0.01 * variance(power_in_zone_dBm)
-       Goal: High, uniform coverage across the entire zone.
-       Note: Variance penalty weight is hardcoded to 0.01 (balanced default).
-
-    2. 'coverage_threshold':
-       Maximizes percentage of zone above a power threshold.
-       Loss = -fraction_above_threshold
-       Goal: Ensure most of zone meets minimum power requirement.
-
-    3. 'percentile_maximize':
-       Maximizes the Nth percentile (e.g., median) power in zone.
-       Loss = -percentile(power_in_zone, N)
-       Goal: Lift the worst-case coverage in the zone.
-
-    Parameters:
-    -----------
-    scene : sionna.rt.Scene
-        The scene containing transmitters and geometry
-    tx_name : str
-        Name of the transmitter to optimize
-    map_config : dict
-        Map configuration (same format as create_zone_mask)
-    scene_xml_path : str
-        Path to scene XML file
-    zone_mask : np.ndarray
-        Binary mask from create_zone_mask (1.0 = in zone, 0.0 = out of zone)
-    initial_boresight : list
-        Initial [x, y, z] look-at position
-    num_sample_points : int
-        Number of receiver sample points
-    building_id : int
-        Building ID for TX placement
-    learning_rate : float
-        Optimizer learning rate
-    num_iterations : int
-        Number of optimization iterations
-    loss_type : str
-        Type of loss function:
-        - 'coverage_maximize': Maximize mean power in zone (default)
-        - 'coverage_threshold': Maximize fraction above threshold
-        - 'percentile_maximize': Maximize median/percentile power
-    power_threshold_dbm : float
-        Minimum acceptable power level (used for 'coverage_threshold')
-    use_grid_search_init : bool
-        If True, perform coarse grid search before gradient optimization (default: False)
-    grid_search_params : dict, optional
-        Parameters for grid search initialization:
-        - 'num_angular_samples': Number of azimuth angles (default: 12)
-        - 'num_elevation_samples': Number of elevation angles (default: 5)
-        - 'min_elevation_deg': Min elevation (default: 0)
-        - 'max_elevation_deg': Max elevation (default: -45)
-        - 'radius_meters': Boresight distance (default: 100.0)
-        - 'num_sample_points': Sample points for grid search (default: 50)
-    verbose : bool
-        Print optimization progress
-    seed : int
-        Random seed for reproducible sampling
-    tx_placement_mode : str
-        TX placement mode ('center', 'fixed', 'line')
-    save_radiomap_frames : bool
-        Save RadioMap visualization at each iteration
-    frame_save_interval : int
-        Save frame every N iterations
-    output_dir : str
-        Directory to save frames
-
-    Returns:
-    --------
-    best_boresight : list
-        Optimized [x, y, z] boresight position
-    loss_history : list
-        Loss value at each iteration
-    boresight_history : list
-        Boresight position at each iteration
-    gradient_history : list
-        Gradient norm at each iteration
-    coverage_stats : dict
-        Final coverage statistics in the zone
-=======
     This follows the rm_diff.ipynb pattern:
     - Use @dr.wrap to enable PyTorch-DrJit AD
     - Use PathSolver (not RadioMapSolver) for gradient computation
     - Sample grid points as receivers
-
-    Parameters:
-    -----------
-    tx_placement_mode : str, default="skip"
-        How to handle transmitter placement:
-        - "skip": Don't move TX (use current position from scene)
-        - "center": Place TX at center of building_id roof
-        - "fixed": Place TX at Tx_start_pos on building_id roof
-        - "line": Use line manifold optimization (not fully implemented)
->>>>>>> a438e78f34c4717a1d3ce99fffabe08efc07375e
     """
-
-    # Perform grid search for initialization if requested
-    if use_grid_search_init:
-        if verbose:
-            print("Using grid search to find initial boresight...")
-
-        # Set default grid search parameters
-        default_grid_params = {
-            'num_angular_samples': 12,
-            'num_elevation_samples': 5,
-            'min_elevation_deg': 0,
-            'max_elevation_deg': -45,
-            'radius_meters': 100.0,
-            'num_sample_points': 50,
-        }
-
-        # Override with user-provided parameters
-        if grid_search_params is not None:
-            default_grid_params.update(grid_search_params)
-
-        # Run grid search
-        grid_boresight, grid_mean_power, grid_results = grid_search_initial_boresight(
-            scene=scene,
-            tx_name=tx_name,
-            map_config=map_config,
-            zone_mask=zone_mask,
-            seed=seed,
-            verbose=verbose,
-            **default_grid_params
-        )
-
-        # Use grid search result as initial boresight
-        initial_boresight = grid_boresight
-
-        if verbose:
-            print(f"Grid search found initial boresight: ({initial_boresight[0]:.1f}, {initial_boresight[1]:.1f}, {initial_boresight[2]:.1f})")
-            print(f"Grid search mean power: {grid_mean_power:.1f} dBm")
-            print("Starting gradient-based optimization from this point...\n")
 
     if verbose:
         print(f"\n{'='*70}")
@@ -1300,32 +1189,77 @@ def optimize_boresight_pathsolver(
         print(
             f"Initial boresight: ({initial_boresight[0]:.1f}, {initial_boresight[1]:.1f}, {initial_boresight[2]:.1f})"
         )
+        print(f"Use grid search init: {use_grid_search_init}")
         print(f"Learning rate: {learning_rate}")
         print(f"Iterations: {num_iterations}")
         print(f"Sample points: {num_sample_points}")
         print(f"Loss type: {loss_type}")
         if loss_type == "coverage_threshold":
-            print(f"Power threshold: {power_threshold_dbm:.1f} dBm")
+            print(f"Power threshold: {power_threshold_dbm:.1f} dB")
         print(f"Map config: {map_config}")
         print(f"{'='*70}\n")
+
+    # Run grid search for initial boresight if requested
+    if use_grid_search_init:
+        if verbose:
+            print("\n" + "="*70)
+            print("PHASE 1: Grid Search for Initial Boresight")
+            print("="*70 + "\n")
+
+        # Set default grid search parameters if not provided
+        # These defaults provide a good balance between coverage and speed:
+        # - 16 azimuth samples (every 22.5°) gives full 360° coverage
+        # - 5 elevation samples from 0° to -45° covers typical downward tilt range
+        # - 100m radius is reasonable for most urban scenarios
+        # - 50 sample points makes grid search fast while still accurate
+        if grid_search_params is None:
+            grid_search_params = {
+                'num_angular_samples': 16,      # Test every 22.5° (full circle)
+                'num_elevation_samples': 5,     # Test 5 elevations from 0° to -45°
+                'min_elevation_deg': 0,         # Horizontal (0° = level with horizon)
+                'max_elevation_deg': -45,       # 45° downward tilt
+                'radius_meters': 100.0,         # 100m distance to boresight target
+                'num_sample_points': 50,        # 50 sample points for evaluation
+            }
+            if verbose:
+                print("Using default grid search parameters:")
+                print(f"  Angular samples: {grid_search_params['num_angular_samples']} (every {360/grid_search_params['num_angular_samples']:.1f}°)")
+                print(f"  Elevation samples: {grid_search_params['num_elevation_samples']} ({grid_search_params['min_elevation_deg']}° to {grid_search_params['max_elevation_deg']}°)")
+                print(f"  Radius: {grid_search_params['radius_meters']:.0f}m")
+                print(f"  Sample points: {grid_search_params['num_sample_points']}")
+                print(f"  Total directions to test: {grid_search_params['num_angular_samples'] * grid_search_params['num_elevation_samples']}\n")
+
+        # Run grid search
+        best_grid_boresight, best_grid_power, grid_results = grid_search_initial_boresight(
+            scene=scene,
+            tx_name=tx_name,
+            map_config=map_config,
+            zone_mask=zone_mask,
+            num_angular_samples=grid_search_params.get('num_angular_samples', 16),
+            num_elevation_samples=grid_search_params.get('num_elevation_samples', 5),
+            min_elevation_deg=grid_search_params.get('min_elevation_deg', 0),
+            max_elevation_deg=grid_search_params.get('max_elevation_deg', -45),
+            radius_meters=grid_search_params.get('radius_meters', 100.0),
+            num_sample_points=grid_search_params.get('num_sample_points', 50),
+            seed=seed,
+            verbose=verbose,
+        )
+
+        # Override initial boresight with grid search result
+        initial_boresight = best_grid_boresight
+
+        if verbose:
+            print("\n" + "="*70)
+            print("PHASE 2: Gradient-Based Refinement")
+            print("="*70)
+            print(f"Starting from grid search result: ({initial_boresight[0]:.1f}, {initial_boresight[1]:.1f}, {initial_boresight[2]:.1f})")
+            print(f"Grid search mean power: {best_grid_power:.1f} dB")
+            print("="*70 + "\n")
 
     # Get TX height for boresight Z constraint (prevent pointing upward)
     tx = scene.get(tx_name)
     tx_height = float(dr.detach(tx.position[2])[0])
 
-<<<<<<< HEAD
-    # IMPORTANT: Skip TX placement if it's already been set up in the notebook
-    # The TxPlacement code below was overriding user-configured TX positions
-    # Only initialize TxPlacement if tx_placement_mode is explicitly set
-    if tx_placement_mode == "fixed":
-        # Initialize TxPlacement only for fixed mode
-        tx_placement = TxPlacement(scene, tx_name, scene_xml_path, building_id)
-        x_start_position = Tx_start_pos[0]
-        y_start_position = Tx_start_pos[1]
-        z_pos = tx_placement.building["z_height"]
-        tx.position = mi.Point3f(x_start_position, y_start_position, z_pos)
-    # Otherwise, trust that the user has already placed the TX correctly
-=======
     # Handle TX placement based on mode
     if tx_placement_mode == "skip":
         # Don't move the TX - use its current position
@@ -1351,7 +1285,6 @@ def optimize_boresight_pathsolver(
             tx.position = mi.Point3f(x_start_position, y_start_position, z_pos)
         else:
             raise ValueError(f"Unknown tx_placement_mode: {tx_placement_mode}. Must be 'skip', 'center', 'fixed', or 'line'")
->>>>>>> a438e78f34c4717a1d3ce99fffabe08efc07375e
 
 
     if verbose:
@@ -1456,22 +1389,12 @@ def optimize_boresight_pathsolver(
             specular_reflection=True,
             diffuse_reflection=True,
             diffraction=True,
-            edge_diffraction=False
+            edge_diffraction=True  # Enable for better obstacle handling in heavily obstructed scenarios
         )
 
         # Extract channel coefficients
         h_real, h_imag = paths.a
 
-<<<<<<< HEAD
-        # NEW BINARY MASK APPROACH:
-        # ==========================
-        # Compute power at each receiver, then apply zone mask to focus
-        # optimization only on receivers inside the target zone.
-        #
-        # Loss = -mean(power_in_zone)  [maximize power in zone]
-        #
-        # Optional: Add variance penalty for uniform coverage
-=======
         # DEBUG: Verify channel coefficient shapes match expectations
         # Expected shape: (num_receivers, num_tx_antennas, num_rx_antennas, num_paths)
         h_real_shape = dr.shape(h_real)
@@ -1492,11 +1415,6 @@ def optimize_boresight_pathsolver(
             print(f"  [DEBUG] Total path power (linear): {total_power}")
             if total_power < 1e-25:
                 print(f"  [WARNING] Very low or zero path power - PathSolver may not be finding paths!")
-
-        # Store values for logging (optional)
-        loss_target = []
-        loss_his = []
->>>>>>> a438e78f34c4717a1d3ce99fffabe08efc07375e
 
         # Collect path gains for all receivers
         path_gains_db_list = []  # Store path gains in dB
@@ -1543,11 +1461,23 @@ def optimize_boresight_pathsolver(
 
         elif loss_type == "coverage_threshold":
             # COVERAGE THRESHOLD: Maximize fraction of zone above threshold
-            # Loss = -fraction_above_threshold
+            # IMPROVED VERSION with enhancements:
+            # 1. Smooth sigmoid for counting points above threshold
+            # 2. Margin bonus for exceeding threshold (prevents gradient saturation)
+            # 3. Soft-minimum penalty to eliminate dead zones/outliers below threshold
+            #
+            # The soft-minimum penalty is KEY for ensuring ALL points reach the threshold.
+            # It creates strong gradients toward improving the weakest points.
 
             count_above_threshold = dr.auto.ad.Float(0.0)
             count_in_zone = dr.auto.ad.Float(0.0)
             threshold = dr.auto.ad.Float(power_threshold_dbm)
+
+            # Track soft-minimum for worst-case penalty
+            # Soft-min gives strong gradients toward improving weakest points
+            # Lower alpha = sharper focus on worst points (more aggressive)
+            soft_min_alpha = dr.auto.ad.Float(5.0)  # 5 dB smoothing for soft-min
+            soft_min_sum = dr.auto.ad.Float(0.0)
 
             for rx_idx in range(num_sample_points):
                 in_zone = float(mask_values[rx_idx])
@@ -1556,20 +1486,47 @@ def optimize_boresight_pathsolver(
 
                 power_db = path_gains_db_list[rx_idx]
 
-                # Check if above threshold (use smooth approximation)
-                # Smooth step: sigmoid((power - threshold) / smoothness)
-                smoothness = dr.auto.ad.Float(5.0)  # 5 dB smoothing
+                # 1. Smooth sigmoid for counting points above threshold
+                distance_from_threshold = power_db - threshold
+                smoothness = dr.auto.ad.Float(8.0)  # 8 dB smoothing for sigmoid
+
                 above_threshold = dr.auto.ad.Float(1.0) / (
-                    dr.auto.ad.Float(1.0) + dr.exp(-(power_db - threshold) / smoothness)
+                    dr.auto.ad.Float(1.0) + dr.exp(-distance_from_threshold / smoothness)
                 )
 
-                count_above_threshold += in_zone_dr * above_threshold
+                # 2. Margin bonus for exceeding threshold
+                # This gives continuous gradients even when well above threshold
+                margin = dr.auto.ad.Float(5.0)  # 5 dB safety margin above threshold
+                excess_power = dr.maximum(distance_from_threshold - margin, dr.auto.ad.Float(0.0))
+                margin_bonus = excess_power / dr.auto.ad.Float(100.0)  # Small bonus to avoid dominating
+
+                count_above_threshold += in_zone_dr * (above_threshold + margin_bonus)
                 count_in_zone += in_zone_dr
 
+                # 3. Accumulate soft-minimum (focuses on worst points)
+                # soft_min ≈ -α * log(sum(exp(-x/α)))
+                # This heavily penalizes low outliers (dead zones)
+                soft_min_sum += in_zone_dr * dr.exp(-power_db / soft_min_alpha)
+
+            # Primary objective: maximize fraction above threshold
             fraction = count_above_threshold / dr.maximum(count_in_zone, dr.auto.ad.Float(1.0))
 
-            # Loss = -fraction (we want to maximize fraction)
-            normalized_loss = -fraction
+            # Soft-minimum of power in zone (approximates worst-case point)
+            # Lower soft_min = worse dead zones
+            soft_min_power = -soft_min_alpha * dr.log(soft_min_sum / dr.maximum(count_in_zone, dr.auto.ad.Float(1.0)))
+
+            # Worst-case penalty: penalize if worst point is below threshold
+            # This creates strong gradients to lift dead zones above threshold
+            # Gap = how far below threshold the worst point is
+            worst_case_gap = threshold - soft_min_power  # Positive if worst point is below threshold
+            worst_case_penalty = dr.maximum(worst_case_gap, dr.auto.ad.Float(0.0)) / dr.auto.ad.Float(10.0)
+
+            # Combined loss:
+            # 1. Maximize fraction above threshold (primary objective)
+            # 2. Lift worst points above threshold (eliminate dead zones)
+            worst_case_weight = dr.auto.ad.Float(0.5)  # Strong weight - aggressive dead zone elimination
+
+            normalized_loss = -fraction + worst_case_weight * worst_case_penalty
 
         elif loss_type == "percentile_maximize":
             # PERCENTILE MAXIMIZE: Maximize the Nth percentile (e.g., median)
@@ -1631,16 +1588,17 @@ def optimize_boresight_pathsolver(
     # Learning rate scheduler: required to jump out of local minima for difficult loss surfaces...
     use_scheduler = num_iterations >= 50
     if use_scheduler:
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        # Use exponential decay for smoother convergence after grid search
+        # This is more stable than ReduceLROnPlateau for noisy loss landscapes
+        scheduler = torch.optim.lr_scheduler.ExponentialLR(
             optimizer,
-            mode="min",
-            factor=0.5,  # Reduce LR by half
-            patience=20,  # Wait 20 iterations without improvement (increased from 10)
-            threshold=0.0005,  # Require 0.05% improvement (relaxed from 0.01%)
-            min_lr=1e-3,  # Don't let LR get too small (increased from 1e-4)
+            gamma=0.95  # Decay by 5% each iteration (smooth reduction)
         )
         if verbose:
-            print(f"Learning rate scheduler enabled (patience=20, threshold=0.05%)")
+            print(f"Learning rate scheduler enabled (exponential decay, gamma=0.95)")
+            print(f"  Initial LR: {learning_rate:.4f}")
+            print(f"  LR after 50 iters: {learning_rate * (0.95**50):.6f}")
+            print(f"  LR after 100 iters: {learning_rate * (0.95**100):.6f}")
 
     # Tracking
     loss_history = []
@@ -1675,8 +1633,6 @@ def optimize_boresight_pathsolver(
 
     # Run the optimization for the specified number of iterations
     for iteration in range(num_iterations):
-<<<<<<< HEAD
-=======
 
         if verbose and iteration == 0:
             print(f"\nIteration {iteration+1}/{num_iterations}:")
@@ -1684,7 +1640,6 @@ def optimize_boresight_pathsolver(
                 f"  Boresight: ({boresight_x.item():.2f}, {boresight_y.item():.2f}, {boresight_z.item():.2f})"
             )
 
->>>>>>> a438e78f34c4717a1d3ce99fffabe08efc07375e
         # Forward pass
         loss = compute_loss(boresight_x, boresight_y, boresight_z)
 
@@ -1716,7 +1671,7 @@ def optimize_boresight_pathsolver(
             )
             # RMSE is not applicable for a maximization objective, print mean power instead
             mean_power_in_zone = -loss.item()
-            print(f"  Loss: {loss.item():.4f}, Mean Power in Zone: {mean_power_in_zone:.2f} dBm")
+            print(f"  Loss: {loss.item():.4f}, Mean Power in Zone: {mean_power_in_zone:.2f} dB")
 
         # Update
         optimizer.step()
@@ -1771,7 +1726,7 @@ def optimize_boresight_pathsolver(
 
         # Update learning rate if scheduler is enabled
         if use_scheduler:
-            scheduler.step(loss.item())
+            scheduler.step()
 
         # Apply constraints on boresight Z:
         # Must be below TX height (cannot point upward)
@@ -1841,9 +1796,9 @@ def optimize_boresight_pathsolver(
         print(f"Best loss: {best_loss:.4f}")
         if loss_type == "coverage_maximize":
             print(f"  (Maximizing mean power in zone with variance penalty)")
-            print(f"  Negative loss = {-best_loss:.2f} dBm (approximate mean power)")
+            print(f"  Negative loss = {-best_loss:.2f} dB (approximate mean power)")
         elif loss_type == "coverage_threshold":
-            print(f"  (Maximizing fraction above {power_threshold_dbm} dBm)")
+            print(f"  (Maximizing fraction above {power_threshold_dbm} dB)")
             print(f"  Estimated coverage: {-best_loss*100:.1f}% of zone")
         elif loss_type == "percentile_maximize":
             print(f"  (Maximizing soft-minimum power in zone)")
