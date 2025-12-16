@@ -1088,9 +1088,9 @@ def grid_search_initial_boresight(
                 los=True,
                 refraction=False,
                 specular_reflection=True,
-                diffuse_reflection=True,
+                diffuse_reflection=False,
                 diffraction=True,
-                edge_diffraction=True
+                edge_diffraction=True,  # Enable for better obstacle handling in heavily obstructed scenarios
             )
 
             # Compute mean power in zone
@@ -1387,9 +1387,9 @@ def optimize_boresight_pathsolver(
             los=True,
             refraction=False,
             specular_reflection=True,
-            diffuse_reflection=True,
+            diffuse_reflection=False,
             diffraction=True,
-            edge_diffraction=True  # Enable for better obstacle handling in heavily obstructed scenarios
+            edge_diffraction=True,  # Enable for better obstacle handling in heavily obstructed scenarios
         )
 
         # Extract channel coefficients
@@ -1460,24 +1460,21 @@ def optimize_boresight_pathsolver(
             normalized_loss = -mean_power
 
         elif loss_type == "coverage_threshold":
-            # COVERAGE THRESHOLD: Maximize fraction of zone above threshold
-            # IMPROVED VERSION with enhancements:
-            # 1. Smooth sigmoid for counting points above threshold
-            # 2. Margin bonus for exceeding threshold (prevents gradient saturation)
-            # 3. Soft-minimum penalty to eliminate dead zones/outliers below threshold
-            #
-            # The soft-minimum penalty is KEY for ensuring ALL points reach the threshold.
-            # It creates strong gradients toward improving the weakest points.
-
-            count_above_threshold = dr.auto.ad.Float(0.0)
-            count_in_zone = dr.auto.ad.Float(0.0)
+            # COVERAGE THRESHOLD: Robust "Violation Minimization"
+            # REPLACEMENT LOGIC:
+            # 1. Clamp signal to noise floor (Fixes the -270 dBm instability).
+            # 2. Calculate "Violation": How far below threshold is the pixel?
+            # 3. Minimize the LogSumExp of Violations (Stable Soft-Max of errors).
+            
             threshold = dr.auto.ad.Float(power_threshold_dbm)
-
-            # Track soft-minimum for worst-case penalty
-            # Soft-min gives strong gradients toward improving weakest points
-            # Lower alpha = sharper focus on worst points (more aggressive)
-            soft_min_alpha = dr.auto.ad.Float(5.0)  # 5 dB smoothing for soft-min
-            soft_min_sum = dr.auto.ad.Float(0.0)
+            noise_floor = dr.auto.ad.Float(-120.0) # Prevents exp() explosion
+            
+            # Alpha controls "hardness" of the focus on worst pixels.
+            # 2.0 is sharper/better than 5.0 for fixing deadzones.
+            lse_alpha = dr.auto.ad.Float(2.0) 
+            
+            sum_violation_exp = dr.auto.ad.Float(0.0)
+            count_in_zone = dr.auto.ad.Float(0.0)
 
             for rx_idx in range(num_sample_points):
                 in_zone = float(mask_values[rx_idx])
@@ -1486,47 +1483,28 @@ def optimize_boresight_pathsolver(
 
                 power_db = path_gains_db_list[rx_idx]
 
-                # 1. Smooth sigmoid for counting points above threshold
-                distance_from_threshold = power_db - threshold
-                smoothness = dr.auto.ad.Float(8.0)  # 8 dB smoothing for sigmoid
+                # 1. CRITICAL STABILITY FIX: Clamp to noise floor
+                # This prevents -270 dBm inputs from generating exp(50) gradients
+                clamped_power = dr.maximum(power_db, noise_floor)
 
-                above_threshold = dr.auto.ad.Float(1.0) / (
-                    dr.auto.ad.Float(1.0) + dr.exp(-distance_from_threshold / smoothness)
-                )
+                # 2. Calculate Violation (ReLU)
+                # If Power < Threshold: Gap is positive (Error)
+                # If Power > Threshold: Gap is 0 (No Error)
+                gap = threshold - clamped_power
+                violation = dr.maximum(gap, dr.auto.ad.Float(0.0))
 
-                # 2. Margin bonus for exceeding threshold
-                # This gives continuous gradients even when well above threshold
-                margin = dr.auto.ad.Float(5.0)  # 5 dB safety margin above threshold
-                excess_power = dr.maximum(distance_from_threshold - margin, dr.auto.ad.Float(0.0))
-                margin_bonus = excess_power / dr.auto.ad.Float(100.0)  # Small bonus to avoid dominating
-
-                count_above_threshold += in_zone_dr * (above_threshold + margin_bonus)
+                # 3. Accumulate for LogSumExp
+                # We sum exp(violation / alpha). 
+                # This naturally emphasizes the largest violations (worst pixels).
+                # Since 'violation' is clamped (max ~40dB), this exponent is safe (~e^20).
+                sum_violation_exp += in_zone_dr * dr.exp(violation / lse_alpha)
+                
                 count_in_zone += in_zone_dr
 
-                # 3. Accumulate soft-minimum (focuses on worst points)
-                # soft_min ≈ -α * log(sum(exp(-x/α)))
-                # This heavily penalizes low outliers (dead zones)
-                soft_min_sum += in_zone_dr * dr.exp(-power_db / soft_min_alpha)
-
-            # Primary objective: maximize fraction above threshold
-            fraction = count_above_threshold / dr.maximum(count_in_zone, dr.auto.ad.Float(1.0))
-
-            # Soft-minimum of power in zone (approximates worst-case point)
-            # Lower soft_min = worse dead zones
-            soft_min_power = -soft_min_alpha * dr.log(soft_min_sum / dr.maximum(count_in_zone, dr.auto.ad.Float(1.0)))
-
-            # Worst-case penalty: penalize if worst point is below threshold
-            # This creates strong gradients to lift dead zones above threshold
-            # Gap = how far below threshold the worst point is
-            worst_case_gap = threshold - soft_min_power  # Positive if worst point is below threshold
-            worst_case_penalty = dr.maximum(worst_case_gap, dr.auto.ad.Float(0.0)) / dr.auto.ad.Float(10.0)
-
-            # Combined loss:
-            # 1. Maximize fraction above threshold (primary objective)
-            # 2. Lift worst points above threshold (eliminate dead zones)
-            worst_case_weight = dr.auto.ad.Float(0.5)  # Strong weight - aggressive dead zone elimination
-
-            normalized_loss = -fraction + worst_case_weight * worst_case_penalty
+            # Final Loss: Smooth Maximum of the Errors
+            # We want to drive this value to 0.
+            avg_exp = sum_violation_exp / dr.maximum(count_in_zone, dr.auto.ad.Float(1.0))
+            normalized_loss = lse_alpha * dr.log(avg_exp)
 
         elif loss_type == "percentile_maximize":
             # PERCENTILE MAXIMIZE: Maximize the Nth percentile (e.g., median)
