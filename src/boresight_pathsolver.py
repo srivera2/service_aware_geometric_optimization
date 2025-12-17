@@ -678,6 +678,7 @@ def compare_boresight_performance(
     zone_mask,
     naive_angles,
     optimized_angles,
+    stablized_angles,
     title="Boresight Optimization Comparison",
 ):
     """
@@ -719,7 +720,8 @@ def compare_boresight_performance(
     results = {}
 
     for config_name, angles in [("Naive Baseline", naive_angles),
-                                 ("Optimized", optimized_angles)]:
+                                 ("Optimized", optimized_angles),
+                                 ("Stablized Angles", stablized_angles)]:
         print(f"Computing RadioMap for {config_name}...")
 
         # Set antenna orientation using angles
@@ -795,7 +797,7 @@ def compare_boresight_performance(
             'num_total_points': len(zone_power),
         }
 
-    # Calculate improvement
+    # Calculate improvement (for best and naive)
     improvement_mean = results['Optimized']['mean'] - results['Naive Baseline']['mean']
     improvement_median = results['Optimized']['median'] - results['Naive Baseline']['median']
 
@@ -804,7 +806,8 @@ def compare_boresight_performance(
 
     # Determine data range for better visualization
     all_power = np.concatenate([results['Naive Baseline']['power_values'],
-                                 results['Optimized']['power_values']])
+                                 results['Optimized']['power_values'], 
+                                 results['Stablized Angles']['power_values']])
     
     # Filter out dead zones for range calculation
     live_power = all_power[all_power > -269]
@@ -822,10 +825,14 @@ def compare_boresight_performance(
             label='Naive Baseline', color='orange', density=True)
     ax.hist(results['Optimized']['power_values'], bins=bins, alpha=0.6,
             label='Optimized', color='green', density=True)
+    ax.hist(results['Stablized Angles']['power_values'], bins=bins, alpha=0.6,
+            label='Stablized', color='white', density=True)
     ax.axvline(results['Naive Baseline']['mean'], color='orange', linestyle='--',
                linewidth=2, label=f"Naive Mean: {results['Naive Baseline']['mean']:.1f} dBm")
     ax.axvline(results['Optimized']['mean'], color='green', linestyle='--',
                linewidth=2, label=f"Optimized Mean: {results['Optimized']['mean']:.1f} dBm")
+    ax.axvline(results['Stablized Angles']['mean'], color='white', linestyle='--',
+               linewidth=2, label=f"Stablized Mean: {results['Stablized Angles']['mean']:.1f} dBm")
     ax.set_xlabel('Signal Strength (dBm)')
     ax.set_ylabel('Probability Density')
     ax.set_title('Power Distribution in Coverage Zone (PDF)')
@@ -1384,7 +1391,7 @@ def optimize_boresight_pathsolver(
         # CRITICAL: Enable gradients for each input parameter
         # The @dr.wrap decorator converts PyTorch 0-D tensors → DrJit Float scalars
         # We need to access .array to get the actual DrJit scalars
-        dr.enable_grad(azimuth_deg.array)
+        #dr.enable_grad(azimuth_deg.array)
         dr.enable_grad(elevation_deg.array)
 
         # Convert degrees to radians for angle conversion
@@ -1392,7 +1399,8 @@ def optimize_boresight_pathsolver(
         deg_to_rad = dr.auto.ad.Float(np.pi / 180.0)
         dr.disable_grad(deg_to_rad)  # Conversion factor is constant
 
-        azimuth_rad = azimuth_deg.array * deg_to_rad
+        # Remember to bring this back to .array
+        azimuth_rad = azimuth_deg * deg_to_rad
         elevation_rad = elevation_deg.array * deg_to_rad
 
         # Convert azimuth/elevation to yaw/pitch (roll = 0)
@@ -1598,9 +1606,9 @@ def optimize_boresight_pathsolver(
     # PyTorch parameters: azimuth and elevation angles (in degrees)
     # Using 0-D tensors (scalars) - this is the ONLY pattern that works with @dr.wrap
     # 1-D tensors lose gradients during indexing
-    azimuth = torch.tensor(
-        initial_azimuth, device="cuda", dtype=torch.float32, requires_grad=True
-    )
+    #azimuth = torch.tensor(
+    #    initial_azimuth, device="cuda", dtype=torch.float32, requires_grad=True
+    #)
     elevation = torch.tensor(
         initial_elevation, device="cuda", dtype=torch.float32, requires_grad=True
     )
@@ -1608,7 +1616,7 @@ def optimize_boresight_pathsolver(
     # Optimizer: Adam shows the best performance
     # Optimize azimuth and elevation angles directly (2 parameters instead of 3)
     optimizer = torch.optim.Adam(
-        [azimuth, elevation], lr=learning_rate
+        [elevation], lr=learning_rate
     )
 
     # Learning rate scheduler: required to jump out of local minima for difficult loss surfaces...
@@ -1664,11 +1672,11 @@ def optimize_boresight_pathsolver(
         if verbose and iteration == 0:
             print(f"\nIteration {iteration+1}/{num_iterations}:")
             print(
-                f"  Angles: Azimuth={azimuth.item():.2f}°, Elevation={elevation.item():.2f}°"
+                #f"  Angles: Azimuth={azimuth.item():.2f}°, Elevation={elevation.item():.2f}°"
             )
 
         # Forward pass
-        loss = compute_loss(azimuth, elevation)
+        loss = compute_loss(initial_azimuth, elevation)
 
         # Backward pass (using AD)
         # The gradients are backpropagated through the scene
@@ -1676,19 +1684,19 @@ def optimize_boresight_pathsolver(
         loss.backward()
 
         # Track gradient norm for diagnostics
-        grad_azimuth_val = azimuth.grad.item() if azimuth.grad is not None else 0.0
+        #grad_azimuth_val = azimuth.grad.item() if azimuth.grad is not None else 0.0
         grad_elevation_val = elevation.grad.item() if elevation.grad is not None else 0.0
 
         # Gradient norm (2 parameters now instead of 3)
         grad_norm = np.sqrt(
-            grad_azimuth_val**2
+            #grad_azimuth_val**2
             + grad_elevation_val**2
         )
         gradient_history.append(grad_norm)
 
         if verbose:
             print(
-                f"  Gradients: dAz={grad_azimuth_val:+.3e}°, dEl={grad_elevation_val:+.3e}° (norm={grad_norm:.3e})"
+                #f"  Gradients: dAz={grad_azimuth_val:+.3e}°, dEl={grad_elevation_val:+.3e}° (norm={grad_norm:.3e})"
             )
             # RMSE is not applicable for a maximization objective, print mean power instead
             mean_power_in_zone = -loss.item()
@@ -1701,9 +1709,9 @@ def optimize_boresight_pathsolver(
         if save_radiomap_frames and (iteration % frame_save_interval == 0 or iteration == num_iterations - 1):
             # Apply current angles to scene (temporarily)
             tx = scene.get(tx_name)
-            current_azimuth = azimuth.item()
+            #current_azimuth = azimuth.item()
             current_elevation = elevation.item()
-            yaw_rad, pitch_rad = azimuth_elevation_to_yaw_pitch(current_azimuth, current_elevation)
+            #yaw_rad, pitch_rad = azimuth_elevation_to_yaw_pitch(current_azimuth, current_elevation)
             tx.orientation = mi.Point3f(float(yaw_rad), float(pitch_rad), 0.0)
 
             # Generate RadioMap
@@ -1754,10 +1762,10 @@ def optimize_boresight_pathsolver(
         # Apply constraints on angles
         with torch.no_grad():
             # Azimuth: clamp to [0, 360) degrees
-            azimuth.clamp_(min=0.0, max=360.0)
+            #azimuth.clamp_(min=0.0, max=360.0)
             # Wrap azimuth around if needed (360° → 0°)
-            if azimuth.item() >= 360.0:
-                azimuth.fill_(azimuth.item() % 360.0)
+            #if azimuth.item() >= 360.0:
+            #    azimuth.fill_(azimuth.item() % 360.0)
 
             # Elevation: clamp to prevent pointing upward (only downward tilt)
             # 0° = horizontal, negative = downward tilt
@@ -1766,13 +1774,13 @@ def optimize_boresight_pathsolver(
         # Track
         loss_history.append(loss.item())
         angle_history.append(
-            [azimuth.item(), elevation.item()]
+            [initial_azimuth, elevation.item()]
         )
 
         # Updates the ideal parameters if the loss is the lowest to date
         if loss.item() < best_loss:
             best_loss = loss.item()
-            best_azimuth_final = azimuth.item()
+            #best_azimuth_final = azimuth.item()
             best_elevation_final = elevation.item()
 
     # Save the elapsed time for metrics
