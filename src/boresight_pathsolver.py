@@ -11,6 +11,7 @@ import drjit as dr
 from drjit.auto import Float, Array3f, UInt
 import mitsuba as mi
 from sionna.rt import PathSolver, Receiver, cpx_abs_square
+from sionna.rt.path_solvers.paths import Paths
 import time
 from shapely.geometry import Point, Polygon
 from tx_placement import TxPlacement
@@ -678,7 +679,6 @@ def compare_boresight_performance(
     zone_mask,
     naive_angles,
     optimized_angles,
-    stablized_angles,
     title="Boresight Optimization Comparison",
 ):
     """
@@ -720,8 +720,7 @@ def compare_boresight_performance(
     results = {}
 
     for config_name, angles in [("Naive Baseline", naive_angles),
-                                 ("Optimized", optimized_angles),
-                                 ("Stablized Angles", stablized_angles)]:
+                                 ("Optimized", optimized_angles)]:
         print(f"Computing RadioMap for {config_name}...")
 
         # Set antenna orientation using angles
@@ -806,8 +805,7 @@ def compare_boresight_performance(
 
     # Determine data range for better visualization
     all_power = np.concatenate([results['Naive Baseline']['power_values'],
-                                 results['Optimized']['power_values'], 
-                                 results['Stablized Angles']['power_values']])
+                                 results['Optimized']['power_values']])
     
     # Filter out dead zones for range calculation
     live_power = all_power[all_power > -269]
@@ -825,14 +823,10 @@ def compare_boresight_performance(
             label='Naive Baseline', color='orange', density=True)
     ax.hist(results['Optimized']['power_values'], bins=bins, alpha=0.6,
             label='Optimized', color='green', density=True)
-    ax.hist(results['Stablized Angles']['power_values'], bins=bins, alpha=0.6,
-            label='Stablized', color='white', density=True)
     ax.axvline(results['Naive Baseline']['mean'], color='orange', linestyle='--',
                linewidth=2, label=f"Naive Mean: {results['Naive Baseline']['mean']:.1f} dBm")
     ax.axvline(results['Optimized']['mean'], color='green', linestyle='--',
                linewidth=2, label=f"Optimized Mean: {results['Optimized']['mean']:.1f} dBm")
-    ax.axvline(results['Stablized Angles']['mean'], color='white', linestyle='--',
-               linewidth=2, label=f"Stablized Mean: {results['Stablized Angles']['mean']:.1f} dBm")
     ax.set_xlabel('Signal Strength (dBm)')
     ax.set_ylabel('Probability Density')
     ax.set_title('Power Distribution in Coverage Zone (PDF)')
@@ -1375,23 +1369,45 @@ def optimize_boresight_pathsolver(
     p_solver = PathSolver()
     p_solver.loop_mode = "evaluated"  # Required for gradient computation
 
+    # Compute paths with AD (this is built into the Dr.Jit framework)
+    # This was moved outside of the loss function to improve the computational overhead
+    paths = p_solver(
+        scene,
+        los=True,
+        refraction=False,
+        specular_reflection=True,
+        diffuse_reflection=False,
+        diffraction=True,
+        edge_diffraction=True,  # Enable for better obstacle handling in heavily obstructed scenarios
+    )
+
+    # Extract the paths_buffer for reuse in compute_loss
+    # The Paths object stores it as _paths_buffer
+    # This contains the pre-traced ray geometry that will be reused with updated antenna orientations
+    paths_buffer = paths._paths_buffer
+
     # Define differentiable loss function using @dr.wrap
     @dr.wrap(source="torch", target="drjit")
-    def compute_loss(azimuth_deg, elevation_deg):
+    def compute_loss(azimuth_deg, elevation_deg, p_solver):
         """
-        Compute loss with AD enabled through PathSolver
+        Compute loss with AD enabled through field_calculator only
+
+        This uses pre-traced ray geometry and recomputes only field coefficients
+        when antenna orientation changes, providing significant performance improvement.
 
         Parameters:
         -----------
         azimuth_deg, elevation_deg : DrJit Float scalars (converted from PyTorch tensors)
             Antenna pointing angles in degrees
             After @dr.wrap conversion, these are DrJit Float scalars with gradient tracking enabled
+        p_solver : PathSolver
+            PathSolver instance used to access _field_calculator
         """
 
         # CRITICAL: Enable gradients for each input parameter
         # The @dr.wrap decorator converts PyTorch 0-D tensors → DrJit Float scalars
         # We need to access .array to get the actual DrJit scalars
-        #dr.enable_grad(azimuth_deg.array)
+        dr.enable_grad(azimuth_deg.array)
         dr.enable_grad(elevation_deg.array)
 
         # Convert degrees to radians for angle conversion
@@ -1415,22 +1431,60 @@ def optimize_boresight_pathsolver(
         tx = scene.get(tx_name)
         tx.orientation = mi.Point3f(yaw_rad, pitch_rad, roll_rad)
 
-        # Position
-        # tx.position = mi.Point3f(tx_x.array, tx_y.array, tx_height)
+        # EXTRACT PARAMETERS FROM SCENE (same as PathSolver.__call__ does)
+        # These calls extract current transmitter/receiver states INCLUDING updated orientation
+        # See sionna-rt path_solver.py:183-186
+        src_positions, src_orientations, rel_ant_positions_tx, tx_velocities = \
+            scene.sources(synthetic_array=True, return_velocities=True)
+        tgt_positions, tgt_orientations, rel_ant_positions_rx, rx_velocities = \
+            scene.targets(synthetic_array=True, return_velocities=True)
 
-        # Compute paths with AD (this is built into the Dr.Jit framework)
-        paths = p_solver(
+        # Get antenna patterns from scene (path_solver.py:189-190)
+        src_antenna_patterns = scene.tx_array.antenna_pattern.patterns
+        tgt_antenna_patterns = scene.rx_array.antenna_pattern.patterns
+
+        # Call field_calculator with updated orientations
+        # The paths_buffer from outer scope contains the pre-traced ray geometry
+        # We're recomputing only the field coefficients with new antenna orientation
+        updated_paths_buffer = p_solver._field_calculator(
+            wavelength=scene.wavelength,
+            paths=paths_buffer,  # Pre-computed ray geometry from outer scope
+            samples_per_src=1000000,  # Match the value used in p_solver call
+            diffraction=True,  # Match p_solver call settings
+            src_positions=src_positions,
+            tgt_positions=tgt_positions,
+            src_orientations=src_orientations,  # Now includes UPDATED orientation
+            tgt_orientations=tgt_orientations,
+            src_antenna_patterns=src_antenna_patterns,
+            tgt_antenna_patterns=tgt_antenna_patterns
+        )
+
+        # Create Paths object with updated field coefficients
+        paths = Paths(
             scene,
-            los=True,
-            refraction=False,
-            specular_reflection=True,
-            diffuse_reflection=False,
-            diffraction=True,
-            edge_diffraction=True,  # Enable for better obstacle handling in heavily obstructed scenarios
+            src_positions,
+            tgt_positions,
+            tx_velocities,
+            rx_velocities,
+            True,  # synthetic_array=True (matches scene.sources/targets calls)
+            updated_paths_buffer,  # Updated buffer with new field coefficients
+            rel_ant_positions_tx,
+            rel_ant_positions_rx
         )
 
         # Extract channel coefficients
         h_real, h_imag = paths.a
+
+        # GRADIENT DIAGNOSTICS: Check if gradients are tracking through the pipeline
+        if verbose and not hasattr(compute_loss, '_gradient_check_printed'):
+            compute_loss._gradient_check_printed = True
+            print(f"  [GRADIENT CHECK] yaw_rad grad enabled: {dr.grad_enabled(yaw_rad)}")
+            print(f"  [GRADIENT CHECK] pitch_rad grad enabled: {dr.grad_enabled(pitch_rad)}")
+            print(f"  [GRADIENT CHECK] elevation_deg grad enabled: {dr.grad_enabled(elevation_deg.array)}")
+            print(f"  [GRADIENT CHECK] h_real grad enabled: {dr.grad_enabled(h_real)}")
+            print(f"  [GRADIENT CHECK] h_imag grad enabled: {dr.grad_enabled(h_imag)}")
+            print(f"  [DIAGNOSTIC] updated_paths_buffer size: {updated_paths_buffer.buffer_size}")
+            print(f"  [DIAGNOSTIC] h_real shape: {dr.shape(h_real)}")
 
         # DEBUG: Verify channel coefficient shapes match expectations
         # Expected shape: (num_receivers, num_tx_antennas, num_rx_antennas, num_paths)
@@ -1497,73 +1551,71 @@ def optimize_boresight_pathsolver(
             normalized_loss = -mean_power
 
         elif loss_type == "coverage_threshold":
-            # COVERAGE THRESHOLD: Maximize fraction of zone above threshold
-            # IMPROVED VERSION with enhancements:
-            # 1. Smooth sigmoid for counting points above threshold
-            # 2. Margin bonus for exceeding threshold (prevents gradient saturation)
-            # 3. Soft-minimum penalty to eliminate dead zones/outliers below threshold
-            #
-            # The soft-minimum penalty is KEY for ensuring ALL points reach the threshold.
-            # It creates strong gradients toward improving the weakest points.
-
+            # --- REVIVED: SoftMin "Deadzone" Loss ---
+            # Maximizes coverage while aggressively penalizing the worst-case outliers.
+            
             count_above_threshold = dr.auto.ad.Float(0.0)
             count_in_zone = dr.auto.ad.Float(0.0)
             threshold = dr.auto.ad.Float(power_threshold_dbm)
 
-            # Track soft-minimum for worst-case penalty
-            # Soft-min gives strong gradients toward improving weakest points
-            # Lower alpha = sharper focus on worst points (more aggressive)
-            soft_min_alpha = dr.auto.ad.Float(5.0)  # 5 dB smoothing for soft-min
+            # 1. Setup Soft-Min (The LSE Replacement)
+            # This approximates the minimum power in the group. 
+            # Lower alpha (e.g., 2.0) = sharper minimum (focus only on the absolute worst point).
+            # Higher alpha (e.g., 5.0) = smooth minimum (considers the bottom 10-20% of points).
+            soft_min_alpha = dr.auto.ad.Float(5.0) 
             soft_min_sum = dr.auto.ad.Float(0.0)
 
             for rx_idx in range(num_sample_points):
                 in_zone = float(mask_values[rx_idx])
                 in_zone_dr = dr.auto.ad.Float(in_zone)
+                # We disable grad on the mask so we don't try to move the receiver positions
                 dr.disable_grad(in_zone_dr)
 
+                # Ensure you are passing the correct power array here
                 power_db = path_gains_db_list[rx_idx]
 
-                # 1. Smooth sigmoid for counting points above threshold
+                # --- A. Smooth Sigmoid Counter ---
+                # Counts how many points are above threshold smoothly (differentiable step)
                 distance_from_threshold = power_db - threshold
-                smoothness = dr.auto.ad.Float(8.0)  # 8 dB smoothing for sigmoid
+                smoothness = dr.auto.ad.Float(8.0) # 8 dB transition width
 
                 above_threshold = dr.auto.ad.Float(1.0) / (
                     dr.auto.ad.Float(1.0) + dr.exp(-distance_from_threshold / smoothness)
                 )
 
-                # 2. Margin bonus for exceeding threshold
-                # This gives continuous gradients even when well above threshold
-                margin = dr.auto.ad.Float(5.0)  # 5 dB safety margin above threshold
+                # --- B. Margin Bonus ---
+                # Gives the optimizer a small "cookie" for going ABOVE the threshold.
+                # Prevents gradients from dying once the goal is met.
+                margin = dr.auto.ad.Float(5.0)
                 excess_power = dr.maximum(distance_from_threshold - margin, dr.auto.ad.Float(0.0))
-                margin_bonus = excess_power / dr.auto.ad.Float(100.0)  # Small bonus to avoid dominating
+                margin_bonus = excess_power / dr.auto.ad.Float(100.0) 
 
                 count_above_threshold += in_zone_dr * (above_threshold + margin_bonus)
                 count_in_zone += in_zone_dr
 
-                # 3. Accumulate soft-minimum (focuses on worst points)
-                # soft_min ≈ -α * log(sum(exp(-x/α)))
-                # This heavily penalizes low outliers (dead zones)
+                # --- C. Soft-Min Accumulation (LSE Core) ---
+                # Accumulate exp(-x/alpha) for the log-sum-exp calculation below
                 soft_min_sum += in_zone_dr * dr.exp(-power_db / soft_min_alpha)
 
-            # Primary objective: maximize fraction above threshold
-            fraction = count_above_threshold / dr.maximum(count_in_zone, dr.auto.ad.Float(1.0))
+            # Prevent division by zero
+            safe_count = dr.maximum(count_in_zone, dr.auto.ad.Float(1.0))
+            
+            # Primary Objective: Fraction of users satisfying requirements
+            fraction = count_above_threshold / safe_count
 
-            # Soft-minimum of power in zone (approximates worst-case point)
-            # Lower soft_min = worse dead zones
-            soft_min_power = -soft_min_alpha * dr.log(soft_min_sum / dr.maximum(count_in_zone, dr.auto.ad.Float(1.0)))
+            # --- D. Calculate the "Soft Minimum" Power ---
+            # Formula: -alpha * log( mean( exp(-x/alpha) ) )
+            soft_min_power = -soft_min_alpha * dr.log(soft_min_sum / safe_count)
 
-            # Worst-case penalty: penalize if worst point is below threshold
-            # This creates strong gradients to lift dead zones above threshold
-            # Gap = how far below threshold the worst point is
-            worst_case_gap = threshold - soft_min_power  # Positive if worst point is below threshold
+            # --- E. The Deadzone Penalty ---
+            # If the "Soft Minimum" (worst area) is below threshold, apply a heavy penalty.
+            # This forces the optimizer to lift the floor.
+            worst_case_gap = threshold - soft_min_power 
             worst_case_penalty = dr.maximum(worst_case_gap, dr.auto.ad.Float(0.0)) / dr.auto.ad.Float(10.0)
 
-            # Combined loss:
-            # 1. Maximize fraction above threshold (primary objective)
-            # 2. Lift worst points above threshold (eliminate dead zones)
-            worst_case_weight = dr.auto.ad.Float(0.5)  # Strong weight - aggressive dead zone elimination
-
-            normalized_loss = -fraction + worst_case_weight * worst_case_penalty
+            # Combined Loss
+            worst_case_weight = dr.auto.ad.Float(0.5) 
+            normalized_loss = -fraction + (worst_case_weight * worst_case_penalty)
             
         elif loss_type == "percentile_maximize":
             # PERCENTILE MAXIMIZE: Maximize the Nth percentile (e.g., median)
@@ -1606,9 +1658,9 @@ def optimize_boresight_pathsolver(
     # PyTorch parameters: azimuth and elevation angles (in degrees)
     # Using 0-D tensors (scalars) - this is the ONLY pattern that works with @dr.wrap
     # 1-D tensors lose gradients during indexing
-    #azimuth = torch.tensor(
-    #    initial_azimuth, device="cuda", dtype=torch.float32, requires_grad=True
-    #)
+    azimuth = torch.tensor(
+        initial_azimuth, device="cuda", dtype=torch.float32, requires_grad=True
+    )
     elevation = torch.tensor(
         initial_elevation, device="cuda", dtype=torch.float32, requires_grad=True
     )
@@ -1616,7 +1668,7 @@ def optimize_boresight_pathsolver(
     # Optimizer: Adam shows the best performance
     # Optimize azimuth and elevation angles directly (2 parameters instead of 3)
     optimizer = torch.optim.Adam(
-        [elevation], lr=learning_rate
+        [azimuth, elevation], lr=learning_rate
     )
 
     # Learning rate scheduler: required to jump out of local minima for difficult loss surfaces...
@@ -1672,11 +1724,11 @@ def optimize_boresight_pathsolver(
         if verbose and iteration == 0:
             print(f"\nIteration {iteration+1}/{num_iterations}:")
             print(
-                #f"  Angles: Azimuth={azimuth.item():.2f}°, Elevation={elevation.item():.2f}°"
+                f"  Angles: Azimuth={azimuth.item():.2f}°, Elevation={elevation.item():.2f}°"
             )
 
         # Forward pass
-        loss = compute_loss(initial_azimuth, elevation)
+        loss = compute_loss(azimuth, elevation, p_solver)
 
         # Backward pass (using AD)
         # The gradients are backpropagated through the scene
@@ -1684,19 +1736,19 @@ def optimize_boresight_pathsolver(
         loss.backward()
 
         # Track gradient norm for diagnostics
-        #grad_azimuth_val = azimuth.grad.item() if azimuth.grad is not None else 0.0
+        grad_azimuth_val = azimuth.grad.item() if azimuth.grad is not None else 0.0
         grad_elevation_val = elevation.grad.item() if elevation.grad is not None else 0.0
 
         # Gradient norm (2 parameters now instead of 3)
         grad_norm = np.sqrt(
-            #grad_azimuth_val**2
+            grad_azimuth_val**2
             + grad_elevation_val**2
         )
         gradient_history.append(grad_norm)
 
         if verbose:
             print(
-                #f"  Gradients: dAz={grad_azimuth_val:+.3e}°, dEl={grad_elevation_val:+.3e}° (norm={grad_norm:.3e})"
+                f"  Gradients: dAz={grad_azimuth_val:+.3e}°, dEl={grad_elevation_val:+.3e}° (norm={grad_norm:.3e})"
             )
             # RMSE is not applicable for a maximization objective, print mean power instead
             mean_power_in_zone = -loss.item()
@@ -1709,9 +1761,9 @@ def optimize_boresight_pathsolver(
         if save_radiomap_frames and (iteration % frame_save_interval == 0 or iteration == num_iterations - 1):
             # Apply current angles to scene (temporarily)
             tx = scene.get(tx_name)
-            #current_azimuth = azimuth.item()
+            current_azimuth = azimuth.item()
             current_elevation = elevation.item()
-            #yaw_rad, pitch_rad = azimuth_elevation_to_yaw_pitch(current_azimuth, current_elevation)
+            yaw_rad, pitch_rad = azimuth_elevation_to_yaw_pitch(current_azimuth, current_elevation)
             tx.orientation = mi.Point3f(float(yaw_rad), float(pitch_rad), 0.0)
 
             # Generate RadioMap
@@ -1762,10 +1814,10 @@ def optimize_boresight_pathsolver(
         # Apply constraints on angles
         with torch.no_grad():
             # Azimuth: clamp to [0, 360) degrees
-            #azimuth.clamp_(min=0.0, max=360.0)
+            azimuth.clamp_(min=0.0, max=360.0)
             # Wrap azimuth around if needed (360° → 0°)
-            #if azimuth.item() >= 360.0:
-            #    azimuth.fill_(azimuth.item() % 360.0)
+            if azimuth.item() >= 360.0:
+                azimuth.fill_(azimuth.item() % 360.0)
 
             # Elevation: clamp to prevent pointing upward (only downward tilt)
             # 0° = horizontal, negative = downward tilt
@@ -1774,13 +1826,13 @@ def optimize_boresight_pathsolver(
         # Track
         loss_history.append(loss.item())
         angle_history.append(
-            [initial_azimuth, elevation.item()]
+            [azimuth.item(), elevation.item()]
         )
 
         # Updates the ideal parameters if the loss is the lowest to date
         if loss.item() < best_loss:
             best_loss = loss.item()
-            #best_azimuth_final = azimuth.item()
+            best_azimuth_final = azimuth.item()
             best_elevation_final = elevation.item()
 
     # Save the elapsed time for metrics
