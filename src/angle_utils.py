@@ -194,3 +194,119 @@ def clamp_elevation(elevation_deg, min_deg=-90.0, max_deg=90.0):
         Elevation clamped to [min_deg, max_deg] range
     """
     return np.clip(elevation_deg, min_deg, max_deg)
+
+
+def poisson_disk_sampling_2d(
+    points_pool,
+    num_samples,
+    min_distance=None,
+    seed=None,
+    max_attempts=30
+):
+    """
+    Poisson disk sampling from a pool of candidate points
+
+    Uses Bridson's algorithm adapted for discrete point sets.
+    Ensures minimum distance between selected points for uniform coverage.
+    This provides better spatial uniformity than random sampling (no clustering)
+    while being more flexible than grid sampling (avoids buildings).
+
+    Parameters:
+    -----------
+    points_pool : np.ndarray
+        Nx2 array of candidate (x, y) points to sample from
+    num_samples : int
+        Target number of samples to select
+    min_distance : float, optional
+        Minimum distance between samples
+        If None, auto-calculated based on area and num_samples
+    seed : int, optional
+        Random seed for reproducibility
+    max_attempts : int
+        Maximum attempts to find valid point per iteration
+
+    Returns:
+    --------
+    selected_points : np.ndarray
+        Mx2 array of selected points (M <= num_samples)
+    """
+    if len(points_pool) == 0:
+        return np.array([]).reshape(0, 2)
+
+    if len(points_pool) <= num_samples:
+        return points_pool.copy()
+
+    # Auto-calculate min_distance if not provided
+    if min_distance is None:
+        # Estimate based on area and desired density
+        x_min, x_max = np.min(points_pool[:, 0]), np.max(points_pool[:, 0])
+        y_min, y_max = np.min(points_pool[:, 1]), np.max(points_pool[:, 1])
+        area = (x_max - x_min) * (y_max - y_min)
+        # Target: fill area with circles of radius r
+        # num_samples ≈ area / (π * r²)
+        # r = sqrt(area / (π * num_samples))
+        min_distance = np.sqrt(area / (np.pi * num_samples)) * 0.8  # 0.8 for some overlap tolerance
+
+    rng = np.random.RandomState(seed) if seed is not None else np.random
+
+    selected = []
+    available_indices = set(range(len(points_pool)))
+
+    # Start with random point
+    first_idx = rng.choice(list(available_indices))
+    selected.append(points_pool[first_idx])
+    available_indices.remove(first_idx)
+
+    # Active list for progressive sampling
+    active_list = [0]  # Index into selected list
+
+    while active_list and len(selected) < num_samples and available_indices:
+        # Pick random point from active list
+        active_idx = rng.choice(len(active_list))
+        base_point_idx = active_list[active_idx]
+        base_point = selected[base_point_idx]
+
+        # Try to find a point near this one
+        found = False
+        for _ in range(max_attempts):
+            if not available_indices:
+                break
+
+            # Pick random available point
+            candidate_idx = rng.choice(list(available_indices))
+            candidate = points_pool[candidate_idx]
+
+            # Check distance to base point
+            dist = np.linalg.norm(candidate - base_point)
+
+            # Check if candidate is far enough from all selected points
+            if dist >= min_distance:
+                valid = True
+                for sel_point in selected:
+                    if np.linalg.norm(candidate - sel_point) < min_distance:
+                        valid = False
+                        break
+
+                if valid:
+                    selected.append(candidate)
+                    available_indices.remove(candidate_idx)
+                    active_list.append(len(selected) - 1)
+                    found = True
+                    break
+
+        # If no valid point found near base_point, remove it from active list
+        if not found:
+            active_list.pop(active_idx)
+
+    # If we didn't get enough points via Poisson disk, fill remainder with random points
+    if len(selected) < num_samples and available_indices:
+        remaining_needed = num_samples - len(selected)
+        remaining_indices = rng.choice(
+            list(available_indices),
+            size=min(remaining_needed, len(available_indices)),
+            replace=False
+        )
+        for idx in remaining_indices:
+            selected.append(points_pool[idx])
+
+    return np.array(selected)
