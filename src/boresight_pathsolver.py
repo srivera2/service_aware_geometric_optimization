@@ -489,8 +489,10 @@ def create_zone_mask(
     n_y = int(height_m / cell_h)
 
     # Create coordinate grids
-    x = np.linspace(center_x - width_m / 2, center_x + width_m / 2, n_x)
-    y = np.linspace(center_y - height_m / 2, center_y + height_m / 2, n_y)
+    # Use endpoint=False to ensure proper cell spacing
+    # With endpoint=False, linspace creates n_x cells of exactly cell_w width
+    x = np.linspace(center_x - width_m / 2, center_x + width_m / 2, n_x, endpoint=False) + cell_w / 2
+    y = np.linspace(center_y - height_m / 2, center_y + height_m / 2, n_y, endpoint=False) + cell_h / 2
     X, Y = np.meshgrid(x, y)
 
     # Initialize mask (all zeros = outside zone)
@@ -568,7 +570,8 @@ def create_zone_mask(
         # Create box mask
         in_x = np.abs(X - bx) <= (bw / 2)
         in_y = np.abs(Y - by) <= (bh / 2)
-        mask[in_x & in_y] = 1.0
+        in_box = in_x & in_y
+        mask[in_box] = 1.0
 
         # Look-at is simply the center of the box
         look_at_pos = np.array([bx, by, target_height], dtype=np.float32)
@@ -582,32 +585,63 @@ def create_zone_mask(
         # Import here to avoid circular dependency
         from scene_parser import extract_building_info
         from shapely.geometry import Polygon, Point
+        from shapely.prepared import prep
 
         # Get building information (reuse existing parser!)
         building_info = extract_building_info(scene_xml_path, verbose=False)
 
-        # For each building, create polygon and exclude cells inside it
-        for building_id, info in building_info.items():
-            # Get building polygon vertices (only X, Y coordinates)
-            vertices_3d = info["vertices"]
-            vertices_2d = [(v[0], v[1]) for v in vertices_3d]
+        # Get coordinates of all cells currently in the zone
+        zone_indices = np.nonzero(mask)
+        zone_y_idx, zone_x_idx = zone_indices
 
-            # Create Shapely polygon for this building
-            try:
-                building_polygon = Polygon(vertices_2d)
+        if len(zone_y_idx) > 0:
+            # Extract coordinates of zone cells
+            zone_x_coords = X[zone_y_idx, zone_x_idx]
+            zone_y_coords = Y[zone_y_idx, zone_x_idx]
 
-                # Check each grid point that's currently in the zone
-                for i in range(n_y):
-                    for j in range(n_x):
-                        if mask[i, j] > 0:  # Only check cells already in the zone
-                            point = Point(X[i, j], Y[i, j])
-                            if building_polygon.contains(point):
-                                mask[i, j] = 0.0  # Exclude this cell
+            # Create array of (x, y) points for vectorized operations
+            zone_points_array = np.column_stack((zone_x_coords, zone_y_coords))
 
-                num_excluded_buildings += 1
-            except Exception as e:
-                # Skip buildings with invalid geometry
-                pass
+            # For each building, create polygon and exclude cells inside it
+            for info in building_info.values():
+                # Get building polygon vertices (only X, Y coordinates)
+                vertices_3d = info["vertices"]
+                vertices_2d = [(v[0], v[1]) for v in vertices_3d]
+
+                # Create Shapely polygon for this building
+                try:
+                    building_polygon = Polygon(vertices_2d)
+
+                    # Get bounding box for quick rejection test
+                    minx, miny, maxx, maxy = building_polygon.bounds
+
+                    # Quick rejection: filter points that are definitely outside bounding box
+                    in_bbox = (
+                        (zone_points_array[:, 0] >= minx)
+                        & (zone_points_array[:, 0] <= maxx)
+                        & (zone_points_array[:, 1] >= miny)
+                        & (zone_points_array[:, 1] <= maxy)
+                    )
+
+                    # Only check points that might be inside the building
+                    candidate_indices = np.where(in_bbox)[0]
+
+                    if len(candidate_indices) > 0:
+                        # Prepare the polygon for faster repeated containment checks
+                        prepared_polygon = prep(building_polygon)
+
+                        # Check candidates against actual polygon boundary
+                        for idx in candidate_indices:
+                            px, py = zone_points_array[idx]
+                            point = Point(px, py)
+                            if prepared_polygon.contains(point):
+                                # Exclude this cell
+                                mask[zone_y_idx[idx], zone_x_idx[idx]] = 0.0
+
+                    num_excluded_buildings += 1
+                except Exception:
+                    # Skip buildings with invalid geometry
+                    pass
 
     # 4. Validate and compute zone statistics
     num_cells_in_zone = int(np.sum(mask))
@@ -625,10 +659,10 @@ def create_zone_mask(
 
     # Compute actual centroid (center of mass of the mask)
     # This may differ from the geometric look_at position
-    zone_x = X[mask == 1.0]
-    zone_y = Y[mask == 1.0]
-    centroid_x = np.mean(zone_x)
-    centroid_y = np.mean(zone_y)
+    # Use np.nonzero for faster indexing (avoids boolean mask overhead)
+    zone_y_idx, zone_x_idx = np.nonzero(mask)
+    centroid_x = np.mean(X[zone_y_idx, zone_x_idx])
+    centroid_y = np.mean(Y[zone_y_idx, zone_x_idx])
 
     zone_stats = {
         "num_cells": num_cells_in_zone,
@@ -651,7 +685,7 @@ def sample_grid_points(
     scene_xml_path=None,
     exclude_buildings=True,
     use_poisson_disk=True,
-    min_distance=None
+    min_distance=None,
 ):
     """
     Sample points from the radio map grid with optional 50/50 stratified sampling
@@ -701,8 +735,9 @@ def sample_grid_points(
     center_x, center_y, ground_z = map_config["center"]
 
     # Sample uniformly from grid
-    x = np.linspace(center_x - width_m / 2, center_x + width_m / 2, n_x)
-    y = np.linspace(center_y - height_m / 2, center_y + height_m / 2, n_y)
+    # Use endpoint=False and shift to cell centers for consistency with create_zone_mask
+    x = np.linspace(center_x - width_m / 2, center_x + width_m / 2, n_x, endpoint=False) + cell_w / 2
+    y = np.linspace(center_y - height_m / 2, center_y + height_m / 2, n_y, endpoint=False) + cell_h / 2
 
     X, Y = np.meshgrid(x, y)
 
@@ -860,10 +895,7 @@ def sample_grid_points(
         from angle_utils import poisson_disk_sampling_2d
 
         sampled_points = poisson_disk_sampling_2d(
-            sampled_points,
-            num_samples,
-            min_distance=min_distance,
-            seed=seed
+            sampled_points, num_samples, min_distance=min_distance, seed=seed
         )
 
     # Add z-coordinate
@@ -1463,7 +1495,9 @@ def grid_search_initial_boresight(
     radius_meters=100.0,
     num_sample_points=50,
     seed=42,
+    loss_type="coverage_maximize",
     verbose=True,
+    scene_xml_path=None,
 ):
     """
     Perform coarse grid search to find good initial boresight direction.
@@ -1471,6 +1505,9 @@ def grid_search_initial_boresight(
     This function evaluates multiple boresight directions on a spherical grid
     and returns the one with best coverage in the target zone. Use this to
     initialize gradient-based optimization.
+
+    The grid search uses the same loss function as the optimization to ensure
+    consistency between initialization and refinement phases.
 
     Parameters:
     -----------
@@ -1496,6 +1533,9 @@ def grid_search_initial_boresight(
         Number of sample points for evaluation (fewer = faster)
     seed : int
         Random seed
+    loss_type : str
+        Loss function type (must match optimization):
+        - 'coverage_maximize': Maximize mean power in zone with interference control
     verbose : bool
         Print progress
 
@@ -1505,8 +1545,8 @@ def grid_search_initial_boresight(
         Best azimuth angle in degrees
     best_elevation : float
         Best elevation angle in degrees
-    best_mean_power : float
-        Mean power (dBm) achieved with best boresight
+    best_loss : float
+        Best loss value achieved (lower is better for the loss function)
     grid_results : dict
         Results for all tested directions
     """
@@ -1530,9 +1570,18 @@ def grid_search_initial_boresight(
         )
         print(f"{'='*70}\n")
 
-    # Sample receivers in zone
+    # Sample receivers with 50/50 stratified sampling (same as optimization)
+    # This ensures balanced representation of target zone and interference zone
     sample_points = sample_grid_points(
-        map_config, num_sample_points, seed=seed, zone_mask=zone_mask
+        map_config,
+        num_sample_points,
+        seed=seed,
+        zone_mask=zone_mask,
+        stratified_50_50=True,  # Enable 50/50 sampling between zones
+        scene_xml_path=scene_xml_path,  # Required for building exclusion
+        exclude_buildings=True,  # Filter out points inside buildings
+        use_poisson_disk=True,  # Use Poisson disk sampling for better uniformity
+        min_distance=None,  # Auto-calculate based on num_samples and area
     )
 
     # Get mask values for samples
@@ -1552,6 +1601,14 @@ def grid_search_initial_boresight(
         mask_values.append(zone_mask[j, i])
     mask_values = np.array(mask_values, dtype=np.float32)
 
+    num_in_zone = int(np.sum(mask_values))
+    num_out_zone = len(mask_values) - num_in_zone
+    if verbose:
+        print(f"Sample points: {num_in_zone} inside zone, {num_out_zone} outside zone")
+        print(
+            f"Zone coverage: {100.0 * num_in_zone / len(mask_values):.1f}% of samples\n"
+        )
+
     # Add receivers (reuse for all grid points)
     rx_names = []
     for idx, position in enumerate(sample_points):
@@ -1564,6 +1621,30 @@ def grid_search_initial_boresight(
         scene.add(rx)
 
     p_solver = PathSolver()
+    p_solver.loop_mode = "symbolic"  # Use symbolic mode for pre-computation
+
+    # Compute paths ONCE with initial orientation
+    # We'll extract the paths_buffer and reuse it with updated antenna orientations
+    # This is the same optimization used in optimize_boresight_pathsolver
+    if verbose:
+        print("Computing ray geometry (this will be reused for all grid directions)...")
+
+    paths = p_solver(
+        scene,
+        los=True,
+        refraction=False,
+        specular_reflection=True,
+        diffuse_reflection=False,
+        diffraction=True,
+        edge_diffraction=True,
+    )
+
+    # Extract the paths_buffer for reuse
+    # This contains the pre-traced ray geometry that will be reused with updated antenna orientations
+    paths_buffer = paths._paths_buffer
+
+    if verbose:
+        print("Ray geometry computed. Now testing grid directions...\n")
 
     # Generate grid of directions
     azimuth_angles = np.linspace(0, 360, num_angular_samples, endpoint=False)
@@ -1571,7 +1652,7 @@ def grid_search_initial_boresight(
         min_elevation_deg, max_elevation_deg, num_elevation_samples
     )
 
-    best_mean_power = -np.inf
+    best_loss = np.inf  # Initialize to worst possible for minimization
     best_azimuth = None
     best_elevation = None
     grid_results = []
@@ -1591,65 +1672,106 @@ def grid_search_initial_boresight(
             # Set antenna orientation directly (roll = 0 for antenna pointing)
             tx.orientation = mi.Point3f(float(yaw_rad), float(pitch_rad), 0.0)
 
-            # Compute paths
-            paths = p_solver(
-                scene,
-                los=True,
-                refraction=False,
-                specular_reflection=True,
-                diffuse_reflection=False,
-                diffraction=True,
-                edge_diffraction=True,  # Enable for better obstacle handling in heavily obstructed scenarios
+            # EXTRACT PARAMETERS FROM SCENE (same as PathSolver.__call__ does)
+            # These calls extract current transmitter/receiver states INCLUDING updated orientation
+            src_positions, src_orientations, rel_ant_positions_tx, tx_velocities = (
+                scene.sources(synthetic_array=True, return_velocities=True)
+            )
+            tgt_positions, tgt_orientations, rel_ant_positions_rx, rx_velocities = (
+                scene.targets(synthetic_array=True, return_velocities=True)
             )
 
-            # Compute mean power in zone
+            # Get antenna patterns from scene
+            src_antenna_patterns = scene.tx_array.antenna_pattern.patterns
+            tgt_antenna_patterns = scene.rx_array.antenna_pattern.patterns
+
+            # Call field_calculator with updated orientations
+            # The paths_buffer contains the pre-traced ray geometry
+            # We're recomputing only the field coefficients with new antenna orientation
+            updated_paths_buffer = p_solver._field_calculator(
+                wavelength=scene.wavelength,
+                paths=paths_buffer,  # Pre-computed ray geometry
+                samples_per_src=1000000,
+                diffraction=True,
+                src_positions=src_positions,
+                tgt_positions=tgt_positions,
+                src_orientations=src_orientations,  # Now includes UPDATED orientation
+                tgt_orientations=tgt_orientations,
+                src_antenna_patterns=src_antenna_patterns,
+                tgt_antenna_patterns=tgt_antenna_patterns,
+            )
+
+            # Create Paths object with updated field coefficients
+            paths = Paths(
+                scene,
+                src_positions,
+                tgt_positions,
+                tx_velocities,
+                rx_velocities,
+                True,  # synthetic_array=True
+                updated_paths_buffer,
+                rel_ant_positions_tx,
+                rel_ant_positions_rx,
+            )
+
+            # ============================================
+            # OBJECTIVE: PROPORTIONAL FAIRNESS (Log-Utility)
+            # ============================================
+            # Match the loss function from optimize_boresight_pathsolver()
+            # This naturally balances "Mean" and "Min" without manual weights.
+
+            # Step 1: Compute Linear Power (Watts)
+            # Use Dr.Jit ops for speed, then convert to numpy
+            # IMPORTANT: Must match the exact calculation in compute_loss()
             h_real, h_imag = paths.a
-            sum_power_db = 0.0
-            count_in_zone = 0
+            power_linear = dr.sum(
+                dr.sum(cpx_abs_square((h_real, h_imag)), axis=-1), axis=-1
+            )
+            power_linear = dr.sum(power_linear, axis=-1)
 
-            for rx_idx in range(num_sample_points):
-                if mask_values[rx_idx] > 0.5:  # In zone
-                    h_real_rx = h_real[rx_idx : rx_idx + 1, ...]
-                    h_imag_rx = h_imag[rx_idx : rx_idx + 1, ...]
+            # Convert to Numpy for scalar logic (detach from any computation graph)
+            power_linear_np = np.array(power_linear, dtype=np.float32)
 
-                    path_gain_linear = dr.sum(
-                        dr.sum(cpx_abs_square((h_real_rx, h_imag_rx)))
-                    )
-                    path_gain_db = (
-                        10.0
-                        * dr.log(dr.maximum(path_gain_linear, 1e-30))
-                        / dr.log(10.0)
-                    )
+            # Step 2: Define "Fairness Bias" (The anchor point)
+            # Set this to the "Edge of Coverage" you care about (e.g., -100 dBm).
+            # -100 dBm = 1e-10 Watts, but we use 1e-11 for more sensitivity
+            bias_watts = 1e-11
 
-                    # Extract scalar value from DrJit tensor
-                    # Convert to numpy array first, then extract scalar
-                    path_gain_db_val = float(np.array(path_gain_db))
+            # Step 3: Compute Utility
+            # function: log(1 + P / bias)
+            # If P is small (< bias): Behaves linearly (Strong Gradient).
+            # If P is large (> bias): Behaves logarithmically (Diminishing Gradient).
+            utility = np.log(1.0 + (power_linear_np / bias_watts))
 
-                    sum_power_db += path_gain_db_val
-                    count_in_zone += 1
+            # Step 4: Apply Target Mask
+            mask_target = mask_values.astype(np.float32)
+            valid_points = np.maximum(np.sum(mask_target), 1.0)
 
-            mean_power = sum_power_db / max(count_in_zone, 1)
+            # Step 5: Compute Loss (negative utility for minimization)
+            # Match optimizer convention: minimize loss = maximize utility
+            loss = -np.sum(utility * mask_target) / valid_points
 
             grid_results.append(
                 {
                     "azimuth_deg": azimuth_deg,
                     "elevation_deg": elevation_deg,
-                    "mean_power_db": mean_power,
+                    "loss": loss,
                 }
             )
 
-            if mean_power > best_mean_power:
-                best_mean_power = mean_power
+            # Find MINIMUM loss (same as optimizer: minimize = maximize utility)
+            if loss < best_loss:
+                best_loss = loss
                 best_azimuth = azimuth_deg
                 best_elevation = elevation_deg
 
                 if verbose:
                     print(
-                        f"[{test_idx}/{total_tests}] NEW BEST: Az={azimuth_deg:.0f}°, El={elevation_deg:.0f}° → {mean_power:.1f} dB"
+                        f"[{test_idx}/{total_tests}] NEW BEST: Az={azimuth_deg:.0f}°, El={elevation_deg:.0f}° → Loss={loss:.4f}"
                     )
             elif verbose and test_idx % 5 == 0:
                 print(
-                    f"[{test_idx}/{total_tests}] Az={azimuth_deg:.0f}°, El={elevation_deg:.0f}° → {mean_power:.1f} dB"
+                    f"[{test_idx}/{total_tests}] Az={azimuth_deg:.0f}°, El={elevation_deg:.0f}° → Loss={loss:.4f}"
                 )
 
     # Cleanup receivers
@@ -1664,10 +1786,10 @@ def grid_search_initial_boresight(
         print(
             f"Best angles: Azimuth={best_azimuth:.1f}°, Elevation={best_elevation:.1f}°"
         )
-        print(f"Best mean power: {best_mean_power:.1f} dB")
+        print(f"Lowest loss: {best_loss}")
         print(f"{'='*70}\n")
 
-    return best_azimuth, best_elevation, best_mean_power, grid_results
+    return best_azimuth, best_elevation, best_loss, grid_results
 
 
 def optimize_boresight_pathsolver(
@@ -1809,9 +1931,9 @@ def optimize_boresight_pathsolver(
             print("PHASE 2: Gradient-Based Refinement")
             print("=" * 70)
             print(
-                f"Starting from grid search result: Azimuth={initial_azimuth:.1f}°, Elevation={initial_elevation:.1f}°"
+                f"Starting from grid search result: Azimuth={initial_azimuth}°, Elevation={initial_elevation}°"
             )
-            print(f"Grid search mean power: {best_grid_power:.1f} dB")
+            print(f"Grid search mean power: {best_grid_power} dB")
             print("=" * 70 + "\n")
 
     # TX height already extracted above (tx_z is already detached)
@@ -1865,7 +1987,7 @@ def optimize_boresight_pathsolver(
         scene_xml_path=scene_xml_path,  # Required for building exclusion
         exclude_buildings=True,  # Filter out points inside buildings
         use_poisson_disk=True,  # Use Poisson disk sampling for better uniformity
-        min_distance=None  # Auto-calculate based on num_samples and area
+        min_distance=None,  # Auto-calculate based on num_samples and area
     )
 
     # CRITICAL: Update num_sample_points to reflect actual number of samples
@@ -1887,6 +2009,7 @@ def optimize_boresight_pathsolver(
 
     # Display the visualization
     import matplotlib.pyplot as plt
+
     plt.show()
 
     # Extract zone mask values at sampled points
@@ -2092,92 +2215,40 @@ def optimize_boresight_pathsolver(
                 )
 
         # ============================================
-        # VECTORIZED LOSS COMPUTATION WITH INTERFERENCE CONTROL (CLAMPED)
+        # OBJECTIVE: PROPORTIONAL FAIRNESS (Log-Utility)
         # ============================================
-        # This replaces the loop-based approach with vectorized operations for better performance
-        # Includes ReLU clamping to prevent interference optimization from overpowering target optimization
+        # This naturally balances "Mean" and "Min" without manual weights.
+        # It implements "Diminishing Returns": 
+        # - Fixing a dead zone is High Reward.
+        # - Boosting a strong signal is Low Reward.
 
-        # Step 1: Compute power in dB for ALL receivers at once (vectorized)
-        # Sum over all dimensions except the receiver dimension (axis 0)
+        # Step 1: Compute Linear Power (Watts)
         power_linear = dr.sum(
             dr.sum(cpx_abs_square((h_real, h_imag)), axis=-1), axis=-1
         )
-        power_linear = dr.sum(power_linear, axis=-1)  # Sum over remaining dimensions
+        power_linear = dr.sum(power_linear, axis=-1)
 
-        # Convert to dB (clamped to avoid log(0))
-        power_db = (
-            10.0
-            * dr.log(dr.maximum(power_linear, dr.auto.ad.Float(1e-30)))
-            / dr.log(dr.auto.ad.Float(10.0))
-        )
-
-        # Step 2: Prepare masks as DrJit Float arrays
-        # Convert numpy mask to DrJit array for vectorized operations
-        # Target mask: 1.0 where we want signal (inside zone)
-        mask_target = dr.auto.ad.Float(mask_values)
-        dr.disable_grad(mask_target)  # Mask is constant
-
-        # Interference mask: 1.0 where we want to minimize power (outside zone)
-        mask_interference = dr.auto.ad.Float(1.0) - mask_target
-        dr.disable_grad(mask_interference)
-
-        # Step 3: Objective A - Maximize signal in target zone using Soft-Min (LSE)
-        # Logic: We want coverage in the target zone to be HIGH
-        # Soft-Min lifts the "dead zones" (worst-case points)
-        soft_min_alpha = dr.auto.ad.Float(5.0)
-
-        # Add large value to points OUTSIDE the mask so Soft-Min ignores them
-        # Soft-Min looks for SMALL values, so we add +1000 to non-target points
-        power_target_safe = power_db + (
-            dr.auto.ad.Float(1.0) - mask_target
-        ) * dr.auto.ad.Float(1000.0)
-
-        # Calculate Soft-Min: -alpha * log(sum(exp(-x/alpha)))
-        # This approximates the minimum power in the target zone
-        exp_sum_target = dr.sum(dr.exp(-power_target_safe / soft_min_alpha))
-        target_score = -soft_min_alpha * dr.log(exp_sum_target)
-
-        # Loss for target zone: negative because we want to MAXIMIZE this
-        loss_target = -target_score
-
-        # Step 4: Objective B - Minimize interference in non-target zone using Soft-Max WITH CLAMPING
-        # Logic: We want power OUTSIDE the target zone to be LOW, but only until a safety threshold.
-        # Once below threshold, we stop optimizing interference to let the target objective win.
-        soft_max_alpha = dr.auto.ad.Float(5.0)
-
-        # Subtract large value from points OUTSIDE the interference mask so Soft-Max ignores them
-        # Soft-Max looks for LARGE values, so we subtract 1000 from non-interference points
-        power_interference_safe = power_db - (
-            dr.auto.ad.Float(1.0) - mask_interference
-        ) * dr.auto.ad.Float(1000.0)
-
-        # Calculate Soft-Max: alpha * log(sum(exp(x/alpha)))
-        # This approximates the maximum power in the interference zone
-        exp_sum_interference = dr.sum(dr.exp(power_interference_safe / soft_max_alpha))
-        interference_score = soft_max_alpha * dr.log(exp_sum_interference)
-
-        # --- CLAMPING FIX (ReLU) ---
-        # Define safety threshold (e.g., -85 dBm). Below this, interference is considered "solved".
-        # Adjust this value based on your noise floor requirements (-85.0 to -90.0 is typical).
-        max_allowed_interference = dr.auto.ad.Float(-90.0)
+        # Step 2: Define "Fairness Bias" (The anchor point)
+        # Set this to the "Edge of Coverage" you care about (e.g., -100 dBm).
+        # -100 dBm = 1e-10 Watts.
+        bias_watts = dr.auto.ad.Float(1e-11)
         
-        # ReLU: Only penalize if we are ABOVE the threshold.
-        # If interference is -90dBm, the result is 0.0, and the gradient becomes 0.0.
-        loss_interference = dr.maximum(interference_score - max_allowed_interference, dr.auto.ad.Float(0.0))
+        # Step 3: Compute Utility
+        # function: log(1 + P / bias)
+        # If P is small (< bias): Behaves linearly (Strong Gradient).
+        # If P is large (> bias): Behaves logarithmically (Diminishing Gradient).
+        utility = 10.0 * dr.log(1.0 + (power_linear / bias_watts))
+        
+        # Step 4: Apply Target Mask
+        mask_target = dr.auto.ad.Float(mask_values)
+        dr.disable_grad(mask_target)
+        valid_points = dr.maximum(dr.sum(mask_target), 1.0)
+        
+        # Step 5: Maximize Total Utility
+        # (Negative because we minimize loss)
+        loss = -dr.sum(utility * mask_target) / valid_points
 
-        # Step 5: Combined loss with interference weighting
-        # Total = (Maximize Target) + lambda * (Minimize Interference)
-        if loss_type == "coverage_maximize":
-            # With clamping, we can afford a stronger weight (e.g., 1.0) because it only
-            # activates when the interference is dangerously high.
-            interference_weight = dr.auto.ad.Float(1.0)
-            normalized_loss = loss_target + interference_weight * loss_interference
-        else:
-            raise ValueError(
-                f"Unknown loss_type: '{loss_type}'. " f"Must be 'coverage_maximize'"
-            )
-
-        return normalized_loss
+        return loss
 
     # PyTorch parameters: azimuth and elevation angles (in degrees)
     # Using 0-D tensors (scalars) - this is the ONLY pattern that works with @dr.wrap
@@ -2354,7 +2425,8 @@ def optimize_boresight_pathsolver(
 
             # Elevation: clamp to prevent pointing upward (only downward tilt)
             # 0° = horizontal, negative = downward tilt
-            elevation.clamp_(min=-90.0, max=0.0)
+            # Adding a hard constraint that's realistic for the given scenario
+            # elevation.clamp_(min=-20.0, max=10.0)
 
         # Track
         loss_history.append(loss.item())
