@@ -1178,15 +1178,18 @@ def compare_boresight_performance(
         rm = rm_solver(
             scene,
             max_depth=5,
-            samples_per_tx=int(1e8),
-            cell_size=map_config["cell_size"],
-            center=map_config["center"],
+            samples_per_tx=int(6e8),
+            cell_size=map_config['cell_size'],
+            center=map_config['center'],
             orientation=[0, 0, 0],
-            size=map_config["size"],
+            size=map_config['size'],
             los=True,
             specular_reflection=True,
             diffuse_reflection=True,
+            diffraction=True,
+            edge_diffraction=True,
             refraction=False,
+            stop_threshold=None,
         )
 
         # Extract signal strength
