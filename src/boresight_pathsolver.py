@@ -2215,40 +2215,50 @@ def optimize_boresight_pathsolver(
                 )
 
         # ============================================
-        # OBJECTIVE: PROPORTIONAL FAIRNESS (Log-Utility)
+        # OBJECTIVE: ZERO-TOLERANCE FLOOR
         # ============================================
-        # This naturally balances "Mean" and "Min" without manual weights.
-        # It implements "Diminishing Returns": 
-        # - Fixing a dead zone is High Reward.
-        # - Boosting a strong signal is Low Reward.
-
-        # Step 1: Compute Linear Power (Watts)
-        power_linear = dr.sum(
+        # 1. Priority 1: ELIMINATE OUTLIERS (< -90 dBm).
+        # 2. Priority 2: Improve coverage (Only after P1 is safe).
+        
+        # --- COMPUTE RELATIVE POWER ---
+        power_relative = dr.sum(
             dr.sum(cpx_abs_square((h_real, h_imag)), axis=-1), axis=-1
         )
-        power_linear = dr.sum(power_linear, axis=-1)
+        power_relative = dr.sum(power_relative, axis=-1)
 
-        # Step 2: Define "Fairness Bias" (The anchor point)
-        # Set this to the "Edge of Coverage" you care about (e.g., -100 dBm).
-        # -100 dBm = 1e-10 Watts.
-        bias_watts = dr.auto.ad.Float(1e-11)
-        
-        # Step 3: Compute Utility
-        # function: log(1 + P / bias)
-        # If P is small (< bias): Behaves linearly (Strong Gradient).
-        # If P is large (> bias): Behaves logarithmically (Diminishing Gradient).
-        utility = 10.0 * dr.log(1.0 + (power_linear / bias_watts))
-        
-        # Step 4: Apply Target Mask
         mask_target = dr.auto.ad.Float(mask_values)
         dr.disable_grad(mask_target)
         valid_points = dr.maximum(dr.sum(mask_target), 1.0)
-        
-        # Step 5: Maximize Total Utility
-        # (Negative because we minimize loss)
-        loss = -dr.sum(utility * mask_target) / valid_points
 
-        return loss
+        # --- PARAMETERS ---
+        # Target: -90 dBm Absolute (-134 dB Relative)
+        target_floor_rel = dr.auto.ad.Float(4.0e-14)
+        
+        # Bias: Deep enough to be logarithmic, but we weight it lightly
+        bias_rel = dr.auto.ad.Float(1e-16)
+
+        # --- TERM A: THE PENALTY (CRISIS MODE) ---
+        # Calculate Percentage Failure
+        # If Power = 2e-14 (Half of target), Deficit = 0.5
+        deficit = dr.maximum((target_floor_rel - power_relative) / target_floor_rel, 0.0)
+        
+        # WEIGHTING: NUCLEAR
+        # We want this to be the ONLY thing the optimizer sees if deficit > 0.
+        # 1,000,000 ensures that a 1% violation (0.01) generates a Loss of 100.
+        penalty_weight = dr.auto.ad.Float(1e6)
+        loss_floor = penalty_weight * dr.sum(dr.sqr(deficit) * mask_target) / valid_points
+
+        # --- TERM B: THE LIFT (BONUS MODE) ---
+        # We scale this DOWN. 
+        # We want the 'Lift' gradient to be a whisper compared to the 'Floor' scream.
+        # Standard Log Utility ~ 10-100. We multiply by 0.01.
+        # This means the optimizer will only listen to this term if loss_floor is near zero.
+        lift_weight = dr.auto.ad.Float(0.01)
+        
+        utility = dr.log(1.0 + (power_relative / bias_rel))
+        loss_lift = -lift_weight * dr.sum(utility * mask_target) / valid_points
+
+        return loss_floor + loss_lift
 
     # PyTorch parameters: azimuth and elevation angles (in degrees)
     # Using 0-D tensors (scalars) - this is the ONLY pattern that works with @dr.wrap
