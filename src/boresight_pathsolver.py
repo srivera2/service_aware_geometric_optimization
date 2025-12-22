@@ -23,6 +23,7 @@ from angle_utils import (
     normalize_azimuth,
     clamp_elevation,
 )
+from loss import linear_power
 
 
 def create_optimization_gif(
@@ -1185,7 +1186,7 @@ def compare_boresight_performance(
             size=map_config['size'],
             los=True,
             specular_reflection=True,
-            diffuse_reflection=True,
+            diffuse_reflection=False,
             diffraction=True,
             edge_diffraction=True,
             refraction=False,
@@ -1612,6 +1613,16 @@ def grid_search_initial_boresight(
             f"Zone coverage: {100.0 * num_in_zone / len(mask_values):.1f}% of samples\n"
         )
 
+    # CRITICAL: Remove ALL existing receivers from the scene first
+    # This ensures paths.a indexing matches our sampled receivers exactly
+    existing_receivers = list(scene.receivers.keys())
+    if verbose and existing_receivers:
+        print(
+            f"Removing {len(existing_receivers)} existing receiver(s): {existing_receivers}"
+        )
+    for rx_name_to_remove in existing_receivers:
+        scene.remove(rx_name_to_remove)
+
     # Add receivers (reuse for all grid points)
     rx_names = []
     for idx, position in enumerate(sample_points):
@@ -1717,42 +1728,9 @@ def grid_search_initial_boresight(
                 rel_ant_positions_rx,
             )
 
-            # ============================================
-            # OBJECTIVE: PROPORTIONAL FAIRNESS (Log-Utility)
-            # ============================================
-            # Match the loss function from optimize_boresight_pathsolver()
-            # This naturally balances "Mean" and "Min" without manual weights.
+            h_real, h_img = paths.a
 
-            # Step 1: Compute Linear Power (Watts)
-            # Use Dr.Jit ops for speed, then convert to numpy
-            # IMPORTANT: Must match the exact calculation in compute_loss()
-            h_real, h_imag = paths.a
-            power_linear = dr.sum(
-                dr.sum(cpx_abs_square((h_real, h_imag)), axis=-1), axis=-1
-            )
-            power_linear = dr.sum(power_linear, axis=-1)
-
-            # Convert to Numpy for scalar logic (detach from any computation graph)
-            power_linear_np = np.array(power_linear, dtype=np.float32)
-
-            # Step 2: Define "Fairness Bias" (The anchor point)
-            # Set this to the "Edge of Coverage" you care about (e.g., -100 dBm).
-            # -100 dBm = 1e-10 Watts, but we use 1e-11 for more sensitivity
-            bias_watts = 1e-11
-
-            # Step 3: Compute Utility
-            # function: log(1 + P / bias)
-            # If P is small (< bias): Behaves linearly (Strong Gradient).
-            # If P is large (> bias): Behaves logarithmically (Diminishing Gradient).
-            utility = np.log(1.0 + (power_linear_np / bias_watts))
-
-            # Step 4: Apply Target Mask
-            mask_target = mask_values.astype(np.float32)
-            valid_points = np.maximum(np.sum(mask_target), 1.0)
-
-            # Step 5: Compute Loss (negative utility for minimization)
-            # Match optimizer convention: minimize loss = maximize utility
-            loss = -np.sum(utility * mask_target) / valid_points
+            loss = linear_power(h_real, h_img, mask_values)
 
             grid_results.append(
                 {
@@ -1770,11 +1748,11 @@ def grid_search_initial_boresight(
 
                 if verbose:
                     print(
-                        f"[{test_idx}/{total_tests}] NEW BEST: Az={azimuth_deg:.0f}°, El={elevation_deg:.0f}° → Loss={loss:.4f}"
+                        f"[{test_idx}/{total_tests}] NEW BEST: Az={azimuth_deg}°, El={elevation_deg}° → Loss={loss}"
                     )
             elif verbose and test_idx % 5 == 0:
                 print(
-                    f"[{test_idx}/{total_tests}] Az={azimuth_deg:.0f}°, El={elevation_deg:.0f}° → Loss={loss:.4f}"
+                    f"[{test_idx}/{total_tests}] Az={azimuth_deg}°, El={elevation_deg}° → Loss={loss}"
                 )
 
     # Cleanup receivers
@@ -1787,7 +1765,7 @@ def grid_search_initial_boresight(
         print("Grid Search Complete!")
         print(f"{'='*70}")
         print(
-            f"Best angles: Azimuth={best_azimuth:.1f}°, Elevation={best_elevation:.1f}°"
+            f"Best angles: Azimuth={best_azimuth}°, Elevation={best_elevation}°"
         )
         print(f"Lowest loss: {best_loss}")
         print(f"{'='*70}\n")
@@ -1980,7 +1958,8 @@ def optimize_boresight_pathsolver(
 
     # Sample grid points for receivers with 50/50 stratified sampling
     # This ensures balanced representation of target zone and interference zone
-    # Also filters out building locations and uses Poisson disk sampling for uniformity
+    # Filters out buildings
+    # Uses Poisson disk sampling for uniformity
     sample_points = sample_grid_points(
         map_config,
         num_sample_points,
@@ -2074,9 +2053,9 @@ def optimize_boresight_pathsolver(
         los=True,
         refraction=False,
         specular_reflection=True,
-        diffuse_reflection=False,
+        diffuse_reflection=True,
         diffraction=True,
-        edge_diffraction=True,  # Enable for better obstacle handling in heavily obstructed scenarios
+        edge_diffraction=True
     )
 
     # Extract the paths_buffer for reuse in compute_loss
@@ -2217,51 +2196,8 @@ def optimize_boresight_pathsolver(
                     f"  [WARNING] Very low or zero path power - PathSolver may not be finding paths!"
                 )
 
-        # ============================================
-        # OBJECTIVE: ZERO-TOLERANCE FLOOR
-        # ============================================
-        # 1. Priority 1: ELIMINATE OUTLIERS (< -90 dBm).
-        # 2. Priority 2: Improve coverage (Only after P1 is safe).
-        
-        # --- COMPUTE RELATIVE POWER ---
-        power_relative = dr.sum(
-            dr.sum(cpx_abs_square((h_real, h_imag)), axis=-1), axis=-1
-        )
-        power_relative = dr.sum(power_relative, axis=-1)
-
-        mask_target = dr.auto.ad.Float(mask_values)
-        dr.disable_grad(mask_target)
-        valid_points = dr.maximum(dr.sum(mask_target), 1.0)
-
-        # --- PARAMETERS ---
-        # Target: -90 dBm Absolute (-134 dB Relative)
-        target_floor_rel = dr.auto.ad.Float(4.0e-14)
-        
-        # Bias: Deep enough to be logarithmic, but we weight it lightly
-        bias_rel = dr.auto.ad.Float(1e-16)
-
-        # --- TERM A: THE PENALTY (CRISIS MODE) ---
-        # Calculate Percentage Failure
-        # If Power = 2e-14 (Half of target), Deficit = 0.5
-        deficit = dr.maximum((target_floor_rel - power_relative) / target_floor_rel, 0.0)
-        
-        # WEIGHTING: NUCLEAR
-        # We want this to be the ONLY thing the optimizer sees if deficit > 0.
-        # 1,000,000 ensures that a 1% violation (0.01) generates a Loss of 100.
-        penalty_weight = dr.auto.ad.Float(1e6)
-        loss_floor = penalty_weight * dr.sum(dr.sqr(deficit) * mask_target) / valid_points
-
-        # --- TERM B: THE LIFT (BONUS MODE) ---
-        # We scale this DOWN. 
-        # We want the 'Lift' gradient to be a whisper compared to the 'Floor' scream.
-        # Standard Log Utility ~ 10-100. We multiply by 0.01.
-        # This means the optimizer will only listen to this term if loss_floor is near zero.
-        lift_weight = dr.auto.ad.Float(0.01)
-        
-        utility = dr.log(1.0 + (power_relative / bias_rel))
-        loss_lift = -lift_weight * dr.sum(utility * mask_target) / valid_points
-
-        return loss_floor + loss_lift
+        # Linear Power
+        return linear_power(h_real, h_imag, mask_values)
 
     # PyTorch parameters: azimuth and elevation angles (in degrees)
     # Using 0-D tensors (scalars) - this is the ONLY pattern that works with @dr.wrap
