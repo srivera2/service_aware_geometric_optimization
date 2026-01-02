@@ -23,6 +23,7 @@ from angle_utils import (
     normalize_azimuth,
     clamp_elevation,
 )
+from loss import linear_power
 
 
 def create_optimization_gif(
@@ -1185,7 +1186,7 @@ def compare_boresight_performance(
             size=map_config['size'],
             los=True,
             specular_reflection=True,
-            diffuse_reflection=True,
+            diffuse_reflection=False,
             diffraction=True,
             edge_diffraction=True,
             refraction=False,
@@ -1717,12 +1718,6 @@ def grid_search_initial_boresight(
                 rel_ant_positions_rx,
             )
 
-            # ============================================
-            # OBJECTIVE: PROPORTIONAL FAIRNESS (Log-Utility)
-            # ============================================
-            # Match the loss function from optimize_boresight_pathsolver()
-            # This naturally balances "Mean" and "Min" without manual weights.
-
             # Step 1: Compute Linear Power (Watts)
             # Use Dr.Jit ops for speed, then convert to numpy
             # IMPORTANT: Must match the exact calculation in compute_loss()
@@ -1837,6 +1832,10 @@ def optimize_boresight_pathsolver(
     tx_z = float(dr.detach(tx.position[2])[0])
     tx_position = [tx_x, tx_y, tx_z]
 
+    # Get transmit power for proper power calculation
+    tx_power_dbm = float(tx.power_dbm[0])
+    print(f"Transmit Power in dBm: {tx_power_dbm}")
+
     # Determine if initial_boresight is angles or position
     # If it's a position [x, y, z], convert to angles
     # If grid search is used, angles will be overridden anyway
@@ -1860,6 +1859,7 @@ def optimize_boresight_pathsolver(
             )
             print(f"  (converted from look_at position: {initial_boresight})")
         print(f"Use grid search init: {use_grid_search_init}")
+        print(f"Transmit power: {tx_power_dbm:.2f} dBm")
         print(f"Learning rate: {learning_rate}")
         print(f"Iterations: {num_iterations}")
         print(f"Sample points: {num_sample_points}")
@@ -2216,52 +2216,62 @@ def optimize_boresight_pathsolver(
                 print(
                     f"  [WARNING] Very low or zero path power - PathSolver may not be finding paths!"
                 )
-
-        # ============================================
-        # OBJECTIVE: ZERO-TOLERANCE FLOOR
-        # ============================================
-        # 1. Priority 1: ELIMINATE OUTLIERS (< -90 dBm).
-        # 2. Priority 2: Improve coverage (Only after P1 is safe).
         
-        # --- COMPUTE RELATIVE POWER ---
+        # --- 1. EXTRACT PATH COEFFICIENTS ---
+        h_real, h_imag = paths.a
+
+        # --- 2. COMPUTE RAW CHANNEL GAIN (|h|^2) ---
         power_relative = dr.sum(
             dr.sum(cpx_abs_square((h_real, h_imag)), axis=-1), axis=-1
         )
         power_relative = dr.sum(power_relative, axis=-1)
 
+        # --- 3. APPLY PHYSICAL SCALING (The "50 dB" Fix) ---
+        # Sionna's RadioMapSolver uses the effective area of the antenna: (lambda / 4pi)^2
+        # Without this, you are optimizing raw gain, not received power.
+        c = 299792458.0
+        wavelength = c / scene.frequency
+        # Normalization factor for isotropic reception (as per Sionna Tech Report S4.1)
+        fspl_fix = (wavelength / (4.0 * np.pi))**2
+        
+        # Convert TX Power to Watts for the linear calculation
+        tx_power_watts_float = 10.0 ** ((tx_power_dbm - 30.0) / 10.0)
+        tx_power_watts = dr.auto.ad.Float(tx_power_watts_float)
+
+        # Physical Power (Watts) = |h|^2 * P_tx * (lambda/4pi)^2
+        physical_power_linear = power_relative * tx_power_watts * fspl_fix
+
+        # --- 4. PREPARE MASK ---
         mask_target = dr.auto.ad.Float(mask_values)
         dr.disable_grad(mask_target)
         valid_points = dr.maximum(dr.sum(mask_target), 1.0)
 
-        # --- PARAMETERS ---
-        # Target: -90 dBm Absolute (-134 dB Relative)
-        target_floor_rel = dr.auto.ad.Float(4.0e-14)
-        
-        # Bias: Deep enough to be logarithmic, but we weight it lightly
-        bias_rel = dr.auto.ad.Float(1e-16)
+        # --- 5. OPTIMIZATION ---
+        # We optimize the Physical Power directly to match the RadioMap goal.
+        # Scale by 1e12 (picoWatts) to keep gradients healthy for DrJit.
+        scale_factor = dr.auto.ad.Float(1e12)
+        loss = -dr.sum(physical_power_linear * scale_factor * mask_target) / valid_points
 
-        # --- TERM A: THE PENALTY (CRISIS MODE) ---
-        # Calculate Percentage Failure
-        # If Power = 2e-14 (Half of target), Deficit = 0.5
-        deficit = dr.maximum((target_floor_rel - power_relative) / target_floor_rel, 0.0)
-        
-        # WEIGHTING: NUCLEAR
-        # We want this to be the ONLY thing the optimizer sees if deficit > 0.
-        # 1,000,000 ensures that a 1% violation (0.01) generates a Loss of 100.
-        penalty_weight = dr.auto.ad.Float(1e6)
-        loss_floor = penalty_weight * dr.sum(dr.sqr(deficit) * mask_target) / valid_points
+        # --- 6. FOR COMPARISON ONLY (Diagnostic Prints) ---
+        with dr.suspend_grad():
+            # Extract mean physical linear power for comparison
+            mean_power_phys = dr.sum(physical_power_linear * mask_target) / valid_points
+            
+            # Convert to Python float safely
+            mean_power_phys_np = np.array(mean_power_phys, dtype=np.float32)
+            mean_power_phys_float = float(mean_power_phys_np.item() if mean_power_phys_np.size == 1 else mean_power_phys_np.flatten()[0])
 
-        # --- TERM B: THE LIFT (BONUS MODE) ---
-        # We scale this DOWN. 
-        # We want the 'Lift' gradient to be a whisper compared to the 'Floor' scream.
-        # Standard Log Utility ~ 10-100. We multiply by 0.01.
-        # This means the optimizer will only listen to this term if loss_floor is near zero.
-        lift_weight = dr.auto.ad.Float(0.01)
-        
-        utility = dr.log(1.0 + (power_relative / bias_rel))
-        loss_lift = -lift_weight * dr.sum(utility * mask_target) / valid_points
+            # Convert to dBm: RSS_dBm = 10*log10(RSS_W) + 30
+            # Adding epsilon for log safety
+            mean_rss_dbm = 10.0 * np.log10(mean_power_phys_float + 1e-30) + 30.0
 
-        return loss_floor + loss_lift
+            # Raw Mean |h|^2 (For your original reference)
+            mean_h2 = dr.sum(power_relative * mask_target) / valid_points
+            mean_h2_float = float(np.array(mean_h2).item())
+
+            print(f"Mean |h|²: {mean_h2_float:.6e} | Aligned RSS: {mean_rss_dbm:.2f} dBm (TX: {tx_power_dbm:.2f} dBm)")
+
+        return loss
 
     # PyTorch parameters: azimuth and elevation angles (in degrees)
     # Using 0-D tensors (scalars) - this is the ONLY pattern that works with @dr.wrap
@@ -2354,10 +2364,10 @@ def optimize_boresight_pathsolver(
             print(
                 f"  Gradients: dAz={grad_azimuth_val:+.3e}°, dEl={grad_elevation_val:+.3e}° (norm={grad_norm:.3e})"
             )
-            # RMSE is not applicable for a maximization objective, print mean power instead
-            mean_power_in_zone = -loss.item()
+            # Convert loss back to mean power in dBm
+            mean_power_in_zone = -loss.item() / 1e2  # Divide by scale_factor
             print(
-                f"  Loss: {loss.item():.4f}, Mean Power in Zone: {mean_power_in_zone:.2f} dB"
+                f"  Loss: {loss.item():.4f}, Mean Power in Zone: {mean_power_in_zone:.2f} dBm"
             )
 
         # Update
@@ -2476,9 +2486,11 @@ def optimize_boresight_pathsolver(
         "num_samples_total": len(mask_values),
         "zone_coverage_fraction": num_in_zone / len(mask_values),
         "final_loss": best_loss,
+        "final_mean_power_linear": -best_loss / 1e10,  # Convert loss to linear power
         "loss_type": loss_type,
         "best_azimuth_deg": best_azimuth_final,
         "best_elevation_deg": best_elevation_final,
+        "tx_power_dbm": tx_power_dbm,
     }
 
     if verbose:
@@ -2490,8 +2502,8 @@ def optimize_boresight_pathsolver(
         )
         print(f"Best loss: {best_loss:.4f}")
         if loss_type == "coverage_maximize":
-            print(f"  (Maximizing mean power in zone)")
-            print(f"  Negative loss = {-best_loss:.2f} dB (approximate mean power)")
+            print(f"  (Maximizing mean power in zone - LINEAR scale)")
+            print(f"  Mean power (linear): {-best_loss / 1e10:.6e}")
         elif loss_type == "coverage_threshold":
             print(f"  (Maximizing fraction above {power_threshold_dbm} dB)")
             print(f"  Estimated coverage: {-best_loss*100:.1f}% of zone")
