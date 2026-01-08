@@ -108,7 +108,7 @@ def yaw_pitch_to_azimuth_elevation(yaw_rad, pitch_rad):
     return azimuth_deg, elevation_deg
 
 
-def compute_initial_angles_from_position(tx_position, look_at_position):
+def compute_initial_angles_from_position(tx_position, look_at_position, verbose=False):
     """
     Compute azimuth and elevation angles from TX position to a look_at point.
 
@@ -120,6 +120,8 @@ def compute_initial_angles_from_position(tx_position, look_at_position):
         [x, y, z] position of transmitter
     look_at_position : array-like
         [x, y, z] position of look_at target point
+    verbose : bool, optional
+        If True, print detailed computation steps for debugging
 
     Returns:
     --------
@@ -154,6 +156,12 @@ def compute_initial_angles_from_position(tx_position, look_at_position):
     # Elevation: angle from horizontal plane
     elevation_rad = np.arctan2(dz, horizontal_dist)
     elevation_deg = np.degrees(elevation_rad)
+
+    if verbose:
+        print(f"  Direction vector: dx={dx:.2f}m, dy={dy:.2f}m, dz={dz:.2f}m")
+        print(f"  Horizontal distance: {horizontal_dist:.2f}m")
+        print(f"  Azimuth calculation: arctan2({dy:.2f}, {dx:.2f}) = {azimuth_deg:.2f}°")
+        print(f"  Elevation calculation: arctan2({dz:.2f}, {horizontal_dist:.2f}) = {elevation_deg:.2f}°")
 
     return azimuth_deg, elevation_deg
 
