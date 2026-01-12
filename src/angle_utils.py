@@ -137,7 +137,9 @@ def compute_initial_angles_from_position(tx_position, look_at_position, verbose=
     >>> print(f"Azimuth: {az:.1f}°, Elevation: {el:.1f}°")
     """
     tx_x, tx_y, tx_z = tx_position
+    print(f"Tx Position: {tx_position}")
     target_x, target_y, target_z = look_at_position
+    print(f"look_at_position: {look_at_position}")
 
     # Compute direction vector
     dx = target_x - tx_x

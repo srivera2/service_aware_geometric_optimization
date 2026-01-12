@@ -687,14 +687,9 @@ def create_zone_mask(
 
 def sample_grid_points(
     map_config,
-    num_samples=100,
-    seed=None,
-    zone_mask=None,
-    stratified_50_50=False,
     scene_xml_path=None,
     exclude_buildings=True,
-    use_poisson_disk=True,
-    min_distance=None,
+    zone_mask=None,
 ):
     """
     Sample points from the radio map grid with optional 50/50 stratified sampling
@@ -743,8 +738,7 @@ def sample_grid_points(
 
     center_x, center_y, ground_z = map_config["center"]
 
-    # Sample uniformly from grid
-    # Use endpoint=False and shift to cell centers for consistency with create_zone_mask
+    # Create each axis
     x = (
         np.linspace(center_x - width_m / 2, center_x + width_m / 2, n_x, endpoint=False)
         + cell_w / 2
@@ -756,106 +750,18 @@ def sample_grid_points(
         + cell_h / 2
     )
 
+    # Create meshgrid
     X, Y = np.meshgrid(x, y)
 
-    # 50/50 stratified sampling mode
-    if stratified_50_50 and zone_mask is not None:
-        # Split samples 50/50 between target zone and interference zone
-        num_target = num_samples // 2
-        num_interference = num_samples - num_target  # Handle odd numbers
+    # Original behavior: sample from entire grid
+    all_points = np.column_stack([X.flatten(), Y.flatten()])
 
-        # Get target zone points (mask == 1.0)
-        target_mask = zone_mask == 1.0
-        target_x = X[target_mask]
-        target_y = Y[target_mask]
-        target_points = np.column_stack([target_x, target_y])
-
-        # Get interference zone points (mask == 0.0)
-        interference_mask = zone_mask == 0.0
-        interference_x = X[interference_mask]
-        interference_y = Y[interference_mask]
-        interference_points = np.column_stack([interference_x, interference_y])
-
-        if len(target_points) == 0:
-            raise ValueError("Target zone is empty - no valid sampling points!")
-        if len(interference_points) == 0:
-            raise ValueError("Interference zone is empty - no valid sampling points!")
-
-        # Use uniform grid sampling (evenly spaced) for each zone
-        rng = np.random.RandomState(seed) if seed is not None else np.random
-
-        # Sample uniformly from target zone
-        if len(target_points) < num_target:
-            print(
-                f"Warning: Target zone has only {len(target_points)} cells, but {num_target} samples requested."
-            )
-            print(
-                f"         Using all {len(target_points)} available points in target zone."
-            )
-            target_sampled = target_points
-        else:
-            # Use uniform spacing to get grid-like coverage
-            indices_target = np.linspace(
-                0, len(target_points) - 1, num_target, dtype=int
-            )
-            target_sampled = target_points[indices_target]
-
-        # Sample uniformly from interference zone
-        if len(interference_points) < num_interference:
-            print(
-                f"Warning: Interference zone has only {len(interference_points)} cells, but {num_interference} samples requested."
-            )
-            print(
-                f"         Using all {len(interference_points)} available points in interference zone."
-            )
-            interference_sampled = interference_points
-        else:
-            # Use uniform spacing to get grid-like coverage
-            indices_interference = np.linspace(
-                0, len(interference_points) - 1, num_interference, dtype=int
-            )
-            interference_sampled = interference_points[indices_interference]
-
-        # Combine both zones
-        sampled_points = np.vstack([target_sampled, interference_sampled])
-
-        # Shuffle to mix target and interference points
-        rng.shuffle(sampled_points)
-
-    # Original behavior: zone-only or full-grid sampling
-    elif zone_mask is not None:
-        # Get coordinates only where mask == 1.0
-        in_zone_mask = zone_mask == 1.0
-        zone_x = X[in_zone_mask]
-        zone_y = Y[in_zone_mask]
-        all_points = np.column_stack([zone_x, zone_y])
-
-        if len(all_points) == 0:
-            raise ValueError("Zone mask is empty - no valid sampling points!")
-
-        if len(all_points) < num_samples:
-            print(
-                f"Warning: Zone has only {len(all_points)} cells, but {num_samples} samples requested."
-            )
-            print(f"         Using all {len(all_points)} available points in zone.")
-            sampled_points = all_points
-        else:
-            # Randomly select num_samples points from zone
-            rng = np.random.RandomState(seed) if seed is not None else np.random
-            indices = rng.choice(len(all_points), num_samples, replace=False)
-            sampled_points = all_points[indices]
-
+    # Only focus on zone_mask (for now)
+    if zone_mask is None:
+        sampled_points = all_points
     else:
-        # Original behavior: sample from entire grid
-        all_points = np.column_stack([X.flatten(), Y.flatten()])
-
-        # Randomly select num_samples points with optional seed
-        if num_samples < len(all_points):
-            rng = np.random.RandomState(seed) if seed is not None else np.random
-            indices = rng.choice(len(all_points), num_samples, replace=False)
-            sampled_points = all_points[indices]
-        else:
-            sampled_points = all_points
+        mask_flat = zone_mask.flatten()
+        sampled_points = all_points[mask_flat == 1.0]
 
     # Filter out building locations if requested
     if exclude_buildings and scene_xml_path is not None:
@@ -900,20 +806,6 @@ def sample_grid_points(
                 )
 
             sampled_points = np.array(filtered_points)
-
-            if len(sampled_points) < num_samples:
-                print(
-                    f"Warning: Building exclusion reduced sample count from {num_samples} to {len(sampled_points)}"
-                )
-                print(f"         ({num_excluded} points were inside buildings)")
-
-    # Apply Poisson disk sampling for better uniformity if requested
-    if use_poisson_disk and len(sampled_points) > num_samples:
-        from angle_utils import poisson_disk_sampling_2d
-
-        sampled_points = poisson_disk_sampling_2d(
-            sampled_points, num_samples, min_distance=min_distance, seed=seed
-        )
 
     # Add z-coordinate
     z_coords = np.full((len(sampled_points), 1), ground_z)
@@ -1212,15 +1104,15 @@ def compare_boresight_performance(
         # Extract signal strength
         rss_watts = rm.rss.numpy()[0, :, :]
         # Commenting this out to test if the linear average is improved
-        #signal_strength_dBm = 10.0 * np.log10(rss_watts + 1e-30) + 30.0
-        
+        # signal_strength_dBm = 10.0 * np.log10(rss_watts + 1e-30) + 30.0
+
         # Extract power values in zone only
         zone_power = rss_watts[zone_mask == 1.0]
 
         # Filter out dead zones (values below -200 dBm are likely numerical artifacts)
         # Dead zones occur when PathSolver finds no propagation paths
-        #DEAD_ZONE_THRESHOLD = -200.0  # dBm
-        DEAD_ZONE_THRESHOLD = 0 # 0 watts
+        # DEAD_ZONE_THRESHOLD = -200.0  # dBm
+        DEAD_ZONE_THRESHOLD = 0  # 0 watts
         live_zone_power = zone_power[zone_power > DEAD_ZONE_THRESHOLD]
 
         # Compute statistics on live points only (exclude dead zones)
@@ -1337,7 +1229,7 @@ def compare_boresight_performance(
     ax.legend(fontsize=9)
     ax.grid(True, alpha=0.3)
     ax.set_xlim(data_min * 0.5, data_max * 2.0)  # Wider margin for better visibility
-    ax.set_xscale('log')  # Use log scale for x-axis to show wide range
+    ax.set_xscale("log")  # Use log scale for x-axis to show wide range
 
     # Plot 2: CDFs
     ax = axes[0, 1]
@@ -1365,7 +1257,7 @@ def compare_boresight_performance(
     ax.grid(True, alpha=0.3)
     # Use adaptive x-axis range
     ax.set_xlim(data_min * 0.5, data_max * 2.0)  # Wider margin for better visibility
-    ax.set_xscale('log')  # Use log scale for x-axis to show wide range
+    ax.set_xscale("log")  # Use log scale for x-axis to show wide range
 
     # Plot 3: Box plot comparison
     ax = axes[1, 0]
@@ -1387,14 +1279,26 @@ def compare_boresight_performance(
 
     # Add improvement annotation
     # Calculate improvement percentage for Watts
-    improvement_pct_mean = (improvement_mean / results["Naive Baseline"]["mean"]) * 100 if results["Naive Baseline"]["mean"] != 0 else 0
-    improvement_pct_median = (improvement_median / results["Naive Baseline"]["median"]) * 100 if results["Naive Baseline"]["median"] != 0 else 0
+    improvement_pct_mean = (
+        (improvement_mean / results["Naive Baseline"]["mean"]) * 100
+        if results["Naive Baseline"]["mean"] != 0
+        else 0
+    )
+    improvement_pct_median = (
+        (improvement_median / results["Naive Baseline"]["median"]) * 100
+        if results["Naive Baseline"]["median"] != 0
+        else 0
+    )
 
     ax.text(
         1.5,
         results["Optimized"]["mean"] * 1.1,  # 10% above optimized mean
         f"Improvement:\nMean: {improvement_pct_mean:+.1f}%\nMedian: {improvement_pct_median:+.1f}%",
-        bbox=dict(boxstyle="round", facecolor="lightgreen" if improvement_pct_mean > 0 else "lightcoral", alpha=0.8),
+        bbox=dict(
+            boxstyle="round",
+            facecolor="lightgreen" if improvement_pct_mean > 0 else "lightcoral",
+            alpha=0.8,
+        ),
         fontsize=10,
         ha="center",
     )
@@ -1417,43 +1321,57 @@ def compare_boresight_performance(
             "Mean (W)",
             f"{results['Naive Baseline']['mean']:.2e}",
             f"{results['Optimized']['mean']:.2e}",
-            format_improvement_pct(results['Optimized']['mean'], results['Naive Baseline']['mean']),
+            format_improvement_pct(
+                results["Optimized"]["mean"], results["Naive Baseline"]["mean"]
+            ),
         ],
         [
             "Median (W)",
             f"{results['Naive Baseline']['median']:.2e}",
             f"{results['Optimized']['median']:.2e}",
-            format_improvement_pct(results['Optimized']['median'], results['Naive Baseline']['median']),
+            format_improvement_pct(
+                results["Optimized"]["median"], results["Naive Baseline"]["median"]
+            ),
         ],
         [
             "Std Dev (W)",
             f"{results['Naive Baseline']['std']:.2e}",
             f"{results['Optimized']['std']:.2e}",
-            format_improvement_pct(results['Optimized']['std'], results['Naive Baseline']['std']),
+            format_improvement_pct(
+                results["Optimized"]["std"], results["Naive Baseline"]["std"]
+            ),
         ],
         [
             "Min (W)",
             f"{results['Naive Baseline']['min']:.2e}",
             f"{results['Optimized']['min']:.2e}",
-            format_improvement_pct(results['Optimized']['min'], results['Naive Baseline']['min']),
+            format_improvement_pct(
+                results["Optimized"]["min"], results["Naive Baseline"]["min"]
+            ),
         ],
         [
             "Max (W)",
             f"{results['Naive Baseline']['max']:.2e}",
             f"{results['Optimized']['max']:.2e}",
-            format_improvement_pct(results['Optimized']['max'], results['Naive Baseline']['max']),
+            format_improvement_pct(
+                results["Optimized"]["max"], results["Naive Baseline"]["max"]
+            ),
         ],
         [
             "10th %ile (W)",
             f"{results['Naive Baseline']['p10']:.2e}",
             f"{results['Optimized']['p10']:.2e}",
-            format_improvement_pct(results['Optimized']['p10'], results['Naive Baseline']['p10']),
+            format_improvement_pct(
+                results["Optimized"]["p10"], results["Naive Baseline"]["p10"]
+            ),
         ],
         [
             "90th %ile (W)",
             f"{results['Naive Baseline']['p90']:.2e}",
             f"{results['Optimized']['p90']:.2e}",
-            format_improvement_pct(results['Optimized']['p90'], results['Naive Baseline']['p90']),
+            format_improvement_pct(
+                results["Optimized"]["p90"], results["Naive Baseline"]["p90"]
+            ),
         ],
     ]
 
@@ -1477,7 +1395,7 @@ def compare_boresight_performance(
         improvement_str = stats_data[i][3]
         # Parse percentage string (e.g., "+10.5%" or "-5.2%")
         if improvement_str != "N/A":
-            improvement_val = float(improvement_str.rstrip('%'))
+            improvement_val = float(improvement_str.rstrip("%"))
             if improvement_val > 0:
                 table[(i, 3)].set_facecolor("#90EE90")
             elif improvement_val < 0:
@@ -1514,325 +1432,19 @@ def compare_boresight_performance(
 
     return fig, stats
 
-
-def grid_search_initial_boresight(
-    scene,
-    tx_name,
-    map_config,
-    zone_mask,
-    num_angular_samples=12,
-    num_elevation_samples=5,
-    min_elevation_deg=0,
-    max_elevation_deg=-45,
-    radius_meters=100.0,
-    num_sample_points=50,
-    seed=42,
-    loss_type="coverage_maximize",
-    verbose=True,
-    scene_xml_path=None,
-):
-    """
-    Perform coarse grid search to find good initial boresight direction.
-
-    This function evaluates multiple boresight directions on a spherical grid
-    and returns the one with best coverage in the target zone. Use this to
-    initialize gradient-based optimization.
-
-    The grid search uses the same loss function as the optimization to ensure
-    consistency between initialization and refinement phases.
-
-    Parameters:
-    -----------
-    scene : sionna.rt.Scene
-        The scene
-    tx_name : str
-        Transmitter name
-    map_config : dict
-        Map configuration
-    zone_mask : np.ndarray
-        Binary zone mask
-    num_angular_samples : int
-        Number of azimuth angles to test (default: 12 = every 30°)
-    num_elevation_samples : int
-        Number of elevation angles to test (default: 5)
-    min_elevation_deg : float
-        Minimum elevation angle in degrees (0° = horizontal)
-    max_elevation_deg : float
-        Maximum elevation angle in degrees (negative = pointing down)
-    radius_meters : float
-        Distance from TX to boresight target point
-    num_sample_points : int
-        Number of sample points for evaluation (fewer = faster)
-    seed : int
-        Random seed
-    loss_type : str
-        Loss function type (must match optimization):
-        - 'coverage_maximize': Maximize mean power in zone with interference control
-    verbose : bool
-        Print progress
-
-    Returns:
-    --------
-    best_azimuth : float
-        Best azimuth angle in degrees
-    best_elevation : float
-        Best elevation angle in degrees
-    best_loss : float
-        Best loss value achieved (lower is better for the loss function)
-    grid_results : dict
-        Results for all tested directions
-    """
-    from sionna.rt import PathSolver, cpx_abs_square
-
-    tx = scene.get(tx_name)
-    # Extract TX position using the same pattern as elsewhere in the file
-    tx_x = float(dr.detach(tx.position[0])[0])
-    tx_y = float(dr.detach(tx.position[1])[0])
-    tx_z = float(dr.detach(tx.position[2])[0])
-
-    if verbose:
-        print(f"\n{'='*70}")
-        print("Grid Search for Initial Boresight")
-        print(f"{'='*70}")
-        print(f"TX position: ({tx_x:.1f}, {tx_y:.1f}, {tx_z:.1f})")
-        print(f"Angular samples: {num_angular_samples}")
-        print(f"Elevation samples: {num_elevation_samples}")
-        print(
-            f"Total directions to test: {num_angular_samples * num_elevation_samples}"
-        )
-        print(f"{'='*70}\n")
-
-    # Sample receivers with 50/50 stratified sampling (same as optimization)
-    # This ensures balanced representation of target zone and interference zone
-    sample_points = sample_grid_points(
-        map_config,
-        num_sample_points,
-        seed=seed,
-        zone_mask=zone_mask,
-        stratified_50_50=True,  # Enable 50/50 sampling between zones
-        scene_xml_path=scene_xml_path,  # Required for building exclusion
-        exclude_buildings=True,  # Filter out points inside buildings
-        use_poisson_disk=True,  # Use Poisson disk sampling for better uniformity
-        min_distance=None,  # Auto-calculate based on num_samples and area
-    )
-
-    # Get mask values for samples
-    width_m, height_m = map_config["size"]
-    cell_w, cell_h = map_config["cell_size"]
-    n_x = int(width_m / cell_w)
-    n_y = int(height_m / cell_h)
-    center_x, center_y, _ = map_config["center"]
-
-    mask_values = []
-    for point in sample_points:
-        x, y = point[0], point[1]
-        i = int((x - (center_x - width_m / 2)) / cell_w)
-        j = int((y - (center_y - height_m / 2)) / cell_h)
-        i = np.clip(i, 0, n_x - 1)
-        j = np.clip(j, 0, n_y - 1)
-        mask_values.append(zone_mask[j, i])
-    mask_values = np.array(mask_values, dtype=np.float32)
-
-    num_in_zone = int(np.sum(mask_values))
-    num_out_zone = len(mask_values) - num_in_zone
-    if verbose:
-        print(f"Sample points: {num_in_zone} inside zone, {num_out_zone} outside zone")
-        print(
-            f"Zone coverage: {100.0 * num_in_zone / len(mask_values):.1f}% of samples\n"
-        )
-
-    # Add receivers (reuse for all grid points)
-    rx_names = []
-    for idx, position in enumerate(sample_points):
-        rx_name = f"grid_rx_{idx}"
-        rx_names.append(rx_name)
-        if rx_name in [obj.name for obj in scene.receivers.values()]:
-            scene.remove(rx_name)
-        position_f32 = [float(position[0]), float(position[1]), float(position[2])]
-        rx = Receiver(name=rx_name, position=position_f32)
-        scene.add(rx)
-
-    p_solver = PathSolver()
-    p_solver.loop_mode = "symbolic"  # Use symbolic mode for pre-computation
-
-    # Compute paths ONCE with initial orientation
-    # We'll extract the paths_buffer and reuse it with updated antenna orientations
-    # This is the same optimization used in optimize_boresight_pathsolver
-    if verbose:
-        print("Computing ray geometry (this will be reused for all grid directions)...")
-
-    paths = p_solver(
-        scene,
-        los=True,
-        refraction=False,
-        specular_reflection=True,
-        diffuse_reflection=False,
-        diffraction=True,
-        edge_diffraction=True,
-    )
-
-    # Extract the paths_buffer for reuse
-    # This contains the pre-traced ray geometry that will be reused with updated antenna orientations
-    paths_buffer = paths._paths_buffer
-
-    if verbose:
-        print("Ray geometry computed. Now testing grid directions...\n")
-
-    # Generate grid of directions
-    azimuth_angles = np.linspace(0, 360, num_angular_samples, endpoint=False)
-    elevation_angles = np.linspace(
-        min_elevation_deg, max_elevation_deg, num_elevation_samples
-    )
-
-    best_loss = np.inf  # Initialize to worst possible for minimization
-    best_azimuth = None
-    best_elevation = None
-    grid_results = []
-
-    total_tests = len(azimuth_angles) * len(elevation_angles)
-    test_idx = 0
-
-    for azimuth_deg in azimuth_angles:
-        for elevation_deg in elevation_angles:
-            test_idx += 1
-
-            # Convert azimuth/elevation to yaw/pitch
-            yaw_rad, pitch_rad = azimuth_elevation_to_yaw_pitch(
-                azimuth_deg, elevation_deg
-            )
-
-            # Set antenna orientation directly (roll = 0 for antenna pointing)
-            tx.orientation = mi.Point3f(float(yaw_rad), float(pitch_rad), 0.0)
-
-            # EXTRACT PARAMETERS FROM SCENE (same as PathSolver.__call__ does)
-            # These calls extract current transmitter/receiver states INCLUDING updated orientation
-            src_positions, src_orientations, rel_ant_positions_tx, tx_velocities = (
-                scene.sources(synthetic_array=True, return_velocities=True)
-            )
-            tgt_positions, tgt_orientations, rel_ant_positions_rx, rx_velocities = (
-                scene.targets(synthetic_array=True, return_velocities=True)
-            )
-
-            # Get antenna patterns from scene
-            src_antenna_patterns = scene.tx_array.antenna_pattern.patterns
-            tgt_antenna_patterns = scene.rx_array.antenna_pattern.patterns
-
-            # Call field_calculator with updated orientations
-            # The paths_buffer contains the pre-traced ray geometry
-            # We're recomputing only the field coefficients with new antenna orientation
-            updated_paths_buffer = p_solver._field_calculator(
-                wavelength=scene.wavelength,
-                paths=paths_buffer,  # Pre-computed ray geometry
-                samples_per_src=1000000,
-                diffraction=True,
-                src_positions=src_positions,
-                tgt_positions=tgt_positions,
-                src_orientations=src_orientations,  # Now includes UPDATED orientation
-                tgt_orientations=tgt_orientations,
-                src_antenna_patterns=src_antenna_patterns,
-                tgt_antenna_patterns=tgt_antenna_patterns,
-            )
-
-            # Create Paths object with updated field coefficients
-            paths = Paths(
-                scene,
-                src_positions,
-                tgt_positions,
-                tx_velocities,
-                rx_velocities,
-                True,  # synthetic_array=True
-                updated_paths_buffer,
-                rel_ant_positions_tx,
-                rel_ant_positions_rx,
-            )
-
-            # Step 1: Compute Linear Power (Watts)
-            # Use Dr.Jit ops for speed, then convert to numpy
-            # IMPORTANT: Must match the exact calculation in compute_loss()
-            h_real, h_imag = paths.a
-            power_linear = dr.sum(
-                dr.sum(cpx_abs_square((h_real, h_imag)), axis=-1), axis=-1
-            )
-            power_linear = dr.sum(power_linear, axis=-1)
-
-            # Convert to Numpy for scalar logic (detach from any computation graph)
-            power_linear_np = np.array(power_linear, dtype=np.float32)
-
-            # Step 2: Define "Fairness Bias" (The anchor point)
-            # Set this to the "Edge of Coverage" you care about (e.g., -100 dBm).
-            # -100 dBm = 1e-10 Watts, but we use 1e-11 for more sensitivity
-            bias_watts = 1e-11
-
-            # Step 3: Compute Utility
-            # function: log(1 + P / bias)
-            # If P is small (< bias): Behaves linearly (Strong Gradient).
-            # If P is large (> bias): Behaves logarithmically (Diminishing Gradient).
-            utility = np.log(1.0 + (power_linear_np / bias_watts))
-
-            # Step 4: Apply Target Mask
-            mask_target = mask_values.astype(np.float32)
-            valid_points = np.maximum(np.sum(mask_target), 1.0)
-
-            # Step 5: Compute Loss (negative utility for minimization)
-            # Match optimizer convention: minimize loss = maximize utility
-            loss = -np.sum(utility * mask_target) / valid_points
-
-            grid_results.append(
-                {
-                    "azimuth_deg": azimuth_deg,
-                    "elevation_deg": elevation_deg,
-                    "loss": loss,
-                }
-            )
-
-            # Find MINIMUM loss (same as optimizer: minimize = maximize utility)
-            if loss < best_loss:
-                best_loss = loss
-                best_azimuth = azimuth_deg
-                best_elevation = elevation_deg
-
-                if verbose:
-                    print(
-                        f"[{test_idx}/{total_tests}] NEW BEST: Az={azimuth_deg:.0f}°, El={elevation_deg:.0f}° → Loss={loss:.4f}"
-                    )
-            elif verbose and test_idx % 5 == 0:
-                print(
-                    f"[{test_idx}/{total_tests}] Az={azimuth_deg:.0f}°, El={elevation_deg:.0f}° → Loss={loss:.4f}"
-                )
-
-    # Cleanup receivers
-    for rx_name in rx_names:
-        if rx_name in [obj.name for obj in scene.receivers.values()]:
-            scene.remove(rx_name)
-
-    if verbose:
-        print(f"\n{'='*70}")
-        print("Grid Search Complete!")
-        print(f"{'='*70}")
-        print(
-            f"Best angles: Azimuth={best_azimuth:.1f}°, Elevation={best_elevation:.1f}°"
-        )
-        print(f"Lowest loss: {best_loss}")
-        print(f"{'='*70}\n")
-
-    return best_azimuth, best_elevation, best_loss, grid_results
-
-
 def optimize_boresight_pathsolver(
     scene,
     tx_name,
     map_config,
     scene_xml_path,
     zone_mask=None,
-    initial_boresight=[100.0, 100.0, 10.0],
+    zone_stats=None,
     num_sample_points=100,
     building_id=10,
     learning_rate=1.0,
     num_iterations=20,
     loss_type="coverage_maximize",
     power_threshold_dbm=-90.0,
-    use_grid_search_init=False,
-    grid_search_params=None,
     verbose=True,
     seed=42,  # Random seed for reproducible sampling
     tx_placement_mode="skip",  # "center", "fixed", "line", "skip" (skip = don't move TX)
@@ -1867,37 +1479,11 @@ def optimize_boresight_pathsolver(
     # Determine if initial_boresight is angles or position
     # If it's a position [x, y, z], convert to angles
     # If grid search is used, angles will be overridden anyway
-    if not use_grid_search_init:
-        print(f"\n{'='*70}")
-        print("NAIVE BASELINE ANGLE VERIFICATION")
-        print(f"{'='*70}")
-        print(f"TX Position: [{tx_position[0]:.2f}, {tx_position[1]:.2f}, {tx_position[2]:.2f}]")
-        print(f"Look-at Position (naive baseline): [{initial_boresight[0]:.2f}, {initial_boresight[1]:.2f}, {initial_boresight[2]:.2f}]")
-
-        # Convert initial_boresight (position) to angles with verbose output
-        initial_azimuth, initial_elevation = compute_initial_angles_from_position(
-            tx_position, initial_boresight, verbose=True
-        )
-
-        print(f"\nFinal converted angles (to be used as starting point):")
-        print(f"  Azimuth: {initial_azimuth:.2f}°")
-        print(f"  Elevation: {initial_elevation:.2f}°")
-        print(f"{'='*70}\n")
-    else:
-        # Grid search will provide angles (set placeholder values for now)
-        initial_azimuth = 0.0
-        initial_elevation = -10.0
 
     if verbose:
         print(f"\n{'='*70}")
         print("Binary Mask Zone Coverage Optimization")
         print(f"{'='*70}")
-        if not use_grid_search_init:
-            print(
-                f"Initial angles: Azimuth={initial_azimuth:.1f}°, Elevation={initial_elevation:.1f}°"
-            )
-            print(f"  (converted from look_at position: {initial_boresight})")
-        print(f"Use grid search init: {use_grid_search_init}")
         print(f"Transmit power: {tx_power_dbm:.2f} dBm")
         print(f"Learning rate: {learning_rate}")
         print(f"Iterations: {num_iterations}")
@@ -1907,76 +1493,6 @@ def optimize_boresight_pathsolver(
             print(f"Power threshold: {power_threshold_dbm:.1f} dB")
         print(f"Map config: {map_config}")
         print(f"{'='*70}\n")
-
-    # Run grid search for initial boresight if requested
-    if use_grid_search_init:
-        if verbose:
-            print("\n" + "=" * 70)
-            print("PHASE 1: Grid Search for Initial Boresight")
-            print("=" * 70 + "\n")
-
-        # Set default grid search parameters if not provided
-        # These defaults provide a good balance between coverage and speed:
-        # - 16 azimuth samples (every 22.5°) gives full 360° coverage
-        # - 5 elevation samples from 0° to -45° covers typical downward tilt range
-        # - 100m radius is reasonable for most urban scenarios
-        # - 50 sample points makes grid search fast while still accurate
-        if grid_search_params is None:
-            grid_search_params = {
-                "num_angular_samples": 16,  # Test every 22.5° (full circle)
-                "num_elevation_samples": 5,  # Test 5 elevations from 0° to -45°
-                "min_elevation_deg": 0,  # Horizontal (0° = level with horizon)
-                "max_elevation_deg": -45,  # 45° downward tilt
-                "radius_meters": 100.0,  # 100m distance to boresight target
-                "num_sample_points": 50,  # 50 sample points for evaluation
-            }
-            if verbose:
-                print("Using default grid search parameters:")
-                print(
-                    f"  Angular samples: {grid_search_params['num_angular_samples']} (every {360/grid_search_params['num_angular_samples']:.1f}°)"
-                )
-                print(
-                    f"  Elevation samples: {grid_search_params['num_elevation_samples']} ({grid_search_params['min_elevation_deg']}° to {grid_search_params['max_elevation_deg']}°)"
-                )
-                print(f"  Radius: {grid_search_params['radius_meters']:.0f}m")
-                print(f"  Sample points: {grid_search_params['num_sample_points']}")
-                print(
-                    f"  Total directions to test: {grid_search_params['num_angular_samples'] * grid_search_params['num_elevation_samples']}\n"
-                )
-
-        # Run grid search
-        best_azimuth, best_elevation, best_grid_power, grid_results = (
-            grid_search_initial_boresight(
-                scene=scene,
-                tx_name=tx_name,
-                map_config=map_config,
-                zone_mask=zone_mask,
-                num_angular_samples=grid_search_params.get("num_angular_samples", 16),
-                num_elevation_samples=grid_search_params.get(
-                    "num_elevation_samples", 5
-                ),
-                min_elevation_deg=grid_search_params.get("min_elevation_deg", 0),
-                max_elevation_deg=grid_search_params.get("max_elevation_deg", -45),
-                radius_meters=grid_search_params.get("radius_meters", 100.0),
-                num_sample_points=grid_search_params.get("num_sample_points", 50),
-                seed=seed,
-                verbose=verbose,
-            )
-        )
-
-        # Store initial angles from grid search (will be used later to initialize optimization)
-        initial_azimuth = best_azimuth
-        initial_elevation = best_elevation
-
-        if verbose:
-            print("\n" + "=" * 70)
-            print("PHASE 2: Gradient-Based Refinement")
-            print("=" * 70)
-            print(
-                f"Starting from grid search result: Azimuth={initial_azimuth}°, Elevation={initial_elevation}°"
-            )
-            print(f"Grid search mean power: {best_grid_power} dB")
-            print("=" * 70 + "\n")
 
     # TX height already extracted above (tx_z is already detached)
     tx_height = tx_z
@@ -2022,14 +1538,9 @@ def optimize_boresight_pathsolver(
     # Also filters out building locations and uses Poisson disk sampling for uniformity
     sample_points = sample_grid_points(
         map_config,
-        num_sample_points,
-        seed=seed,
-        zone_mask=zone_mask,
-        stratified_50_50=True,  # Enable 50/50 sampling between zones
         scene_xml_path=scene_xml_path,  # Required for building exclusion
         exclude_buildings=True,  # Filter out points inside buildings
-        use_poisson_disk=True,  # Use Poisson disk sampling for better uniformity
-        min_distance=None,  # Auto-calculate based on num_samples and area
+        zone_mask=zone_mask
     )
 
     # CRITICAL: Update num_sample_points to reflect actual number of samples
@@ -2165,7 +1676,7 @@ def optimize_boresight_pathsolver(
 
         # Adding jitter to smooth out the "Needle" effect and avoid overfitting to sample points
         # Use numpy for random jitter since this happens outside the differentiable path
-        jitter_std_deg = 0.25  # Small jitter in degrees
+        jitter_std_deg = .1  # Small jitter in degrees
         jitter_std_rad = jitter_std_deg * (np.pi / 180.0)
 
         # Generate random jitter using numpy (converted to DrJit Float)
@@ -2296,16 +1807,21 @@ def optimize_boresight_pathsolver(
         # "Log of Means"
         # Attempts to improve the overall power in the reigon
         total_watts = dr.sum(target_power)
-        loss_peak = dr.log(total_watts + epsilon)
+        loss_peak = dr.log(total_watts + epsilon) / valid_points
 
         # Greediness Factor
         # Set to split the goal evenly
-        alpha = .5
-        
+        alpha = 1.0
+
         # Alpha should be biased closed to 1.0 since there is a magnitude difference between the objectives
         loss = -(alpha * loss_peak + (1.0 - alpha) * loss_coverage)
 
         return loss
+    
+    # Calculate the initial azimuth and elevation angles based on the position of the transmitter + center of the zone 
+    initial_azimuth, initial_elevation = compute_initial_angles_from_position([x_start_position, y_start_position, tx_height], zone_stats["look_at_xyz"], verbose=False)
+    print(f"initial azimuth (after function): {initial_azimuth}")
+    print(f"initial elevation (after function): {initial_elevation}")
 
     # PyTorch parameters: azimuth and elevation angles (in degrees)
     # Using 0-D tensors (scalars) - this is the ONLY pattern that works with @dr.wrap
