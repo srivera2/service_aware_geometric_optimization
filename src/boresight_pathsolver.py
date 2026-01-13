@@ -23,7 +23,6 @@ from angle_utils import (
     normalize_azimuth,
     clamp_elevation,
 )
-from loss import linear_power
 
 
 def create_optimization_gif(
@@ -373,104 +372,6 @@ def create_zone_mask(
     scene_xml_path=None,
     exclude_buildings=True,
 ):
-    """
-    Create a binary coverage zone mask for simplified optimization.
-
-    This function replaces create_target_radiomap() by using a binary mask approach:
-    - Mask value = 1.0 inside the coverage zone (optimize for high power here)
-    - Mask value = 0.0 outside the zone (don't care about power here)
-
-    This simplifies the optimization problem - instead of matching specific power
-    levels at each location, we just maximize coverage uniformly within the zone.
-    The goal is to lift the median coverage level in the selected area.
-
-    Parameters:
-    -----------
-    map_config : dict
-        Map configuration containing:
-        - 'size': [width, height] in meters
-        - 'cell_size': (cell_w, cell_h) grid resolution
-        - 'center': [x, y, z] center of the map
-
-    zone_type : str
-        Type of coverage zone:
-        - 'angular_sector': Wedge-shaped sector from TX (azimuth-based)
-        - 'box': Rectangular region
-
-    origin_point : tuple or list
-        (x, y, z) position of the transmitter in meters.
-        Required for 'angular_sector' (defines the sector origin).
-        Optional for 'box' (if provided, used for validation).
-
-    zone_params : dict
-        Zone-specific parameters:
-
-        For 'angular_sector':
-            - 'angle_start': Start angle in degrees (0° = East, counter-clockwise)
-            - 'angle_end': End angle in degrees
-            - 'radius': Maximum distance from TX in meters
-
-        For 'box':
-            - 'center': (x, y) center of box in meters
-            - 'width': Box width in meters
-            - 'height': Box height in meters
-
-    target_height : float
-        Z-coordinate for the returned look_at position (typically UE height: 1.5m).
-        This defines the vertical aim point for a naive baseline boresight.
-
-    scene_xml_path : str, optional
-        Path to scene XML file. Required if exclude_buildings=True.
-
-    exclude_buildings : bool
-        If True, exclude building footprints from the coverage zone mask.
-        This prevents the optimizer from targeting areas inside buildings.
-
-    Returns:
-    --------
-    mask : np.ndarray
-        2D binary mask, shape (n_y, n_x), dtype float32
-        - 1.0 = inside coverage zone (target for optimization)
-        - 0.0 = outside coverage zone (ignored)
-
-    look_at_pos : np.ndarray
-        [x, y, z] coordinates of the zone's geometric center.
-        Use this for a naive baseline: tx.look_at(look_at_pos)
-
-    zone_stats : dict
-        Statistics about the zone:
-        - 'num_cells': Number of grid cells in the zone (mask sum)
-        - 'coverage_fraction': Fraction of map covered by zone
-        - 'centroid_xy': [x, y] geometric center of the zone
-        - 'look_at_xyz': [x, y, z] same as look_at_pos
-
-    Raises:
-    -------
-    ValueError
-        - If zone_type is invalid
-        - If required parameters are missing
-        - If zone is empty (no cells inside)
-
-    Example:
-    --------
-    >>> # Angular sector: 45° wide cone pointing northeast, 100m range
-    >>> mask, look_at, stats = create_zone_mask(
-    ...     map_config={'center': [0, 0, 0], 'size': [200, 200], 'cell_size': (5, 5)},
-    ...     zone_type='angular_sector',
-    ...     origin_point=[0, 0, 20],  # TX at 20m height
-    ...     zone_params={'angle_start': 22.5, 'angle_end': 67.5, 'radius': 100},
-    ...     target_height=1.5
-    ... )
-    >>> print(f"Coverage zone has {stats['num_cells']} cells")
-
-    >>> # Rectangular box: 50m x 30m area
-    >>> mask, look_at, stats = create_zone_mask(
-    ...     map_config={'center': [0, 0, 0], 'size': [200, 200], 'cell_size': (5, 5)},
-    ...     zone_type='box',
-    ...     zone_params={'center': (50, 30), 'width': 50, 'height': 30},
-    ...     target_height=1.5
-    ... )
-    """
 
     # Validate inputs
     if zone_type not in ["angular_sector", "box"]:
@@ -680,6 +581,7 @@ def create_zone_mask(
         "look_at_xyz": look_at_pos.tolist(),
         "buildings_excluded": exclude_buildings,
         "num_excluded_buildings": num_excluded_buildings,
+        "zone_params": zone_params,
     }
 
     return mask, look_at_pos, zone_stats
@@ -690,46 +592,10 @@ def sample_grid_points(
     scene_xml_path=None,
     exclude_buildings=True,
     zone_mask=None,
+    zone_stats=None,
+    qrand=None,
 ):
-    """
-    Sample points from the radio map grid with optional 50/50 stratified sampling
 
-    This function now supports:
-    - Building exclusion (no receivers placed inside buildings)
-    - Poisson disk sampling for uniform spatial distribution
-    - Stratified sampling between target and interference zones
-
-    Parameters:
-    -----------
-    map_config : dict
-        Map configuration
-    num_samples : int
-        Total number of points to sample
-    seed : int or None
-        Random seed for reproducibility. If None, sampling is random.
-    zone_mask : np.ndarray, optional
-        Binary mask (shape: n_y x n_x) defining coverage zone.
-        If provided and stratified_50_50=False, samples ONLY from cells where mask == 1.0
-        If provided and stratified_50_50=True, samples 50% from target zone, 50% from interference zone
-    stratified_50_50 : bool
-        If True, split sampling 50/50 between target zone (mask=1) and interference zone (mask=0)
-        Each zone gets uniformly spaced samples on a grid pattern
-    scene_xml_path : str, optional
-        Path to scene XML file. Required if exclude_buildings=True.
-    exclude_buildings : bool
-        If True, exclude points that fall inside building footprints
-    use_poisson_disk : bool
-        If True, use Poisson disk sampling for more uniform spatial distribution
-        If False, use uniform grid sampling (legacy behavior)
-    min_distance : float, optional
-        Minimum distance between samples for Poisson disk sampling
-        If None, automatically calculated based on num_samples and zone area
-
-    Returns:
-    --------
-    sampled_points_3d : numpy array
-        Nx3 array of (x, y, z) coordinates
-    """
     width_m, height_m = map_config["size"]
     cell_w, cell_h = map_config["cell_size"]
 
@@ -738,30 +604,63 @@ def sample_grid_points(
 
     center_x, center_y, ground_z = map_config["center"]
 
-    # Create each axis
-    x = (
-        np.linspace(center_x - width_m / 2, center_x + width_m / 2, n_x, endpoint=False)
-        + cell_w / 2
-    )
-    y = (
-        np.linspace(
-            center_y - height_m / 2, center_y + height_m / 2, n_y, endpoint=False
-        )
-        + cell_h / 2
-    )
+    # Quasi-random sampling: directly sample from the target zone
+    if zone_stats is not None and qrand is not None:
+        zone_params = zone_stats.get("zone_params")
 
-    # Create meshgrid
-    X, Y = np.meshgrid(x, y)
+        # Generate quasi-random samples in [0, 1] x [0, 1]
+        decimals = qrand.draw(zone_stats["num_cells"])
 
-    # Original behavior: sample from entire grid
-    all_points = np.column_stack([X.flatten(), Y.flatten()])
+        # Scale to zone dimensions [0, width] x [0, height]
+        sampled_pos_x_local = decimals[:, 0] * zone_params["width"]
+        sampled_pos_y_local = decimals[:, 1] * zone_params["height"]
 
-    # Only focus on zone_mask (for now)
-    if zone_mask is None:
-        sampled_points = all_points
+        # Center the samples: shift from [0, width] to [-width/2, +width/2]
+        sampled_pos_x_centered = sampled_pos_x_local - zone_params["width"] / 2
+        sampled_pos_y_centered = sampled_pos_y_local - zone_params["height"] / 2
+
+        # Translate to global coordinates by adding the zone center
+        zone_center = zone_params.get("center", zone_stats["look_at_xyz"][:2])
+        sampled_pos_x_global = sampled_pos_x_centered + zone_center[0]
+        sampled_pos_y_global = sampled_pos_y_centered + zone_center[1]
+
+        # Clip to zone bounds to handle numerical precision issues
+        # This ensures all samples stay strictly within the zone
+        x_min = zone_center[0] - zone_params["width"] / 2
+        x_max = zone_center[0] + zone_params["width"] / 2
+        y_min = zone_center[1] - zone_params["height"] / 2
+        y_max = zone_center[1] + zone_params["height"] / 2
+
+        sampled_pos_x_global = np.clip(sampled_pos_x_global, x_min, x_max)
+        sampled_pos_y_global = np.clip(sampled_pos_y_global, y_min, y_max)
+
+        # Already filtered to zone - no mask filtering needed
+        sampled_points = np.column_stack([sampled_pos_x_global, sampled_pos_y_global])
+
+    # Uniform grid sampling: sample entire grid then filter by mask
     else:
-        mask_flat = zone_mask.flatten()
-        sampled_points = all_points[mask_flat == 1.0]
+        x = (
+            np.linspace(
+                center_x - width_m / 2, center_x + width_m / 2, n_x, endpoint=False
+            )
+            + cell_w / 2
+        )
+        y = (
+            np.linspace(
+                center_y - height_m / 2, center_y + height_m / 2, n_y, endpoint=False
+            )
+            + cell_h / 2
+        )
+
+        X, Y = np.meshgrid(x, y)
+        all_points = np.column_stack([X.flatten(), Y.flatten()])
+
+        # Filter by zone mask
+        if zone_mask is None:
+            sampled_points = all_points
+        else:
+            mask_flat = zone_mask.flatten()
+            sampled_points = all_points[mask_flat == 1.0]
 
     # Filter out building locations if requested
     if exclude_buildings and scene_xml_path is not None:
@@ -893,6 +792,7 @@ def visualize_receiver_placement(
     for point in sample_points:
         x, y = point[0], point[1]
         # Convert to grid indices
+        # Grid cells are centered, so we use floor division to find the cell
         i = int((x - (center_x - width_m / 2)) / cell_w)
         j = int((y - (center_y - height_m / 2)) / cell_h)
         i = np.clip(i, 0, n_x - 1)
@@ -1432,6 +1332,7 @@ def compare_boresight_performance(
 
     return fig, stats
 
+
 def optimize_boresight_pathsolver(
     scene,
     tx_name,
@@ -1454,7 +1355,7 @@ def optimize_boresight_pathsolver(
     Tx_start_pos=[0.0, 0.0],
     save_radiomap_frames=False,
     frame_save_interval=1,
-    output_dir="./optimization_frames",
+    output_dir="/home/tingjunlab/Development/optimize_tx/figures",
 ):
     """
     Optimize boresight using PathSolver with automatic differentiation
@@ -1533,14 +1434,17 @@ def optimize_boresight_pathsolver(
             f"Boresight Z constraint: must be < {tx_height:.1f}m (no pointing upward)\n"
         )
 
-    # Sample grid points for receivers with 50/50 stratified sampling
-    # This ensures balanced representation of target zone and interference zone
-    # Also filters out building locations and uses Poisson disk sampling for uniformity
+    # Initialize Sobol quasi-random sequence generator for QMC sampling
+    qrand = torch.quasirandom.SobolEngine(dimension=2, scramble=True, seed=seed)
+
+    # Sample Grid Points using Quasi-Monte Carlo (Sobol sequence)
     sample_points = sample_grid_points(
         map_config,
-        scene_xml_path=scene_xml_path,  # Required for building exclusion
-        exclude_buildings=True,  # Filter out points inside buildings
-        zone_mask=zone_mask
+        scene_xml_path=scene_xml_path,
+        exclude_buildings=True,
+        zone_mask=zone_mask,
+        zone_stats=zone_stats,
+        qrand=qrand,
     )
 
     # CRITICAL: Update num_sample_points to reflect actual number of samples
@@ -1619,24 +1523,24 @@ def optimize_boresight_pathsolver(
 
     # Compute paths with AD (this is built into the Dr.Jit framework)
     # This was moved outside of the loss function to improve the computational overhead
-    paths = p_solver(
-        scene,
-        los=True,
-        refraction=False,
-        specular_reflection=True,
-        diffuse_reflection=False,
-        diffraction=True,
-        edge_diffraction=True,  # Enable for better obstacle handling in heavily obstructed scenarios
-    )
+    # paths = p_solver(
+    #    scene,
+    #    los=True,
+    #    refraction=False,
+    #    specular_reflection=True,
+    #    diffuse_reflection=False,
+    #    diffraction=True,
+    #    edge_diffraction=True,  # Enable for better obstacle handling in heavily obstructed scenarios
+    # )
 
     # Extract the paths_buffer for reuse in compute_loss
     # The Paths object stores it as _paths_buffer
     # This contains the pre-traced ray geometry that will be reused with updated antenna orientations
-    paths_buffer = paths._paths_buffer
+    # paths_buffer = paths._paths_buffer
 
     # Define differentiable loss function using @dr.wrap
     @dr.wrap(source="torch", target="drjit")
-    def compute_loss(azimuth_deg, elevation_deg, p_solver):
+    def compute_loss(azimuth_deg, elevation_deg):
         """
         Compute loss with AD enabled through field_calculator only
 
@@ -1676,7 +1580,7 @@ def optimize_boresight_pathsolver(
 
         # Adding jitter to smooth out the "Needle" effect and avoid overfitting to sample points
         # Use numpy for random jitter since this happens outside the differentiable path
-        jitter_std_deg = .1  # Small jitter in degrees
+        jitter_std_deg = 0.1  # Small jitter in degrees
         jitter_std_rad = jitter_std_deg * (np.pi / 180.0)
 
         # Generate random jitter using numpy (converted to DrJit Float)
@@ -1686,55 +1590,96 @@ def optimize_boresight_pathsolver(
         dr.disable_grad(pitch_jitter)
 
         # Apply jitter to orientation
-        yaw_rad_jittered = yaw_rad + yaw_jitter
-        pitch_rad_jittered = pitch_rad + pitch_jitter
+        yaw_rad_jittered = yaw_rad #+ yaw_jitter
+        pitch_rad_jittered = pitch_rad #+ pitch_jitter
 
         # Set antenna orientation directly using yaw, pitch, roll
         tx = scene.get(tx_name)
         tx.orientation = mi.Point3f(yaw_rad_jittered, pitch_rad_jittered, roll_rad)
 
+        # Generate new sample points using Sobol sequence
+        new_sample_points = sample_grid_points(
+            map_config,
+            scene_xml_path=scene_xml_path,
+            exclude_buildings=True,
+            zone_mask=zone_mask,
+            zone_stats=zone_stats,
+            qrand=qrand,
+        )
+
+        # Update the actual receiver count (may vary due to building exclusion)
+        nonlocal num_sample_points
+        num_sample_points = len(new_sample_points)
+
+        # Store for visualization outside the loss function
+        compute_loss.current_sample_points = new_sample_points
+
+        # Remove existing receivers from scene
+        for rx_name in rx_names:
+            scene.remove(rx_name)
+
+        # Add new receivers at sampled positions
+        rx_names.clear()
+        for idx, position in enumerate(new_sample_points):
+            rx_name = f"opt_rx_{idx}"
+            rx_names.append(rx_name)
+            position_f32 = [float(position[0]), float(position[1]), float(position[2])]
+            rx = Receiver(name=rx_name, position=position_f32)
+            scene.add(rx)
+
+        # Run path solver with updated receivers and antenna orientation
+        paths = p_solver(
+            scene,
+            los=True,
+            refraction=False,
+            specular_reflection=True,
+            diffuse_reflection=False,
+            diffraction=True,
+            edge_diffraction=True,
+        )
+
         # EXTRACT PARAMETERS FROM SCENE (same as PathSolver.__call__ does)
         # These calls extract current transmitter/receiver states INCLUDING updated orientation
         # See sionna-rt path_solver.py:183-186
-        src_positions, src_orientations, rel_ant_positions_tx, tx_velocities = (
-            scene.sources(synthetic_array=True, return_velocities=True)
-        )
-        tgt_positions, tgt_orientations, rel_ant_positions_rx, rx_velocities = (
-            scene.targets(synthetic_array=True, return_velocities=True)
-        )
+        # src_positions, src_orientations, rel_ant_positions_tx, tx_velocities = (
+        #    scene.sources(synthetic_array=True, return_velocities=True)
+        # )
+        # tgt_positions, tgt_orientations, rel_ant_positions_rx, rx_velocities = (
+        #    scene.targets(synthetic_array=True, return_velocities=True)
+        # )
 
         # Get antenna patterns from scene (path_solver.py:189-190)
-        src_antenna_patterns = scene.tx_array.antenna_pattern.patterns
-        tgt_antenna_patterns = scene.rx_array.antenna_pattern.patterns
+        # src_antenna_patterns = scene.tx_array.antenna_pattern.patterns
+        # tgt_antenna_patterns = scene.rx_array.antenna_pattern.patterns
 
         # Call field_calculator with updated orientations
         # The paths_buffer from outer scope contains the pre-traced ray geometry
         # We're recomputing only the field coefficients with new antenna orientation
-        updated_paths_buffer = p_solver._field_calculator(
-            wavelength=scene.wavelength,
-            paths=paths_buffer,  # Pre-computed ray geometry from outer scope
-            samples_per_src=1000000,  # Match the value used in p_solver call
-            diffraction=True,  # Match p_solver call settings
-            src_positions=src_positions,
-            tgt_positions=tgt_positions,
-            src_orientations=src_orientations,  # Now includes UPDATED orientation
-            tgt_orientations=tgt_orientations,
-            src_antenna_patterns=src_antenna_patterns,
-            tgt_antenna_patterns=tgt_antenna_patterns,
-        )
+        # updated_paths_buffer = p_solver._field_calculator(
+        #    wavelength=scene.wavelength,
+        #    paths=paths_buffer,  # Pre-computed ray geometry from outer scope
+        #    samples_per_src=1000000,  # Match the value used in p_solver call
+        #    diffraction=True,  # Match p_solver call settings
+        #    src_positions=src_positions,
+        #    tgt_positions=tgt_positions,
+        #    src_orientations=src_orientations,  # Now includes UPDATED orientation
+        #    tgt_orientations=tgt_orientations,
+        #    src_antenna_patterns=src_antenna_patterns,
+        #    tgt_antenna_patterns=tgt_antenna_patterns,
+        # )
 
         # Create Paths object with updated field coefficients
-        paths = Paths(
-            scene,
-            src_positions,
-            tgt_positions,
-            tx_velocities,
-            rx_velocities,
-            True,  # synthetic_array=True (matches scene.sources/targets calls)
-            updated_paths_buffer,  # Updated buffer with new field coefficients
-            rel_ant_positions_tx,
-            rel_ant_positions_rx,
-        )
+        # paths = Paths(
+        #    scene,
+        #    src_positions,
+        #    tgt_positions,
+        #    tx_velocities,
+        #    rx_velocities,
+        #    True,  # synthetic_array=True (matches scene.sources/targets calls)
+        #    updated_paths_buffer,  # Updated buffer with new field coefficients
+        #    rel_ant_positions_tx,
+        #    rel_ant_positions_rx,
+        # )
 
         # Extract channel coefficients
         h_real, h_imag = paths.a
@@ -1753,9 +1698,6 @@ def optimize_boresight_pathsolver(
             )
             print(f"  [GRADIENT CHECK] h_real grad enabled: {dr.grad_enabled(h_real)}")
             print(f"  [GRADIENT CHECK] h_imag grad enabled: {dr.grad_enabled(h_imag)}")
-            print(
-                f"  [DIAGNOSTIC] updated_paths_buffer size: {updated_paths_buffer.buffer_size}"
-            )
             print(f"  [DIAGNOSTIC] h_real shape: {dr.shape(h_real)}")
 
         # DEBUG: Verify channel coefficient shapes match expectations
@@ -1817,9 +1759,13 @@ def optimize_boresight_pathsolver(
         loss = -(alpha * loss_peak + (1.0 - alpha) * loss_coverage)
 
         return loss
-    
-    # Calculate the initial azimuth and elevation angles based on the position of the transmitter + center of the zone 
-    initial_azimuth, initial_elevation = compute_initial_angles_from_position([x_start_position, y_start_position, tx_height], zone_stats["look_at_xyz"], verbose=False)
+
+    # Calculate the initial azimuth and elevation angles based on the position of the transmitter + center of the zone
+    initial_azimuth, initial_elevation = compute_initial_angles_from_position(
+        [x_start_position, y_start_position, tx_height],
+        zone_stats["look_at_xyz"],
+        verbose=False,
+    )
     print(f"initial azimuth (after function): {initial_azimuth}")
     print(f"initial elevation (after function): {initial_elevation}")
 
@@ -1859,6 +1805,13 @@ def optimize_boresight_pathsolver(
             print(f"  LR after 50 iters: {learning_rate * (0.95**50):.6f}")
             print(f"  LR after 100 iters: {learning_rate * (0.95**100):.6f}")
 
+    # Create output directory for frame saving
+    if save_radiomap_frames:
+        import os
+        os.makedirs(output_dir, exist_ok=True)
+        if verbose:
+            print(f"Saving frames to: {output_dir}")
+
     # Tracking
     loss_history = []
     angle_history = [[initial_azimuth, initial_elevation]]
@@ -1867,17 +1820,6 @@ def optimize_boresight_pathsolver(
     best_loss = float("inf")
     best_azimuth_final = initial_azimuth
     best_elevation_final = initial_elevation
-
-    # Setup frame saving if requested
-    if save_radiomap_frames:
-        import os
-
-        os.makedirs(output_dir, exist_ok=True)
-        from sionna.rt import RadioMapSolver
-
-        rm_solver = RadioMapSolver()
-        print(f"RadioMap frames will be saved to: {output_dir}")
-        print(f"Saving every {frame_save_interval} iteration(s)")
 
     start_time = time.time()
 
@@ -1904,7 +1846,28 @@ def optimize_boresight_pathsolver(
             print(f"{'='*70}\n")
 
         # Forward pass
-        loss = compute_loss(azimuth, elevation, p_solver)
+        loss = compute_loss(azimuth, elevation)
+
+        # Visualize the Sobol sampling pattern (only save every N iterations to reduce file count)
+        if save_radiomap_frames and (iteration % frame_save_interval == 0):
+            current_points = getattr(
+                compute_loss, "current_sample_points", sample_points
+            )
+            fig = visualize_receiver_placement(
+                current_points,
+                zone_mask,
+                map_config,
+                tx_position=tx_position,
+                scene_xml_path=scene_xml_path,
+                title=f"Sobol Sampling - Iteration {iteration}",
+                figsize=(14, 10),
+            )
+            plt.savefig(
+                f"{output_dir}/sampling_iteration_{iteration:04d}.png",
+                dpi=100,
+                bbox_inches="tight",
+            )
+            plt.close(fig)
 
         # Backward pass (using AD)
         # The gradients are backpropagated through the scene
@@ -1934,67 +1897,6 @@ def optimize_boresight_pathsolver(
 
         # Update
         optimizer.step()
-
-        # Save RadioMap frame if requested
-        if save_radiomap_frames and (
-            iteration % frame_save_interval == 0 or iteration == num_iterations - 1
-        ):
-            # Apply current angles to scene (temporarily)
-            tx = scene.get(tx_name)
-            current_azimuth = azimuth.item()
-            current_elevation = elevation.item()
-            yaw_rad, pitch_rad = azimuth_elevation_to_yaw_pitch(
-                current_azimuth, current_elevation
-            )
-            tx.orientation = mi.Point3f(float(yaw_rad), float(pitch_rad), 0.0)
-
-            # Generate RadioMap
-            rm = rm_solver(
-                scene,
-                max_depth=5,
-                samples_per_tx=int(1e7),  # Lower for speed, increase for quality
-                cell_size=map_config["cell_size"],
-                center=map_config["center"],
-                orientation=[0, 0, 0],
-                size=map_config["size"],
-                los=True,
-                specular_reflection=True,
-                diffuse_reflection=True,
-                refraction=False,
-            )
-
-            # Extract and save visualization
-            import matplotlib.pyplot as plt
-
-            rss_watts = rm.rss.numpy()[0, :, :]
-            signal_strength_dBm = 10.0 * np.log10(rss_watts + 1e-30) + 30.0
-
-            fig, ax = plt.subplots(figsize=(10, 8))
-            im = ax.imshow(
-                signal_strength_dBm,
-                origin="lower",
-                cmap="viridis",
-                vmin=-120,
-                vmax=-60,
-                extent=[
-                    map_config["center"][0] - map_config["size"][0] / 2,
-                    map_config["center"][0] + map_config["size"][0] / 2,
-                    map_config["center"][1] - map_config["size"][1] / 2,
-                    map_config["center"][1] + map_config["size"][1] / 2,
-                ],
-            )
-            plt.colorbar(im, ax=ax, label="Signal Strength (dB)")
-            ax.set_title(f"Iteration {iteration} | Loss: {loss.item():.2f}")
-            ax.set_xlabel("X (m)")
-            ax.set_ylabel("Y (m)")
-
-            # Save frame
-            frame_path = os.path.join(output_dir, f"frame_{iteration:04d}.png")
-            plt.savefig(frame_path, dpi=100, bbox_inches="tight")
-            plt.close(fig)
-
-            if verbose:
-                print(f"  Saved frame: {frame_path}")
 
         # Update learning rate if scheduler is enabled
         if use_scheduler:
