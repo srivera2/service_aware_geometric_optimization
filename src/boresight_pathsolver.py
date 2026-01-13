@@ -25,6 +25,10 @@ from angle_utils import (
 )
 
 
+# Global cache for Sobol base points to ensure they are generated only once per configuration
+_sobol_base_points_cache = {}
+
+
 def create_optimization_gif(
     frame_dir,
     output_path="optimization.gif",
@@ -604,38 +608,37 @@ def sample_grid_points(
 
     center_x, center_y, ground_z = map_config["center"]
 
-    # Quasi-random sampling: directly sample from the target zone
+    # Quasi-random sampling in continuous space within the zone
     if zone_stats is not None and qrand is not None:
+        num_samples = zone_stats["num_cells"]
+
+        # 1. Use the stateful Sobol engine to draw a new batch of points in the unit square [0,1]x[0,1].
+        # Calling .draw() advances the engine's state, giving a new set of points for each iteration.
+        unit_points = qrand.draw(num_samples).numpy()
+
+        # Clip to [0, 1] to handle any floating-point precision issues
+        unit_points = np.clip(unit_points, 0.0, 1.0)
+
+        # 2. Scale these unit-square points to the real-world dimensions of the user-defined zone.
         zone_params = zone_stats.get("zone_params")
-
-        # Generate quasi-random samples in [0, 1] x [0, 1]
-        decimals = qrand.draw(zone_stats["num_cells"])
-
-        # Scale to zone dimensions [0, width] x [0, height]
-        sampled_pos_x_local = decimals[:, 0] * zone_params["width"]
-        sampled_pos_y_local = decimals[:, 1] * zone_params["height"]
-
-        # Center the samples: shift from [0, width] to [-width/2, +width/2]
-        sampled_pos_x_centered = sampled_pos_x_local - zone_params["width"] / 2
-        sampled_pos_y_centered = sampled_pos_y_local - zone_params["height"] / 2
-
-        # Translate to global coordinates by adding the zone center
         zone_center = zone_params.get("center", zone_stats["look_at_xyz"][:2])
-        sampled_pos_x_global = sampled_pos_x_centered + zone_center[0]
-        sampled_pos_y_global = sampled_pos_y_centered + zone_center[1]
+        zone_width = zone_params["width"]
+        zone_height = zone_params["height"]
 
-        # Clip to zone bounds to handle numerical precision issues
-        # This ensures all samples stay strictly within the zone
-        x_min = zone_center[0] - zone_params["width"] / 2
-        x_max = zone_center[0] + zone_params["width"] / 2
-        y_min = zone_center[1] - zone_params["height"] / 2
-        y_max = zone_center[1] + zone_params["height"] / 2
+        # Define the boundaries of the zone
+        min_bound_x = zone_center[0] - zone_width / 2
+        min_bound_y = zone_center[1] - zone_height / 2
 
-        sampled_pos_x_global = np.clip(sampled_pos_x_global, x_min, x_max)
-        sampled_pos_y_global = np.clip(sampled_pos_y_global, y_min, y_max)
+        # Linearly scale the points from [0, 1] to the zone's width and height
+        scaled_x = unit_points[:, 0] * zone_width
+        scaled_y = unit_points[:, 1] * zone_height
 
-        # Already filtered to zone - no mask filtering needed
-        sampled_points = np.column_stack([sampled_pos_x_global, sampled_pos_y_global])
+        # Translate the samples to the scene frame
+        trans_x = min_bound_x + scaled_x
+        trans_y = min_bound_y + scaled_y
+
+        # Stack into 2D points and convert to numpy for downstream processing
+        sampled_points = np.column_stack([trans_x, trans_y])
 
     # Uniform grid sampling: sample entire grid then filter by mask
     else:
@@ -789,12 +792,15 @@ def visualize_receiver_placement(
     target_receivers = []
     interference_receivers = []
 
-    for point in sample_points:
+    for idx, point in enumerate(sample_points):
         x, y = point[0], point[1]
         # Convert to grid indices
         # Grid cells are centered, so we use floor division to find the cell
         i = int((x - (center_x - width_m / 2)) / cell_w)
         j = int((y - (center_y - height_m / 2)) / cell_h)
+
+        # Debug: check if clipping is changing the indices
+        i_orig, j_orig = i, j
         i = np.clip(i, 0, n_x - 1)
         j = np.clip(j, 0, n_y - 1)
 
@@ -802,6 +808,11 @@ def visualize_receiver_placement(
             target_receivers.append([x, y])
         else:  # Interference zone
             interference_receivers.append([x, y])
+            # Debug: Print details about misclassified points
+            if len(interference_receivers) <= 2:  # Only print first 2 misclassified points
+                print(f"  [DEBUG] Point at ({x:.2f}, {y:.2f}) classified as interference:")
+                print(f"    Grid indices: i={i_orig}->{i}, j={j_orig}->{j}")
+                print(f"    Mask value: {zone_mask[j, i]:.2f}")
 
     target_receivers = np.array(target_receivers)
     interference_receivers = np.array(interference_receivers)
@@ -1580,7 +1591,7 @@ def optimize_boresight_pathsolver(
 
         # Adding jitter to smooth out the "Needle" effect and avoid overfitting to sample points
         # Use numpy for random jitter since this happens outside the differentiable path
-        jitter_std_deg = 0.1  # Small jitter in degrees
+        jitter_std_deg = 0.3  # Small jitter in degrees
         jitter_std_rad = jitter_std_deg * (np.pi / 180.0)
 
         # Generate random jitter using numpy (converted to DrJit Float)
@@ -1590,8 +1601,8 @@ def optimize_boresight_pathsolver(
         dr.disable_grad(pitch_jitter)
 
         # Apply jitter to orientation
-        yaw_rad_jittered = yaw_rad #+ yaw_jitter
-        pitch_rad_jittered = pitch_rad #+ pitch_jitter
+        yaw_rad_jittered = yaw_rad + yaw_jitter
+        pitch_rad_jittered = pitch_rad + pitch_jitter
 
         # Set antenna orientation directly using yaw, pitch, roll
         tx = scene.get(tx_name)
