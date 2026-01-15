@@ -1218,71 +1218,53 @@ def compare_boresight_performance(
     ax = axes[1, 1]
     ax.axis("off")
 
-    # Helper function to format improvement values (as percentage)
-    def format_improvement_pct(optimized, baseline):
-        if baseline != 0:
-            pct = ((optimized - baseline) / baseline) * 100
-            return f"{pct:+.1f}%"
-        else:
-            return "N/A"
+    # Helper function to convert Watts to dBm
+    def watts_to_dbm(watts):
+        return 10.0 * np.log10(watts + 1e-30) + 30.0
 
     stats_data = [
         ["Metric", "Naive Baseline", "Optimized", "Improvement"],
         [
-            "Mean (W)",
-            f"{results['Naive Baseline']['mean']:.2e}",
-            f"{results['Optimized']['mean']:.2e}",
-            format_improvement_pct(
-                results["Optimized"]["mean"], results["Naive Baseline"]["mean"]
-            ),
+            "Mean (dBm)",
+            f"{watts_to_dbm(results['Naive Baseline']['mean']):.2f}",
+            f"{watts_to_dbm(results['Optimized']['mean']):.2f}",
+            f"{watts_to_dbm(results['Optimized']['mean']) - watts_to_dbm(results['Naive Baseline']['mean']):+.2f} dB",
         ],
         [
-            "Median (W)",
-            f"{results['Naive Baseline']['median']:.2e}",
-            f"{results['Optimized']['median']:.2e}",
-            format_improvement_pct(
-                results["Optimized"]["median"], results["Naive Baseline"]["median"]
-            ),
+            "Median (dBm)",
+            f"{watts_to_dbm(results['Naive Baseline']['median']):.2f}",
+            f"{watts_to_dbm(results['Optimized']['median']):.2f}",
+            f"{watts_to_dbm(results['Optimized']['median']) - watts_to_dbm(results['Naive Baseline']['median']):+.2f} dB",
         ],
         [
-            "Std Dev (W)",
-            f"{results['Naive Baseline']['std']:.2e}",
-            f"{results['Optimized']['std']:.2e}",
-            format_improvement_pct(
-                results["Optimized"]["std"], results["Naive Baseline"]["std"]
-            ),
+            "Std Dev (dB)",
+            f"{watts_to_dbm(results['Naive Baseline']['std']):.2f}",
+            f"{watts_to_dbm(results['Optimized']['std']):.2f}",
+            f"{watts_to_dbm(results['Optimized']['std']) - watts_to_dbm(results['Naive Baseline']['std']):+.2f} dB",
         ],
         [
-            "Min (W)",
-            f"{results['Naive Baseline']['min']:.2e}",
-            f"{results['Optimized']['min']:.2e}",
-            format_improvement_pct(
-                results["Optimized"]["min"], results["Naive Baseline"]["min"]
-            ),
+            "Min (dBm)",
+            f"{watts_to_dbm(results['Naive Baseline']['min']):.2f}",
+            f"{watts_to_dbm(results['Optimized']['min']):.2f}",
+            f"{watts_to_dbm(results['Optimized']['min']) - watts_to_dbm(results['Naive Baseline']['min']):+.2f} dB",
         ],
         [
-            "Max (W)",
-            f"{results['Naive Baseline']['max']:.2e}",
-            f"{results['Optimized']['max']:.2e}",
-            format_improvement_pct(
-                results["Optimized"]["max"], results["Naive Baseline"]["max"]
-            ),
+            "Max (dBm)",
+            f"{watts_to_dbm(results['Naive Baseline']['max']):.2f}",
+            f"{watts_to_dbm(results['Optimized']['max']):.2f}",
+            f"{watts_to_dbm(results['Optimized']['max']) - watts_to_dbm(results['Naive Baseline']['max']):+.2f} dB",
         ],
         [
-            "10th %ile (W)",
-            f"{results['Naive Baseline']['p10']:.2e}",
-            f"{results['Optimized']['p10']:.2e}",
-            format_improvement_pct(
-                results["Optimized"]["p10"], results["Naive Baseline"]["p10"]
-            ),
+            "10th %ile (dBm)",
+            f"{watts_to_dbm(results['Naive Baseline']['p10']):.2f}",
+            f"{watts_to_dbm(results['Optimized']['p10']):.2f}",
+            f"{watts_to_dbm(results['Optimized']['p10']) - watts_to_dbm(results['Naive Baseline']['p10']):+.2f} dB",
         ],
         [
-            "90th %ile (W)",
-            f"{results['Naive Baseline']['p90']:.2e}",
-            f"{results['Optimized']['p90']:.2e}",
-            format_improvement_pct(
-                results["Optimized"]["p90"], results["Naive Baseline"]["p90"]
-            ),
+            "90th %ile (dBm)",
+            f"{watts_to_dbm(results['Naive Baseline']['p90']):.2f}",
+            f"{watts_to_dbm(results['Optimized']['p90']):.2f}",
+            f"{watts_to_dbm(results['Optimized']['p90']) - watts_to_dbm(results['Naive Baseline']['p90']):+.2f} dB",
         ],
     ]
 
@@ -1304,9 +1286,16 @@ def compare_boresight_performance(
     # Color improvement column green if positive
     for i in range(1, len(stats_data)):
         improvement_str = stats_data[i][3]
-        # Parse percentage string (e.g., "+10.5%" or "-5.2%")
+        # Parse percentage string (e.g., "+10.5%" or "-5.2%") or dB string (e.g., "+0.88 dB")
         if improvement_str != "N/A":
-            improvement_val = float(improvement_str.rstrip("%"))
+            # Handle both percentage and dB formats
+            if improvement_str.endswith("%"):
+                improvement_val = float(improvement_str.rstrip("%"))
+            elif improvement_str.endswith(" dB"):
+                improvement_val = float(improvement_str.rstrip(" dB"))
+            else:
+                continue  # Skip if format is unexpected
+
             if improvement_val > 0:
                 table[(i, 3)].set_facecolor("#90EE90")
             elif improvement_val < 0:
