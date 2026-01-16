@@ -1,0 +1,11 @@
+drjit==1.2.0
+imageio==2.37.0
+matplotlib==3.10.8
+mitsuba==3.7.1
+numpy==2.4.1
+Pillow==12.1.0
+plyfile==1.1.3
+Shapely==2.1.2
+sionna_rt==1.2.1
+sionna_rt.egg==info
+torch==2.9.1

@@ -25,10 +25,6 @@ from angle_utils import (
 )
 
 
-# Global cache for Sobol base points to ensure they are generated only once per configuration
-_sobol_base_points_cache = {}
-
-
 def create_optimization_gif(
     frame_dir,
     output_path="optimization.gif",
@@ -809,8 +805,12 @@ def visualize_receiver_placement(
         else:  # Interference zone
             interference_receivers.append([x, y])
             # Debug: Print details about misclassified points
-            if len(interference_receivers) <= 2:  # Only print first 2 misclassified points
-                print(f"  [DEBUG] Point at ({x:.2f}, {y:.2f}) classified as interference:")
+            if (
+                len(interference_receivers) <= 2
+            ):  # Only print first 2 misclassified points
+                print(
+                    f"  [DEBUG] Point at ({x:.2f}, {y:.2f}) classified as interference:"
+                )
                 print(f"    Grid indices: i={i_orig}->{i}, j={j_orig}->{j}")
                 print(f"    Mask value: {zone_mask[j, i]:.2f}")
 
@@ -1540,7 +1540,7 @@ def optimize_boresight_pathsolver(
 
     # Define differentiable loss function using @dr.wrap
     @dr.wrap(source="torch", target="drjit")
-    def compute_loss(azimuth_deg, elevation_deg):
+    def compute_loss(azimuth_deg, elevation_deg, qrand_op):
         """
         Compute loss with AD enabled through field_calculator only
 
@@ -1604,7 +1604,7 @@ def optimize_boresight_pathsolver(
             exclude_buildings=True,
             zone_mask=zone_mask,
             zone_stats=zone_stats,
-            qrand=qrand,
+            qrand=qrand_op,
         )
 
         # Update the actual receiver count (may vary due to building exclusion)
@@ -1808,6 +1808,7 @@ def optimize_boresight_pathsolver(
     # Create output directory for frame saving
     if save_radiomap_frames:
         import os
+
         os.makedirs(output_dir, exist_ok=True)
         if verbose:
             print(f"Saving frames to: {output_dir}")
@@ -1845,8 +1846,13 @@ def optimize_boresight_pathsolver(
             print(f"  (These should match the naive baseline angles shown above)")
             print(f"{'='*70}\n")
 
-        # Forward pass
-        loss = compute_loss(azimuth, elevation)
+        # Using an independent (random) set of Sobol points using different seeds
+        # qrand_run = torch.quasirandom.SobolEngine(dimension=2, scramble=True, seed=iteration)
+
+        # Virtualized mini-batch
+        loss = compute_loss(azimuth, elevation, qrand)
+        optimizer.zero_grad()
+        loss.backward()
 
         # Visualize the Sobol sampling pattern (only save every N iterations to reduce file count)
         if save_radiomap_frames and (iteration % frame_save_interval == 0):
@@ -1869,11 +1875,6 @@ def optimize_boresight_pathsolver(
             )
             plt.close(fig)
 
-        # Backward pass (using AD)
-        # The gradients are backpropagated through the scene
-        optimizer.zero_grad()
-        loss.backward()
-
         # Track gradient norm for diagnostics
         grad_azimuth_val = azimuth.grad.item() if azimuth.grad is not None else 0.0
         grad_elevation_val = (
@@ -1894,6 +1895,9 @@ def optimize_boresight_pathsolver(
             print(
                 f"  Loss: {loss.item():.4f}, Mean Power in Zone: {mean_power_in_zone_dbm:.2f} dBm"
             )
+
+        torch.nn.utils.clip_grad_norm_(elevation.grad, max_norm=0.5)
+        torch.nn.utils.clip_grad_norm_(elevation.grad, max_norm=0.5)
 
         # Update
         optimizer.step()

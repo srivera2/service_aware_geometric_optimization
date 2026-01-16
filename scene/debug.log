@@ -1,0 +1,28 @@
+2025-12-17 14:06:17,744 - scene_generation.cli - [INFO] - Check the bbox at http://bboxfinder.com/#35.9966,-78.9459,36.0076,-78.9323
+2025-12-17 14:06:17,798 - scene_generation.core - [INFO] - Using UTM Zone: EPSG:32617
+2025-12-17 14:06:17,798 - scene_generation.core - [INFO] - 
+2025-12-17 14:06:17,798 - scene_generation.core - [INFO] - Ground Material Type:              Wet Ground           | Frequency Range:   1   -  10   (GHz)
+2025-12-17 14:06:17,798 - scene_generation.core - [INFO] - Building Rooftop Material Type:    Metal                | Frequency Range:   1   -  100  (GHz)
+2025-12-17 14:06:17,798 - scene_generation.core - [INFO] - Building Wall Material Type:       Concrete             | Frequency Range:   1   -  100  (GHz)
+2025-12-17 14:06:17,798 - scene_generation.core - [INFO] - 
+2025-12-17 14:06:17,799 - scene_generation.core - [DEBUG] - Loop: [(-600.1540700442856, -623.1196107324213), (-625.8814682246884, 597.1859471285716), (599.9835137688788, 623.1196107319556), (625.8814682244556, -597.1891912827268)]
+2025-12-17 14:06:17,800 - scene_generation.core - [DEBUG] - Verts: [[-600.15407004 -623.11961073]
+ [-625.88146822  597.18594713]
+ [ 599.98351377  623.11961073]
+ [ 625.88146822 -597.18919128]], Edges: [[0 1]
+ [1 2]
+ [2 3]
+ [3 0]]
+2025-12-17 14:06:17,800 - scene_generation.core - [DEBUG] - points from triangulate: [[-600.15407004 -623.11961073    0.        ]
+ [-625.88146822  597.18594713    0.        ]
+ [ 599.98351377  623.11961073    0.        ]
+ [ 625.88146822 -597.18919128    0.        ]]
+2025-12-17 14:06:17,800 - scene_generation.core - [INFO] - Estimated ground polygon size: width=1252m, height=1247m
+2025-12-17 14:06:17,800 - scene_generation.core - [DEBUG] - OSM bounding box: (north=36.0076, south=35.9966, east=-78.9323, west=-78.9459)
+2025-12-17 14:06:17,858 - urllib3.connectionpool - [DEBUG] - Starting new HTTPS connection (1): overpass-api.de:443
+2025-12-17 14:06:19,034 - urllib3.connectionpool - [DEBUG] - https://overpass-api.de:443 "POST /api/interpreter/interpreter HTTP/1.1" 200 46125
+2025-12-17 14:06:19,311 - scene_generation.core - [DEBUG] - building_polygon.geom_type: Point
+2025-12-17 14:06:19,311 - scene_generation.core - [DEBUG] - building_polygon.geom_type: Point
+2025-12-17 14:06:19,311 - scene_generation.core - [DEBUG] - building_polygon.geom_type: Point
+2025-12-17 14:06:19,311 - scene_generation.core - [DEBUG] - building_polygon.geom_type: Point
+2025-12-17 14:06:19,311 - scene_generation.core - [DEBUG] - building_polygon.geom_type: Point
