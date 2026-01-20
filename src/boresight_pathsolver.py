@@ -14,6 +14,7 @@ import mitsuba as mi
 from sionna.rt import PathSolver, Receiver, cpx_abs_square
 from sionna.rt.path_solvers.paths import Paths
 import time
+from shapely import contains_xy
 from shapely.geometry import Point, Polygon
 from tx_placement import TxPlacement
 from angle_utils import (
@@ -23,6 +24,7 @@ from angle_utils import (
     normalize_azimuth,
     clamp_elevation,
 )
+import scipy
 
 
 def create_optimization_gif(
@@ -365,7 +367,7 @@ def estimate_achievable_power(
 
 def create_zone_mask(
     map_config,
-    zone_type="angular_sector",
+    zone_type="box",
     origin_point=None,
     zone_params=None,
     target_height=1.5,
@@ -373,98 +375,39 @@ def create_zone_mask(
     exclude_buildings=True,
 ):
 
-    # Validate inputs
-    if zone_type not in ["angular_sector", "box"]:
-        raise ValueError(
-            f"Invalid zone_type '{zone_type}'. Must be 'angular_sector' or 'box'."
-        )
-
     if zone_params is None:
         raise ValueError("zone_params must be provided")
 
-    # 1. Setup Grid
-    width_m, height_m = map_config["size"]
-    cell_w, cell_h = map_config["cell_size"]
-    center_x, center_y, _ = map_config["center"]
+    # Configures the zone based on rectangular area described by zone_params
+    if zone_type == "box":
+        # 1. Set up outer area (map size)
+        width_m, height_m = map_config["size"]
+        cell_w, cell_h = map_config["cell_size"]
+        center_x, center_y, _ = map_config["center"]
 
-    n_x = int(width_m / cell_w)
-    n_y = int(height_m / cell_h)
+        n_x = int(width_m / cell_w)
+        n_y = int(height_m / cell_h)
 
-    # Create coordinate grids
-    # Use endpoint=False to ensure proper cell spacing
-    # With endpoint=False, linspace creates n_x cells of exactly cell_w width
-    x = (
-        np.linspace(center_x - width_m / 2, center_x + width_m / 2, n_x, endpoint=False)
-        + cell_w / 2
-    )
-    y = (
-        np.linspace(
-            center_y - height_m / 2, center_y + height_m / 2, n_y, endpoint=False
+        # Create coordinate grids
+        # Use endpoint=False to ensure proper cell spacing
+        # With endpoint=False, linspace creates n_x cells of exactly cell_w width
+        x = (
+            np.linspace(center_x - width_m / 2, center_x + width_m / 2, n_x, endpoint=False)
+            + cell_w / 2
         )
-        + cell_h / 2
-    )
-    X, Y = np.meshgrid(x, y)
-
-    # Initialize mask (all zeros = outside zone)
-    mask = np.zeros((n_y, n_x), dtype=np.float32)
-
-    # Default look_at position (will be overridden based on zone geometry)
-    look_at_pos = np.array([center_x, center_y, target_height], dtype=np.float32)
-
-    # 2. Generate Mask & Calculate Look-At Position
-    if zone_type == "angular_sector":
-        # Validate required parameters
-        if origin_point is None:
-            raise ValueError(
-                "zone_type='angular_sector' requires 'origin_point' (TX location)."
+        y = (
+            np.linspace(
+                center_y - height_m / 2, center_y + height_m / 2, n_y, endpoint=False
             )
+            + cell_h / 2
+        )
+        X, Y = np.meshgrid(x, y)
 
-        tx_x, tx_y, _ = origin_point
-        start_deg = zone_params.get("angle_start", 0)
-        end_deg = zone_params.get("angle_end", 360)
-        radius = zone_params.get("radius", 100.0)
+        # Initialize mask (all zeros = outside zone)
+        mask = np.zeros((n_y, n_x), dtype=np.float32)
 
-        # Validate sector parameters
-        if radius <= 0:
-            raise ValueError(f"radius must be positive, got {radius}")
-
-        # Calculate angles from TX to each grid point
-        # Angle convention: 0° = East (+X), 90° = North (+Y), counter-clockwise
-        theta = np.degrees(np.arctan2(Y - tx_y, X - tx_x))
-        theta = np.where(theta < 0, theta + 360, theta)  # Normalize to [0, 360)
-
-        # Calculate distances from TX
-        dist = np.sqrt((X - tx_x) ** 2 + (Y - tx_y) ** 2)
-
-        # Handle wrap-around sectors (e.g., 350° to 10° wraps through 0°)
-        if start_deg > end_deg:
-            # Sector crosses 0° boundary
-            in_wedge = (theta >= start_deg) | (theta <= end_deg)
-            # Calculate bisector angle (wraps correctly)
-            mid_angle_deg = (start_deg + end_deg + 360) / 2
-            if mid_angle_deg >= 360:
-                mid_angle_deg -= 360
-        else:
-            # Normal sector (no wrap-around)
-            in_wedge = (theta >= start_deg) & (theta <= end_deg)
-            mid_angle_deg = (start_deg + end_deg) / 2
-
-        # Apply distance constraint
-        in_sector = in_wedge & (dist <= radius)
-        mask[in_sector] = 1.0
-
-        # Calculate Look-At Position
-        # Use 75% of radius along bisector for better beam centering
-        # (empirically works better than edge or full center)
-        target_dist = radius * 0.75
-
-        mid_rad = np.radians(mid_angle_deg)
-        target_x = tx_x + target_dist * np.cos(mid_rad)
-        target_y = tx_y + target_dist * np.sin(mid_rad)
-
-        look_at_pos = np.array([target_x, target_y, target_height], dtype=np.float32)
-
-    elif zone_type == "box":
+        # Default look_at position (will be overridden based on zone geometry)
+        look_at_pos = np.array([center_x, center_y, target_height], dtype=np.float32)
         # Get box parameters
         box_center = zone_params.get("center", (center_x, center_y))
         bx, by = box_center
@@ -485,8 +428,53 @@ def create_zone_mask(
 
         # Look-at is simply the center of the box
         look_at_pos = np.array([bx, by, target_height], dtype=np.float32)
+    
+    elif zone_type == "polygon":
+        print("Creating polygon")
+        # 1. Set up outer area (map size)
+        width_m, height_m = map_config["size"]
+        cell_w, cell_h = map_config["cell_size"]
+        center_x, center_y, _ = map_config["center"]
 
-    # 3. Exclude building footprints (optional)
+        n_x = int(width_m / cell_w)
+        n_y = int(height_m / cell_h)
+
+        # Create coordinate grids
+        x = (np.linspace(center_x - width_m / 2, center_x + width_m / 2, n_x, endpoint=False) + cell_w / 2)
+        y = (np.linspace(center_y - height_m / 2, center_y + height_m / 2, n_y, endpoint=False) + cell_h / 2)
+        X, Y = np.meshgrid(x, y)
+
+        # Initialize mask (all zeros = outside zone)
+        mask = np.zeros((n_y, n_x), dtype=np.float32)
+
+        # Get the vertices of the polygon from zone_params
+        vertices = zone_params.get("vertices", [(0,0), (10,0), (10,-10), (0,-10)])
+
+        from shapely.geometry import Polygon
+        from shapely import contains_xy
+
+        # Create polygon from vertices
+        zone = Polygon(vertices)
+
+        # Vectorized containment check: flatten grid points and check all at once
+        mask_flat = contains_xy(zone, X.flatten(), Y.flatten())
+        mask = mask_flat.reshape(n_y, n_x).astype(np.float32)
+
+        # Set the look at position at the centroid of the polygon
+        centroid = zone.centroid
+        look_at_pos = np.array([centroid.x, centroid.y, target_height], dtype=np.float32)
+
+        # Store bounding box for LDS sampling
+        minx, miny, maxx, maxy = zone.bounds
+        zone_params['center'] = [(minx + maxx) / 2, (miny + maxy) / 2]
+        zone_params['width'] = maxx - minx
+        zone_params['height'] = maxy - miny
+
+    else:
+        print("Polygon configuration is not clear. Double check your configuration")
+        exit
+
+    # 3. Exclude building footprints (independent of the zone type)
     num_excluded_buildings = 0
     if exclude_buildings:
         if scene_xml_path is None:
@@ -594,6 +582,8 @@ def sample_grid_points(
     zone_mask=None,
     zone_stats=None,
     qrand=None,
+    # Making the number of points configurable from now on
+    num_points=20,
 ):
 
     width_m, height_m = map_config["size"]
@@ -603,38 +593,63 @@ def sample_grid_points(
     n_y = int(height_m / cell_h)
 
     center_x, center_y, ground_z = map_config["center"]
+    
+    from shapely.geometry import Polygon
+    from shapely import contains_xy
 
     # Quasi-random sampling in continuous space within the zone
     if zone_stats is not None and qrand is not None:
-        num_samples = zone_stats["num_cells"]
-
-        # 1. Use the stateful Sobol engine to draw a new batch of points in the unit square [0,1]x[0,1].
-        # Calling .draw() advances the engine's state, giving a new set of points for each iteration.
-        unit_points = qrand.draw(num_samples).numpy()
-
-        # Clip to [0, 1] to handle any floating-point precision issues
-        unit_points = np.clip(unit_points, 0.0, 1.0)
-
-        # 2. Scale these unit-square points to the real-world dimensions of the user-defined zone.
         zone_params = zone_stats.get("zone_params")
         zone_center = zone_params.get("center", zone_stats["look_at_xyz"][:2])
         zone_width = zone_params["width"]
         zone_height = zone_params["height"]
 
-        # Define the boundaries of the zone
-        min_bound_x = zone_center[0] - zone_width / 2
-        min_bound_y = zone_center[1] - zone_height / 2
+        # Check if this is a polygon zone (has vertices)
+        if "vertices" in zone_params:
+            # Polygon sampling with rejection method
+            zone_polygon = Polygon(zone_params["vertices"])
 
-        # Linearly scale the points from [0, 1] to the zone's width and height
-        scaled_x = unit_points[:, 0] * zone_width
-        scaled_y = unit_points[:, 1] * zone_height
+            # Oversample to account for rejection (2x should be enough for most polygons)
+            oversample_factor = 2
+            samples_needed = num_points
+            sampled_points_list = []
 
-        # Translate the samples to the scene frame
-        trans_x = min_bound_x + scaled_x
-        trans_y = min_bound_y + scaled_y
+            while len(sampled_points_list) < num_points:
+                # Draw from bounding box
+                unit_points = np.array(qrand.random(samples_needed))
+                unit_points = np.clip(unit_points, 0.0, 1.0)
 
-        # Stack into 2D points and convert to numpy for downstream processing
-        sampled_points = np.column_stack([trans_x, trans_y])
+                # Scale to bounding box
+                min_bound_x = zone_center[0] - zone_width / 2
+                min_bound_y = zone_center[1] - zone_height / 2
+                scaled_x = min_bound_x + unit_points[:, 0] * zone_width
+                scaled_y = min_bound_y + unit_points[:, 1] * zone_height
+
+                # Keep only points inside polygon
+                inside_mask = contains_xy(zone_polygon, scaled_x, scaled_y)
+                valid_points = np.column_stack([scaled_x[inside_mask], scaled_y[inside_mask]])
+                sampled_points_list.append(valid_points)
+
+                # Update how many more we need
+                samples_needed = num_points - sum(len(pts) for pts in sampled_points_list)
+
+            # Combine and trim to exact count
+            sampled_points = np.vstack(sampled_points_list)[:num_points]
+        else:
+            # Box sampling (original logic)
+            unit_points = np.array(qrand.random(num_points))
+            unit_points = np.clip(unit_points, 0.0, 1.0)
+
+            min_bound_x = zone_center[0] - zone_width / 2
+            min_bound_y = zone_center[1] - zone_height / 2
+
+            scaled_x = unit_points[:, 0] * zone_width
+            scaled_y = unit_points[:, 1] * zone_height
+
+            trans_x = min_bound_x + scaled_x
+            trans_y = min_bound_y + scaled_y
+
+            sampled_points = np.column_stack([trans_x, trans_y])
 
     # Uniform grid sampling: sample entire grid then filter by mask
     else:
@@ -1345,13 +1360,12 @@ def optimize_boresight_pathsolver(
     learning_rate=1.0,
     num_iterations=20,
     loss_type="coverage_maximize",
-    power_threshold_dbm=-90.0,
     verbose=True,
-    seed=42,  # Random seed for reproducible sampling
+    seed=None,
+    lds="Sobol",  # Random seed for reproducible sampling
     tx_placement_mode="skip",  # "center", "fixed", "line", "skip" (skip = don't move TX)
     # If true, the center position of the roof polygon is used
     # Else, use the start position
-    Tx_Center=True,
     Tx_start_pos=[0.0, 0.0],
     save_radiomap_frames=False,
     frame_save_interval=1,
@@ -1390,8 +1404,6 @@ def optimize_boresight_pathsolver(
         print(f"Iterations: {num_iterations}")
         print(f"Sample points: {num_sample_points}")
         print(f"Loss type: {loss_type}")
-        if loss_type == "coverage_threshold":
-            print(f"Power threshold: {power_threshold_dbm:.1f} dB")
         print(f"Map config: {map_config}")
         print(f"{'='*70}\n")
 
@@ -1434,8 +1446,18 @@ def optimize_boresight_pathsolver(
             f"Boresight Z constraint: must be < {tx_height:.1f}m (no pointing upward)\n"
         )
 
-    # Initialize Sobol quasi-random sequence generator for QMC sampling
-    qrand = torch.quasirandom.SobolEngine(dimension=2, scramble=True, seed=seed)
+    # Select LDS from available list
+    if lds == "Sobol":
+        qrand = scipy.stats.qmc.Sobol(d=2, scramble=True, seed=None)
+    elif lds == "Halton":
+        qrand = scipy.stats.qmc.Halton(d=2, scramble=True, seed=None)
+    elif lds == "Latin":
+        qrand = scipy.stats.qmc.LatinHypercube(d=2, scramble=True, seed=None)
+    elif lds == "Uniform":
+        qrand = None
+    else:
+        print("This LDS is not supported. Using Sobol as default")
+        qrand = scipy.stats.qmc.Sobol(d=2, scramble=True, seed=None)
 
     # Sample Grid Points using Quasi-Monte Carlo (Sobol sequence)
     sample_points = sample_grid_points(
@@ -1445,15 +1467,14 @@ def optimize_boresight_pathsolver(
         zone_mask=zone_mask,
         zone_stats=zone_stats,
         qrand=qrand,
+        num_points=num_sample_points
     )
 
-    # CRITICAL: Update num_sample_points to reflect actual number of samples
-    # Building exclusion may reduce the count
-    num_sample_points = len(sample_points)
-
+    # Print to see the number of sample points after sampling
     if verbose:
         print(f"Actual sample points after building exclusion: {num_sample_points}")
 
+    # Visualize the receiver placement to ensure everything looks correct
     fig = visualize_receiver_placement(
         sample_points,
         zone_mask,
@@ -1466,7 +1487,6 @@ def optimize_boresight_pathsolver(
 
     # Display the visualization
     import matplotlib.pyplot as plt
-
     plt.show()
 
     # Extract zone mask values at sampled points
@@ -1521,26 +1541,9 @@ def optimize_boresight_pathsolver(
     p_solver = PathSolver()
     p_solver.loop_mode = "evaluated"  # Required for gradient computation
 
-    # Compute paths with AD (this is built into the Dr.Jit framework)
-    # This was moved outside of the loss function to improve the computational overhead
-    # paths = p_solver(
-    #    scene,
-    #    los=True,
-    #    refraction=False,
-    #    specular_reflection=True,
-    #    diffuse_reflection=False,
-    #    diffraction=True,
-    #    edge_diffraction=True,  # Enable for better obstacle handling in heavily obstructed scenarios
-    # )
-
-    # Extract the paths_buffer for reuse in compute_loss
-    # The Paths object stores it as _paths_buffer
-    # This contains the pre-traced ray geometry that will be reused with updated antenna orientations
-    # paths_buffer = paths._paths_buffer
-
     # Define differentiable loss function using @dr.wrap
     @dr.wrap(source="torch", target="drjit")
-    def compute_loss(azimuth_deg, elevation_deg, qrand_op):
+    def compute_loss(azimuth_deg, elevation_deg, qrand_op, num_sample_points):
         """
         Compute loss with AD enabled through field_calculator only
 
@@ -1605,11 +1608,8 @@ def optimize_boresight_pathsolver(
             zone_mask=zone_mask,
             zone_stats=zone_stats,
             qrand=qrand_op,
+            num_points=num_sample_points
         )
-
-        # Update the actual receiver count (may vary due to building exclusion)
-        nonlocal num_sample_points
-        num_sample_points = len(new_sample_points)
 
         # Store for visualization outside the loss function
         compute_loss.current_sample_points = new_sample_points
@@ -1638,49 +1638,6 @@ def optimize_boresight_pathsolver(
             edge_diffraction=True,
         )
 
-        # EXTRACT PARAMETERS FROM SCENE (same as PathSolver.__call__ does)
-        # These calls extract current transmitter/receiver states INCLUDING updated orientation
-        # See sionna-rt path_solver.py:183-186
-        # src_positions, src_orientations, rel_ant_positions_tx, tx_velocities = (
-        #    scene.sources(synthetic_array=True, return_velocities=True)
-        # )
-        # tgt_positions, tgt_orientations, rel_ant_positions_rx, rx_velocities = (
-        #    scene.targets(synthetic_array=True, return_velocities=True)
-        # )
-
-        # Get antenna patterns from scene (path_solver.py:189-190)
-        # src_antenna_patterns = scene.tx_array.antenna_pattern.patterns
-        # tgt_antenna_patterns = scene.rx_array.antenna_pattern.patterns
-
-        # Call field_calculator with updated orientations
-        # The paths_buffer from outer scope contains the pre-traced ray geometry
-        # We're recomputing only the field coefficients with new antenna orientation
-        # updated_paths_buffer = p_solver._field_calculator(
-        #    wavelength=scene.wavelength,
-        #    paths=paths_buffer,  # Pre-computed ray geometry from outer scope
-        #    samples_per_src=1000000,  # Match the value used in p_solver call
-        #    diffraction=True,  # Match p_solver call settings
-        #    src_positions=src_positions,
-        #    tgt_positions=tgt_positions,
-        #    src_orientations=src_orientations,  # Now includes UPDATED orientation
-        #    tgt_orientations=tgt_orientations,
-        #    src_antenna_patterns=src_antenna_patterns,
-        #    tgt_antenna_patterns=tgt_antenna_patterns,
-        # )
-
-        # Create Paths object with updated field coefficients
-        # paths = Paths(
-        #    scene,
-        #    src_positions,
-        #    tgt_positions,
-        #    tx_velocities,
-        #    rx_velocities,
-        #    True,  # synthetic_array=True (matches scene.sources/targets calls)
-        #    updated_paths_buffer,  # Updated buffer with new field coefficients
-        #    rel_ant_positions_tx,
-        #    rel_ant_positions_rx,
-        # )
-
         # Extract channel coefficients
         h_real, h_imag = paths.a
 
@@ -1699,14 +1656,6 @@ def optimize_boresight_pathsolver(
             print(f"  [GRADIENT CHECK] h_real grad enabled: {dr.grad_enabled(h_real)}")
             print(f"  [GRADIENT CHECK] h_imag grad enabled: {dr.grad_enabled(h_imag)}")
             print(f"  [DIAGNOSTIC] h_real shape: {dr.shape(h_real)}")
-
-        # DEBUG: Verify channel coefficient shapes match expectations
-        # Expected shape: (num_receivers, num_tx_antennas, num_rx_antennas, num_paths)
-        h_real_shape = dr.shape(h_real)
-        if verbose and h_real_shape[0] != num_sample_points:
-            print(f"  [WARNING] Channel coefficient shape mismatch!")
-            print(f"    Expected {num_sample_points} receivers, got {h_real_shape[0]}")
-            print(f"    Full h_real shape: {h_real_shape}")
 
         # DEBUG: Check if any paths were found (only print on first call)
         # We use a simple flag via a mutable default to track first call
@@ -1789,10 +1738,12 @@ def optimize_boresight_pathsolver(
 
     # Optimizer: Adam shows the best performance
     # Optimize azimuth and elevation angles directly (2 parameters instead of 3)
-    optimizer = torch.optim.Adam([azimuth, elevation], lr=learning_rate)
+    # Adding a heavier beta term for momentum through noisy measurements
+    optimizer = torch.optim.Adam([azimuth, elevation], lr=learning_rate, betas=(0.98, 0.999))
 
     # Learning rate scheduler: required to jump out of local minima for difficult loss surfaces...
     use_scheduler = num_iterations >= 50
+
     if use_scheduler:
         # Use exponential decay for smoother convergence after grid search
         # This is more stable than ReduceLROnPlateau for noisy loss landscapes
@@ -1818,25 +1769,16 @@ def optimize_boresight_pathsolver(
     angle_history = [[initial_azimuth, initial_elevation]]
     gradient_history = []  # Track gradient norms for diagnostics
 
-    best_loss = float("inf")
     best_azimuth_final = initial_azimuth
     best_elevation_final = initial_elevation
 
+    # List to save the average of the last 10 values
+    final_el_list = np.array([])
+    final_az_list = np.array([])
+
+    # Start the optimization
     start_time = time.time()
-
-    # Verify scene state before optimization
-    if verbose:
-        print(f"\nScene verification before optimization:")
-        print(f"  Number of receivers: {len(scene.receivers)}")
-        print(f"  Number of transmitters: {len(scene.transmitters)}")
-        tx = scene.get(tx_name)
-        print(f"  TX '{tx_name}' position: {tx.position}")
-        print(f"  TX '{tx_name}' orientation: {tx.orientation}")
-        print()
-
-    # Run the optimization for the specified number of iterations
     for iteration in range(num_iterations):
-
         if verbose and iteration == 0:
             print(f"\n{'='*70}")
             print(f"STARTING OPTIMIZATION - Iteration {iteration+1}/{num_iterations}")
@@ -1848,9 +1790,8 @@ def optimize_boresight_pathsolver(
 
         # Using an independent (random) set of Sobol points using different seeds
         # qrand_run = torch.quasirandom.SobolEngine(dimension=2, scramble=True, seed=iteration)
-
-        # Virtualized mini-batch
-        loss = compute_loss(azimuth, elevation, qrand)
+        # Could build in different sampling sequences for customizable performance
+        loss = compute_loss(azimuth, elevation, qrand, num_sample_points)
         optimizer.zero_grad()
         loss.backward()
 
@@ -1865,7 +1806,7 @@ def optimize_boresight_pathsolver(
                 map_config,
                 tx_position=tx_position,
                 scene_xml_path=scene_xml_path,
-                title=f"Sobol Sampling - Iteration {iteration}",
+                title=f"LDS - Iteration {iteration}",
                 figsize=(14, 10),
             )
             plt.savefig(
@@ -1914,20 +1855,19 @@ def optimize_boresight_pathsolver(
             if azimuth.item() >= 360.0:
                 azimuth.fill_(azimuth.item() % 360.0)
 
-            # Elevation: clamp to prevent pointing upward (only downward tilt)
-            # 0° = horizontal, negative = downward tilt
-            # Adding a hard constraint that's realistic for the given scenario
-            # elevation.clamp_(min=-20.0, max=10.0)
-
         # Track
         loss_history.append(loss.item())
         angle_history.append([azimuth.item(), elevation.item()])
 
-        # Updates the ideal parameters if the loss is the lowest to date
-        if loss.item() < best_loss:
-            best_loss = loss.item()
-            best_azimuth_final = azimuth.item()
-            best_elevation_final = elevation.item()
+        # Modified to reflect robust value over the lowest loss
+        if iteration > (num_iterations - 10):
+            # Save the values to a list
+            final_az_list = np.append(final_az_list, azimuth.item())
+            final_el_list = np.append(final_el_list, elevation.item())
+    
+    # Save the average of the final 10 values
+    best_azimuth_final = np.mean(final_az_list)
+    best_elevation_final = np.mean(final_el_list)
 
     # Save the elapsed time for metrics
     elapsed_time = time.time() - start_time
@@ -1953,8 +1893,6 @@ def optimize_boresight_pathsolver(
         "num_samples_in_zone": num_in_zone,
         "num_samples_total": len(mask_values),
         "zone_coverage_fraction": num_in_zone / len(mask_values),
-        "final_loss": best_loss,
-        "final_mean_power_linear": -best_loss / 1e10,  # Convert loss to linear power
         "loss_type": loss_type,
         "best_azimuth_deg": best_azimuth_final,
         "best_elevation_deg": best_elevation_final,
@@ -1968,15 +1906,6 @@ def optimize_boresight_pathsolver(
         print(
             f"Best angles: Azimuth={best_azimuth_final:.1f}°, Elevation={best_elevation_final:.1f}°"
         )
-        print(f"Best loss: {best_loss:.4f}")
-        if loss_type == "coverage_maximize":
-            print(f"  (Maximizing mean power in zone - LINEAR scale)")
-            print(f"  Mean power (linear): {-best_loss / 1e10:.6e}")
-        elif loss_type == "coverage_threshold":
-            print(f"  (Maximizing fraction above {power_threshold_dbm} dB)")
-            print(f"  Estimated coverage: {-best_loss*100:.1f}% of zone")
-        elif loss_type == "percentile_maximize":
-            print(f"  (Maximizing soft-minimum power in zone)")
         print(
             f"Zone samples: {num_in_zone}/{len(mask_values)} ({100.0*num_in_zone/len(mask_values):.1f}%)"
         )
@@ -1987,100 +1916,3 @@ def optimize_boresight_pathsolver(
     # Return angles instead of Cartesian coordinates
     best_angles = [best_azimuth_final, best_elevation_final]
     return best_angles, loss_history, angle_history, gradient_history, coverage_stats
-
-
-# ============================================
-# EXAMPLE USAGE
-# ============================================
-
-if __name__ == "__main__":
-    print("Boresight optimization using PathSolver + AD")
-    print("\nExample usage:")
-    print(
-        """
-    from mcp_optimization_boresight_pathsolver import (
-        optimize_boresight_pathsolver,
-        create_target_radiomap
-    )
-
-    # Get TX position from scene
-    tx = scene.get("gnb")
-    tx_pos = tx.position  # (x, y, z)
-
-    map_config = {
-        'center': [0, 0, 1.5],
-        'size': [400, 400],
-        'cell_size': (20, 20),  # Coarser for PathSolver
-        'ground_height': 1.5,
-    }
-
-    # Option 1: Path-loss based target (omnidirectional)
-    target_map = create_target_radiomap(
-        map_config,
-        target_type='path_loss',
-        tx_position=tx_pos,
-        tx_power_dBm=30.0,  # 1 Watt
-        frequency_GHz=3.5,  # 5G mid-band
-        path_loss_exponent=2.5  # Urban environment
-    )
-
-    # Option 2: Path-loss with sector (directional antenna)
-    target_map = create_target_radiomap(
-        map_config,
-        target_type='path_loss_sector',
-        tx_position=tx_pos,
-        tx_power_dBm=30.0,
-        frequency_GHz=3.5,
-        path_loss_exponent=2.5,
-        sector_angle=45,  # Point northeast
-        sector_width=120  # 120° beamwidth
-    )
-
-    # Option 3: Simple Gaussian (for testing)
-    target_map = create_target_radiomap(map_config, target_type='circular')
-
-    # Option 4: Angular sectors with custom power levels
-    angular_sectors_config = [
-        {'angle_start': 0, 'angle_end': 120, 'power_dbm': -80},      # East to SE: -80 dBm
-        {'angle_start': 120, 'angle_end': 240, 'power_dbm': -100},   # SE to NW: -100 dBm
-        {'angle_start': 240, 'angle_end': 360, 'power_dbm': -90}     # NW to East: -90 dBm
-    ]
-    target_map = create_target_radiomap(
-        map_config,
-        target_type='angular_sectors',
-        tx_position=tx_pos,
-        angular_sectors=angular_sectors_config
-    )
-
-    # Option 5: Angular sectors with AUTO-SCALED power levels (RECOMMENDED for large maps)
-    # This automatically computes achievable power levels based on map size and antenna characteristics
-    angular_sectors_auto = [
-        {'angle_start': 0, 'angle_end': 120, 'relative_power': 'high'},     # Strong coverage sector
-        {'angle_start': 120, 'angle_end': 240, 'relative_power': 'low'},   # Weak coverage sector
-        {'angle_start': 240, 'angle_end': 360, 'relative_power': 'medium'} # Medium coverage sector
-    ]
-    target_map = create_target_radiomap(
-        map_config,
-        target_type='angular_sectors',
-        tx_position=tx_pos,
-        angular_sectors=angular_sectors_auto,
-        auto_scale_power=True,  # Enable auto-scaling
-        antenna_gain_dBi=8.0,   # TR38.901 default
-        frequency_GHz=3.5,      # 5G mid-band
-        path_loss_exponent=2.5  # Urban environment
-    )
-
-    best_boresight, loss_hist, bore_hist = optimize_boresight_pathsolver(
-        scene=scene,
-        tx_name="gnb",
-        map_config=map_config,
-        target_map=target_map,
-        initial_boresight=[100.0, 100.0, 10.0],
-        num_sample_points=100,  # Number of receiver points
-        learning_rate=1.0,
-        num_iterations=50,
-        loss_type='mse',  # Use MSE for path-loss targets
-        verbose=True
-    )
-    """
-    )
