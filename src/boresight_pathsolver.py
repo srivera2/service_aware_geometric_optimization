@@ -431,7 +431,7 @@ def create_zone_mask(
     
     elif zone_type == "polygon":
         print("Creating polygon")
-        # 1. Set up outer area (map size)
+        # Set up outer area (map size)
         width_m, height_m = map_config["size"]
         cell_w, cell_h = map_config["cell_size"]
         center_x, center_y, _ = map_config["center"]
