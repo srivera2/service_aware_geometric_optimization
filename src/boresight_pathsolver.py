@@ -1480,7 +1480,7 @@ def optimize_boresight_pathsolver(
         zone_mask,
         map_config,
         tx_position=tx_position,
-        scene_xml_path="/home/tingjunlab/Development/geo2sigmap/scenes/Duke/scene.xml",
+        scene_xml_path="../scene/scene.xml",
         title="Receiver Sampling Visualization",
         figsize=(14, 10),
     )
@@ -1698,11 +1698,12 @@ def optimize_boresight_pathsolver(
         # "Log of Means"
         # Attempts to improve the overall power in the reigon
         total_watts = dr.sum(target_power)
-        loss_peak = dr.log(total_watts + epsilon) / valid_points
+        loss_peak = dr.log((total_watts / valid_points) + epsilon)
 
         # Greediness Factor
         # Set to split the goal evenly
-        alpha = 1.0
+        #alpha = 1.0
+        alpha = 0.0
 
         # Alpha should be biased closed to 1.0 since there is a magnitude difference between the objectives
         loss = -(alpha * loss_peak + (1.0 - alpha) * loss_coverage)
