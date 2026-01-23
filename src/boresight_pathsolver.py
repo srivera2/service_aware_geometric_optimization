@@ -11,7 +11,7 @@ import numpy as np
 import drjit as dr
 from drjit.auto import Float, Array3f, UInt
 import mitsuba as mi
-from sionna.rt import PathSolver, Receiver, cpx_abs_square
+from sionna.rt import PathSolver, Receiver, cpx_abs_square, load_scene
 from sionna.rt.path_solvers.paths import Paths
 import time
 from shapely import contains_xy
@@ -1348,6 +1348,75 @@ def compare_boresight_performance(
     return fig, stats
 
 
+def reload_scene_with_receivers(
+    scene_xml_path, scene_config, tx_config, new_sample_points, verbose=False
+):
+    """
+    Efficiently reload scene with new receivers.
+
+    This reloads the scene from XML and adds receivers at new positions.
+    This is much faster than removing and adding receivers one by one,
+    as it avoids repeated scene updates/rebuilds.
+
+    Parameters:
+    -----------
+    scene_xml_path : str
+        Path to scene XML file
+    scene_config : dict
+        Scene configuration with keys:
+        - 'frequency': Operating frequency in Hz
+        - 'tx_array': Transmitter antenna array
+        - 'rx_array': Receiver antenna array
+    tx_config : dict
+        Transmitter configuration with keys:
+        - 'name': Transmitter name
+        - 'position': Transmitter position [x, y, z]
+        - 'orientation': Transmitter orientation (yaw, pitch, roll)
+        - 'power_dbm': Transmit power in dBm (optional)
+    new_sample_points : np.ndarray
+        Nx3 array of new receiver positions
+    verbose : bool
+        Print debug information
+
+    Returns:
+    --------
+    scene : sionna.rt.Scene
+        Freshly loaded scene with new receivers
+    rx_names : list
+        Names of the receivers that were added
+    """
+    from sionna.rt import Transmitter
+
+    # Reload scene from scratch - this is faster than individual remove/add
+    scene = load_scene(scene_xml_path)
+
+    # Restore scene-level configurations
+    scene.frequency = scene_config['frequency']
+    scene.tx_array = scene_config['tx_array']
+    scene.rx_array = scene_config['rx_array']
+
+    # Re-create and add transmitter (it's not in the XML, it was added programmatically)
+    tx = Transmitter(name=tx_config['name'], position=tx_config['position'])
+    if 'power_dbm' in tx_config:
+        tx.power_dbm = tx_config['power_dbm']
+    scene.add(tx)
+    tx.orientation = tx_config['orientation']
+
+    # Add all receivers at once
+    rx_names = []
+    for idx, position in enumerate(new_sample_points):
+        rx_name = f"opt_rx_{idx}"
+        rx_names.append(rx_name)
+        position_f32 = [float(position[0]), float(position[1]), float(position[2])]
+        rx = Receiver(name=rx_name, position=position_f32)
+        scene.add(rx)
+
+    if verbose:
+        print(f"  [RELOAD] Scene reloaded with {len(rx_names)} receivers")
+
+    return scene, rx_names
+
+
 def optimize_boresight_pathsolver(
     scene,
     tx_name,
@@ -1527,15 +1596,9 @@ def optimize_boresight_pathsolver(
     for rx_name in existing_receivers:
         scene.remove(rx_name)
 
-    # Add receivers to scene
+    # Initialize rx_names list (will be populated by compute_loss via scene reload)
+    # No need to add receivers here since compute_loss will reload scene with new receivers
     rx_names = []
-    for idx, position in enumerate(sample_points):
-        rx_name = f"opt_rx_{idx}"
-        rx_names.append(rx_name)
-        # Convert to float32 to avoid type errors with Mitsuba
-        position_f32 = [float(position[0]), float(position[1]), float(position[2])]
-        rx = Receiver(name=rx_name, position=position_f32)
-        scene.add(rx)
 
     # Create PathSolver
     p_solver = PathSolver()
@@ -1558,6 +1621,8 @@ def optimize_boresight_pathsolver(
         p_solver : PathSolver
             PathSolver instance used to access _field_calculator
         """
+        nonlocal scene  # Allow updating the scene reference
+
         # CRITICAL: Enable gradients for each input parameter
         # The @dr.wrap decorator converts PyTorch 0-D tensors → DrJit Float scalars
         # We need to access .array to get the actual DrJit scalars
@@ -1596,10 +1661,6 @@ def optimize_boresight_pathsolver(
         yaw_rad_jittered = yaw_rad + yaw_jitter
         pitch_rad_jittered = pitch_rad + pitch_jitter
 
-        # Set antenna orientation directly using yaw, pitch, roll
-        tx = scene.get(tx_name)
-        tx.orientation = mi.Point3f(yaw_rad_jittered, pitch_rad_jittered, roll_rad)
-
         # Generate new sample points using Sobol sequence
         new_sample_points = sample_grid_points(
             map_config,
@@ -1614,18 +1675,36 @@ def optimize_boresight_pathsolver(
         # Store for visualization outside the loss function
         compute_loss.current_sample_points = new_sample_points
 
-        # Remove existing receivers from scene
-        for rx_name in rx_names:
-            scene.remove(rx_name)
+        # Get current scene configuration to preserve it across scene reload
+        scene_config = {
+            'frequency': scene.frequency,
+            'tx_array': scene.tx_array,
+            'rx_array': scene.rx_array,
+        }
 
-        # Add new receivers at sampled positions
+        # Get current transmitter configuration to preserve it across scene reload
+        tx = scene.get(tx_name)
+        tx_config = {
+            'name': tx_name,
+            'position': [float(tx.position[0][0]), float(tx.position[1][0]), float(tx.position[2][0])],
+            'orientation': mi.Point3f(yaw_rad_jittered, pitch_rad_jittered, roll_rad),
+            'power_dbm': float(tx.power_dbm[0]) if hasattr(tx, 'power_dbm') else 30.0,
+        }
+
+        # OPTIMIZATION: Reload scene with new receivers instead of remove/add loop
+        # This is much faster as it avoids repeated scene update/rebuild overhead
+        # The scene reload also recreates the transmitter with the jittered orientation
+        scene, new_rx_names = reload_scene_with_receivers(
+            scene_xml_path,
+            scene_config,
+            tx_config,
+            new_sample_points,
+            verbose=False,
+        )
+
+        # Update rx_names to track the new receivers
         rx_names.clear()
-        for idx, position in enumerate(new_sample_points):
-            rx_name = f"opt_rx_{idx}"
-            rx_names.append(rx_name)
-            position_f32 = [float(position[0]), float(position[1]), float(position[2])]
-            rx = Receiver(name=rx_name, position=position_f32)
-            scene.add(rx)
+        rx_names.extend(new_rx_names)
 
         # Run path solver with updated receivers and antenna orientation
         paths = p_solver(
