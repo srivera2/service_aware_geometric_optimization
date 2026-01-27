@@ -1474,16 +1474,16 @@ def optimize_boresight_pathsolver(
     if verbose:
         print(f"Actual sample points after building exclusion: {num_sample_points}")
 
-    # Visualize the receiver placement to ensure everything looks correct
-    fig = visualize_receiver_placement(
-        sample_points,
-        zone_mask,
-        map_config,
-        tx_position=tx_position,
-        scene_xml_path="../scene/scene.xml",
-        title="Receiver Sampling Visualization",
-        figsize=(14, 10),
-    )
+    ## Visualize the receiver placement to ensure everything looks correct
+    #fig = visualize_receiver_placement(
+    #    sample_points,
+    #    zone_mask,
+    #    map_config,
+    #    tx_position=tx_position,
+    #    scene_xml_path="../scene/scene.xml",
+    #    title="Receiver Sampling Visualization",
+    #    figsize=(14, 10),
+    #)
 
     # Display the visualization
     import matplotlib.pyplot as plt

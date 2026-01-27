@@ -548,3 +548,90 @@ def visualize_triangulation(
     plt.tight_layout()
 
     return fig
+
+def sample_triangulated_zone(tri_verts, num_samples, qrand, ground_z=0.0):
+    """
+    Unified function to sample a triangulated mesh using an LDS generator.
+    
+    Input:
+        tri_verts: Numpy array (N, 3, 2) from your triangulation function.
+        num_samples: Integer count of points to generate.
+        qrand: Your random number generator object (must have .random(n) method).
+        ground_z: Float z-height for the final points.
+        
+    Output:
+        sampled_points_3d: (num_samples, 3) array [x, y, z]
+    """
+    
+    # --- Step 1: Calculate Triangle Areas (The Weights) ---
+    # Extract vertices A, B, C for all triangles
+    A = tri_verts[:, 0, :]
+    B = tri_verts[:, 1, :]
+    C = tri_verts[:, 2, :]
+    
+    # Shoelace formula for area of a triangle: 0.5 * |x1(y2-y3) + x2(y3-y1) + x3(y1-y2)|
+    # This is fully vectorized for N triangles.
+    areas = 0.5 * np.abs(
+        A[:,0]*(B[:,1] - C[:,1]) + 
+        B[:,0]*(C[:,1] - A[:,1]) + 
+        C[:,0]*(A[:,1] - B[:,1])
+    )
+    
+    # Normalize to get probabilities summing to 1.0
+    total_area = np.sum(areas)
+    probabilities = areas / total_area
+    
+    # Create Cumulative Distribution Function (CDF)
+    cdf = np.cumsum(probabilities)
+    cdf[-1] = 1.0 # Fix floating point drift
+    
+    # --- Step 2: Generate LDS Sequence (The "Global" Source) ---
+    # We need 3 dimensions: 
+    # Dim 0: Triangle Selector
+    # Dim 1: Coordinate u
+    # Dim 2: Coordinate v
+    
+    # Assumption: qrand.random returns shape (N, D). 
+    # If your generator is 2D, you might need to call it twice or configure it for 3D.
+    # For this POC, we request num_samples points.
+    raw_samples = np.array(qrand.random(num_samples))
+    
+    # Handle dimension mismatch if qrand is only 2D (common in Sobol engines)
+    if raw_samples.shape[1] < 3:
+        # Generate extra columns if needed to get 3 dimensions
+        extra_needed = 3 - raw_samples.shape[1]
+        more_samples = np.array(qrand.random(num_samples))[:, :extra_needed]
+        raw_samples = np.hstack([raw_samples, more_samples])
+        
+    # Clip to avoid index out of bounds
+    raw_samples = np.clip(raw_samples, 0.0, 0.999999)
+    
+    u_select = raw_samples[:, 0]
+    u_bary_1 = raw_samples[:, 1]
+    u_bary_2 = raw_samples[:, 2]
+    
+    # --- Step 3: Select Triangles (Inverse Transform Sampling) ---
+    # "Which triangle corresponds to this probability?"
+    triangle_indices = np.searchsorted(cdf, u_select)
+    
+    # Get the specific A, B, C coordinates for each chosen sample
+    A_selected = A[triangle_indices]
+    B_selected = B[triangle_indices]
+    C_selected = C[triangle_indices]
+    
+    # --- Step 4: Map to Position (Turk's Formula) ---
+    # Map square (u_bary_1, u_bary_2) -> Triangle
+    sqrt_r1 = np.sqrt(u_bary_1)
+    
+    w_A = (1 - sqrt_r1)[:, None]
+    w_B = (sqrt_r1 * (1 - u_bary_2))[:, None]
+    w_C = (sqrt_r1 * u_bary_2)[:, None]
+    
+    # Calculate final 2D coordinates
+    points_2d = w_A * A_selected + w_B * B_selected + w_C * C_selected
+    
+    # --- Step 5: Add Z-Dimension ---
+    z_col = np.full((num_samples, 1), ground_z)
+    sampled_points_3d = np.hstack([points_2d, z_col])
+    
+    return sampled_points_3d.astype(np.float32)
