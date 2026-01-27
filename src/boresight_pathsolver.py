@@ -1691,22 +1691,13 @@ def optimize_boresight_pathsolver(
         valid_points = dr.maximum(dr.sum(mask_target), 1.0)
         epsilon = 1e-16
 
-        # "Mean of Logs"
+        # "Mean of Logs" (Geometric Mean)
         # Punishes shadows. Drives the "Median" and "10th Percentile" up.
+        # log is concave, so low values contribute more to the loss
         loss_coverage = dr.sum(dr.log(target_power + epsilon)) / valid_points
 
-        # "Log of Means"
-        # Attempts to improve the overall power in the reigon
-        total_watts = dr.sum(target_power)
-        loss_peak = dr.log((total_watts / valid_points) + epsilon)
-
-        # Greediness Factor
-        # Set to split the goal evenly
-        #alpha = 1.0
-        alpha = 0.0
-
-        # Alpha should be biased closed to 1.0 since there is a magnitude difference between the objectives
-        loss = -(alpha * loss_peak + (1.0 - alpha) * loss_coverage)
+        # Negate to maximize (optimizer minimizes)
+        loss = -loss_coverage
 
         return loss
 
