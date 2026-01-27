@@ -25,7 +25,7 @@ from angle_utils import (
     clamp_elevation,
 )
 import scipy
-
+import triangulate
 
 def create_optimization_gif(
     frame_dir,
