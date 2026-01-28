@@ -5,6 +5,7 @@ from shapely import contains_xy, constrained_delaunay_triangles
 from shapely.geometry import Point, Polygon, MultiPolygon
 from shapely.ops import triangulate, unary_union
 import triangle as tr
+import scipy.stats.qmc as qmc
 
 
 def get_zone_polygon_with_exclusions(
@@ -272,7 +273,7 @@ def triangulate_zone(target_zone, building_exclusions, buffer_distance=-0.01, ve
     # 'p': PSLG
     # 'q30': Quality mesh (min angle 30 deg) - prevents slivers!
     try:
-        result = tr.triangulate(data, 'pq30') 
+        result = tr.triangulate(data, 'pq') 
     except Exception as e:
         if verbose: print(f"Triangulation Error: {e}")
         return np.array([], dtype=np.float32)
@@ -283,7 +284,7 @@ def triangulate_zone(target_zone, building_exclusions, buffer_distance=-0.01, ve
     tri_indices = result['triangles']
     tri_verts = result['vertices'][tri_indices]
     
-    return tri_verts.astype(np.float32)
+    return tri_verts.astype(np.float32), clean_zone
 
 
 def diagnose_polygon_issues(target_zone, building_exclusions, verbose=True):
@@ -635,3 +636,117 @@ def sample_triangulated_zone(tri_verts, num_samples, qrand, ground_z=0.0):
     sampled_points_3d = np.hstack([points_2d, z_col])
     
     return sampled_points_3d.astype(np.float32)
+
+
+def calculate_discrepancy_score(points, zone_polygon, num_probes=1000):
+    """
+    Estimates discrepancy by placing random test circles inside the zone
+    and comparing Actual Count vs. Expected Count.
+    """
+    total_area = zone_polygon.area
+    total_points = len(points)
+    max_deviation = 0.0
+    
+    # Pre-calculate bounds for faster probe generation
+    minx, miny, maxx, maxy = zone_polygon.bounds
+    
+    # Convert points to Shapely for containment checks (slow but accurate)
+    # Optimized: Use simple boolean masking for speed if possible, 
+    # but Shapely is easiest for "Arbitrary Polygon" proof.
+    pts_as_shapely = [Point(p[0], p[1]) for p in points]
+    
+    for _ in range(num_probes):
+        # 1. Generate a random test circle strictly inside the polygon
+        #    (Rejection sample the probe itself!)
+        valid_probe = False
+        while not valid_probe:
+            cx = np.random.uniform(minx, maxx)
+            cy = np.random.uniform(miny, maxy)
+            # Random radius between 1% and 10% of zone width
+            r = np.random.uniform((maxx-minx)*0.01, (maxx-minx)*0.1)
+            probe = Point(cx, cy).buffer(r)
+            
+            if zone_polygon.contains(probe):
+                valid_probe = True
+        
+        # 2. Expected Ratio (Area)
+        expected_ratio = probe.area / total_area
+        
+        # 3. Actual Ratio (Count)
+        #    Count how many points fall inside this probe
+        count = sum(1 for p in pts_as_shapely if probe.contains(p))
+        actual_ratio = count / total_points
+        
+        # 4. Deviation
+        diff = abs(actual_ratio - expected_ratio)
+        if diff > max_deviation:
+            max_deviation = diff
+            
+    return max_deviation
+
+import time 
+
+# --- Comparison Runner ---
+def run_comparison(zone_poly, mesh, num_samples_list=[256, 1024, 4096, 8192]):
+    results_rejection = []
+    results_cdt = []
+    
+    print(f"{'N Samples':<10} | {'Rejection D':<12} | {'CDT D':<12} | {'Improvement'}")
+    print("-" * 50)
+    
+    for N in num_samples_list:
+        # --- 1. Rejection Sampler (Method A) ---
+        # Generate slightly more, filter, then truncate to N
+        # (Simulating the 'broken sequence')
+        eng_A = qmc.LatinHypercube(d=2, scramble=True)
+        # Bounding Box Logic
+        minx, miny, maxx, maxy = zone_poly.bounds
+        w, h = maxx-minx, maxy-miny
+        
+        # --- 1. Measure Rejection Sampler ---
+        t0 = time.perf_counter()
+
+        # Generate pool (Cost #1: Generating the numbers)
+        raw_A = eng_A.random(N * 5) 
+
+        pts_A = []
+        # Filter pool (Cost #2: Geometric checks)
+        for p in raw_A:
+            px, py = minx + p[0]*w, miny + p[1]*h
+            if zone_poly.contains(Point(px, py)):
+                pts_A.append([px, py])
+                if len(pts_A) == N: break
+
+        t_rejection = (time.perf_counter() - t0) * 1000 # Record time immediately
+
+        # --- 2. Measure CDT Sampler ---
+        t0 = time.perf_counter()
+
+        # Initialize Engine (Cost #1: Setup)
+        eng_B = qmc.LatinHypercube(d=3, scramble=True)
+
+        # Generate & Map (Cost #2: The Unified Function)
+        # This returns a fully computed Numpy array (Eager execution)
+        pts_B_3d = sample_triangulated_zone(mesh, N, eng_B, ground_z=0)
+
+        t_cdt = (time.perf_counter() - t0) * 1000 # Record time immediately
+
+        # --- Post-Processing (Outside the Timer) ---
+        # Slice to 2D for the discrepancy check
+        pts_B = pts_B_3d[:, :2]
+
+        print(f"N={N:<5} | Rej: {t_rejection:6.2f} ms | CDT: {t_cdt:6.2f} ms | Speedup: {t_rejection/t_cdt:.1f}x")
+        
+        # --- 3. Measure Discrepancy ---
+        d_A = calculate_discrepancy_score(pts_A, zone_poly)
+        d_B = calculate_discrepancy_score(pts_B, zone_poly) # Will be same as A in this mock
+        
+        print(f"{N:<10} | {d_A:.5f}      | {d_B:.5f}      | {(d_A/d_B - 1)*100:.1f}%")
+        
+        results_rejection.append(d_A)
+        results_cdt.append(d_B)
+
+    return num_samples_list, results_rejection, results_cdt
+
+# Usage:
+# Ns, res_A, res_B = run_comparison(my_shapely_polygon, my_mesh)
