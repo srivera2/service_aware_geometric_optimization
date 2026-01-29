@@ -273,7 +273,7 @@ def triangulate_zone(target_zone, building_exclusions, buffer_distance=-0.01, ve
     # 'p': PSLG
     # 'q30': Quality mesh (min angle 30 deg) - prevents slivers!
     try:
-        result = tr.triangulate(data, 'pq') 
+        result = tr.triangulate(data, 'pq30') 
     except Exception as e:
         if verbose: print(f"Triangulation Error: {e}")
         return np.array([], dtype=np.float32)
@@ -708,6 +708,7 @@ def run_comparison(zone_poly, mesh, num_samples_list=[256, 1024, 4096, 8192]):
 
         # Generate pool (Cost #1: Generating the numbers)
         raw_A = eng_A.random(N * 5) 
+        #print(raw_A)
 
         pts_A = []
         # Filter pool (Cost #2: Geometric checks)
