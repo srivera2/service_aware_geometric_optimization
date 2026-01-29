@@ -26,6 +26,7 @@ from angle_utils import (
 )
 import scipy
 import triangulate
+from triangulate import sample_triangulated_zone, get_zone_polygon_with_exclusions, triangulate_zone
 
 def create_optimization_gif(
     frame_dir,
@@ -1355,6 +1356,7 @@ def optimize_boresight_pathsolver(
     scene_xml_path,
     zone_mask=None,
     zone_stats=None,
+    zone_params=None,
     num_sample_points=100,
     building_id=10,
     learning_rate=1.0,
@@ -1447,75 +1449,49 @@ def optimize_boresight_pathsolver(
         )
 
     # Select LDS from available list
+    # Changing the dimension to 3 to support CDT + Turk's
     if lds == "Sobol":
-        qrand = scipy.stats.qmc.Sobol(d=2, scramble=True, seed=None)
+        qrand = scipy.stats.qmc.Sobol(d=3, scramble=True, seed=None)
     elif lds == "Halton":
-        qrand = scipy.stats.qmc.Halton(d=2, scramble=True, seed=None)
+        qrand = scipy.stats.qmc.Halton(d=3, scramble=True, seed=None)
     elif lds == "Latin":
-        qrand = scipy.stats.qmc.LatinHypercube(d=2, scramble=True, seed=None)
+        qrand = scipy.stats.qmc.LatinHypercube(d=3, scramble=True, seed=None)
     elif lds == "Uniform":
         qrand = None
     else:
         print("This LDS is not supported. Using Sobol as default")
-        qrand = scipy.stats.qmc.Sobol(d=2, scramble=True, seed=None)
+        qrand = scipy.stats.qmc.Sobol(d=3, scramble=True, seed=None)
 
     # Sample Grid Points using Quasi-Monte Carlo (Sobol sequence)
-    sample_points = sample_grid_points(
-        map_config,
-        scene_xml_path=scene_xml_path,
-        exclude_buildings=True,
-        zone_mask=zone_mask,
-        zone_stats=zone_stats,
-        qrand=qrand,
-        num_points=num_sample_points
+    #sample_points = sample_grid_points(
+    #    map_config,
+    #    scene_xml_path=scene_xml_path,
+    #    exclude_buildings=True,
+    #    zone_mask=zone_mask,
+    #    zone_stats=zone_stats,
+    #    qrand=qrand,
+    #    num_points=num_sample_points
+    #)
+
+    # Solve for polygon zone and remove building exclusions.
+    target_zone, building_exclusions, _ = get_zone_polygon_with_exclusions(
+    zone_type='polygon',
+    zone_params=zone_params,
+    scene_xml_path=scene_xml_path,
+    exclude_buildings=True
+    )
+
+    # Triangulate using CDT (only need to do this once)
+    triangles, _ = triangulate_zone(
+        target_zone, 
+        building_exclusions,
+        buffer_distance=-.01,
+        verbose=True
     )
 
     # Print to see the number of sample points after sampling
     if verbose:
         print(f"Actual sample points after building exclusion: {num_sample_points}")
-
-    ## Visualize the receiver placement to ensure everything looks correct
-    #fig = visualize_receiver_placement(
-    #    sample_points,
-    #    zone_mask,
-    #    map_config,
-    #    tx_position=tx_position,
-    #    scene_xml_path="../scene/scene.xml",
-    #    title="Receiver Sampling Visualization",
-    #    figsize=(14, 10),
-    #)
-
-    # Display the visualization
-    import matplotlib.pyplot as plt
-    plt.show()
-
-    # Extract zone mask values at sampled points
-    width_m, height_m = map_config["size"]
-    cell_w, cell_h = map_config["cell_size"]
-    n_x = int(width_m / cell_w)
-    n_y = int(height_m / cell_h)
-    center_x, center_y, _ = map_config["center"]
-
-    # Map sample points to grid indices to get mask values (1.0 = in zone, 0.0 = out of zone)
-    mask_values = []
-    for point in sample_points:
-        x, y = point[0], point[1]
-        # Convert to grid indices
-        i = int((x - (center_x - width_m / 2)) / cell_w)
-        j = int((y - (center_y - height_m / 2)) / cell_h)
-        i = np.clip(i, 0, n_x - 1)
-        j = np.clip(j, 0, n_y - 1)
-        mask_values.append(zone_mask[j, i])
-
-    mask_values = np.array(mask_values, dtype=np.float32)
-    num_in_zone = int(np.sum(mask_values))
-    num_out_zone = len(mask_values) - num_in_zone
-
-    if verbose:
-        print(f"Sample points: {num_in_zone} inside zone, {num_out_zone} outside zone")
-        print(
-            f"Zone coverage: {100.0 * num_in_zone / len(mask_values):.1f}% of samples"
-        )
 
     # CRITICAL: Remove ALL existing receivers from the scene first
     # This ensures paths.a indexing matches our optimization receivers exactly
@@ -1529,17 +1505,13 @@ def optimize_boresight_pathsolver(
 
     # Add receivers to scene
     rx_names = []
-    for idx, position in enumerate(sample_points):
-        rx_name = f"opt_rx_{idx}"
-        rx_names.append(rx_name)
-        # Convert to float32 to avoid type errors with Mitsuba
-        position_f32 = [float(position[0]), float(position[1]), float(position[2])]
-        rx = Receiver(name=rx_name, position=position_f32)
-        scene.add(rx)
 
     # Create PathSolver
     p_solver = PathSolver()
     p_solver.loop_mode = "evaluated"  # Required for gradient computation
+
+    # Storage for sample points (accessible from outside the wrapped function)
+    sample_points_storage = {}
 
     # Define differentiable loss function using @dr.wrap
     @dr.wrap(source="torch", target="drjit")
@@ -1601,18 +1573,10 @@ def optimize_boresight_pathsolver(
         tx.orientation = mi.Point3f(yaw_rad_jittered, pitch_rad_jittered, roll_rad)
 
         # Generate new sample points using Sobol sequence
-        new_sample_points = sample_grid_points(
-            map_config,
-            scene_xml_path=scene_xml_path,
-            exclude_buildings=True,
-            zone_mask=zone_mask,
-            zone_stats=zone_stats,
-            qrand=qrand_op,
-            num_points=num_sample_points
-        )
+        new_sample_points = sample_triangulated_zone(tri_verts=triangles, num_samples=num_sample_points, qrand=qrand_op, ground_z=0.0)
 
         # Store for visualization outside the loss function
-        compute_loss.current_sample_points = new_sample_points
+        sample_points_storage['current'] = new_sample_points
 
         # Remove existing receivers from scene
         for rx_name in rx_names:
@@ -1641,22 +1605,6 @@ def optimize_boresight_pathsolver(
         # Extract channel coefficients
         h_real, h_imag = paths.a
 
-        # GRADIENT DIAGNOSTICS: Check if gradients are tracking through the pipeline
-        if verbose and not hasattr(compute_loss, "_gradient_check_printed"):
-            compute_loss._gradient_check_printed = True
-            print(
-                f"  [GRADIENT CHECK] yaw_rad grad enabled: {dr.grad_enabled(yaw_rad)}"
-            )
-            print(
-                f"  [GRADIENT CHECK] pitch_rad grad enabled: {dr.grad_enabled(pitch_rad)}"
-            )
-            print(
-                f"  [GRADIENT CHECK] elevation_deg grad enabled: {dr.grad_enabled(elevation_deg.array)}"
-            )
-            print(f"  [GRADIENT CHECK] h_real grad enabled: {dr.grad_enabled(h_real)}")
-            print(f"  [GRADIENT CHECK] h_imag grad enabled: {dr.grad_enabled(h_imag)}")
-            print(f"  [DIAGNOSTIC] h_real shape: {dr.shape(h_real)}")
-
         # DEBUG: Check if any paths were found (only print on first call)
         # We use a simple flag via a mutable default to track first call
         if not hasattr(compute_loss, "_first_call_done"):
@@ -1680,21 +1628,12 @@ def optimize_boresight_pathsolver(
             dr.sum(cpx_abs_square((h_real, h_imag)), axis=-1), axis=-1
         )
         power_relative = dr.sum(power_relative, axis=-1)
-
-        # Apply mask to solve for average
-        mask_target = dr.auto.ad.Float(mask_values)
-        dr.disable_grad(mask_target)
-        valid_points = dr.maximum(dr.sum(mask_target), 1.0)
-
-        # Isolate power in the target zone
-        target_power = power_relative * mask_target
-        valid_points = dr.maximum(dr.sum(mask_target), 1.0)
         epsilon = 1e-16
 
         # "Mean of Logs" (Geometric Mean)
         # Punishes shadows. Drives the "Median" and "10th Percentile" up.
         # log is concave, so low values contribute more to the loss
-        loss_coverage = dr.sum(dr.log(target_power + epsilon)) / valid_points
+        loss_coverage = dr.sum(dr.log(power_relative + epsilon)) / num_sample_points
 
         # Negate to maximize (optimizer minimizes)
         loss = -loss_coverage
@@ -1789,24 +1728,23 @@ def optimize_boresight_pathsolver(
 
         # Visualize the Sobol sampling pattern (only save every N iterations to reduce file count)
         if save_radiomap_frames and (iteration % frame_save_interval == 0):
-            current_points = getattr(
-                compute_loss, "current_sample_points", sample_points
-            )
-            fig = visualize_receiver_placement(
-                current_points,
-                zone_mask,
-                map_config,
-                tx_position=tx_position,
-                scene_xml_path=scene_xml_path,
-                title=f"LDS - Iteration {iteration}",
-                figsize=(14, 10),
-            )
-            plt.savefig(
-                f"{output_dir}/sampling_iteration_{iteration:04d}.png",
-                dpi=100,
-                bbox_inches="tight",
-            )
-            plt.close(fig)
+            current_points = sample_points_storage.get('current', None)
+            if current_points is not None:
+                fig = visualize_receiver_placement(
+                    current_points,
+                    zone_mask,
+                    map_config,
+                    tx_position=tx_position,
+                    scene_xml_path=scene_xml_path,
+                    title=f"LDS - Iteration {iteration}",
+                    figsize=(14, 10),
+                )
+                plt.savefig(
+                    f"{output_dir}/sampling_iteration_{iteration:04d}.png",
+                    dpi=100,
+                    bbox_inches="tight",
+                )
+                plt.close(fig)
 
         # Track gradient norm for diagnostics
         grad_azimuth_val = azimuth.grad.item() if azimuth.grad is not None else 0.0
@@ -1882,9 +1820,6 @@ def optimize_boresight_pathsolver(
 
     # Compute final coverage statistics
     coverage_stats = {
-        "num_samples_in_zone": num_in_zone,
-        "num_samples_total": len(mask_values),
-        "zone_coverage_fraction": num_in_zone / len(mask_values),
         "loss_type": loss_type,
         "best_azimuth_deg": best_azimuth_final,
         "best_elevation_deg": best_elevation_final,
@@ -1897,9 +1832,6 @@ def optimize_boresight_pathsolver(
         print(f"{'='*70}")
         print(
             f"Best angles: Azimuth={best_azimuth_final:.1f}°, Elevation={best_elevation_final:.1f}°"
-        )
-        print(
-            f"Zone samples: {num_in_zone}/{len(mask_values)} ({100.0*num_in_zone/len(mask_values):.1f}%)"
         )
         print(f"Total time: {elapsed_time:.1f}s")
         print(f"Time per iteration: {elapsed_time/num_iterations:.2f}s")
