@@ -1515,7 +1515,7 @@ def optimize_boresight_pathsolver(
 
     # Define differentiable loss function using @dr.wrap
     @dr.wrap(source="torch", target="drjit")
-    def compute_loss(azimuth_deg, elevation_deg, qrand_op, num_sample_points):
+    def compute_loss(azimuth_deg, elevation_deg, qrand_op, num_sample_points, sample_type='CDT'):
         """
         Compute loss with AD enabled through field_calculator only
 
@@ -1572,8 +1572,21 @@ def optimize_boresight_pathsolver(
         tx = scene.get(tx_name)
         tx.orientation = mi.Point3f(yaw_rad_jittered, pitch_rad_jittered, roll_rad)
 
-        # Generate new sample points using Sobol sequence
-        new_sample_points = sample_triangulated_zone(tri_verts=triangles, num_samples=num_sample_points, qrand=qrand_op, ground_z=0.0)
+        if sample_type is "CDT":
+            # Generate new sample points using Sobol sequence
+            new_sample_points = sample_triangulated_zone(tri_verts=triangles, num_samples=num_sample_points, qrand=qrand_op, ground_z=0.0)
+        
+        else:
+            # Sample Grid Points using Quasi-Monte Carlo (Sobol sequence)
+            new_sample_points = sample_grid_points(
+                map_config,
+                scene_xml_path=scene_xml_path,
+                exclude_buildings=True,
+                zone_mask=zone_mask,
+                zone_stats=zone_stats,
+                qrand=qrand,
+                num_points=num_sample_points
+            )
 
         # Store for visualization outside the loss function
         sample_points_storage['current'] = new_sample_points
@@ -1646,8 +1659,9 @@ def optimize_boresight_pathsolver(
         zone_stats["look_at_xyz"],
         verbose=False,
     )
-    print(f"initial azimuth (after function): {initial_azimuth}")
-    print(f"initial elevation (after function): {initial_elevation}")
+
+    # Save the initial angles for analysis with multiple scenarios
+    initial_angles = [initial_azimuth, initial_elevation]
 
     # PyTorch parameters: azimuth and elevation angles (in degrees)
     # Using 0-D tensors (scalars) - this is the ONLY pattern that works with @dr.wrap
@@ -1722,7 +1736,7 @@ def optimize_boresight_pathsolver(
         # Using an independent (random) set of Sobol points using different seeds
         # qrand_run = torch.quasirandom.SobolEngine(dimension=2, scramble=True, seed=iteration)
         # Could build in different sampling sequences for customizable performance
-        loss = compute_loss(azimuth, elevation, qrand, num_sample_points)
+        loss = compute_loss(azimuth, elevation, qrand, num_sample_points, 'Rejection')
         optimizer.zero_grad()
         loss.backward()
 
@@ -1839,4 +1853,4 @@ def optimize_boresight_pathsolver(
 
     # Return angles instead of Cartesian coordinates
     best_angles = [best_azimuth_final, best_elevation_final]
-    return best_angles, loss_history, angle_history, gradient_history, coverage_stats
+    return best_angles, loss_history, angle_history, gradient_history, coverage_stats, initial_angles
