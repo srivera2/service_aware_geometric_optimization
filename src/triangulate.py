@@ -221,7 +221,7 @@ def triangulate_zone(target_zone, building_exclusions, buffer_distance=-0.01, ve
     # Handle empty result (e.g., building covers entire zone)
     if clean_zone.is_empty:
         if verbose: print("Zone is completely covered by buildings.")
-        return np.array([], dtype=np.float32)
+        return np.array([], dtype=np.float32), None
 
     # --- 2. Convert Shapely -> Triangle Format ---
     # clean_zone could be a Polygon or MultiPolygon (if a building splits the zone)
@@ -273,13 +273,13 @@ def triangulate_zone(target_zone, building_exclusions, buffer_distance=-0.01, ve
     # 'p': PSLG
     # 'q30': Quality mesh (min angle 30 deg) - prevents slivers!
     try:
-        result = tr.triangulate(data, 'pq30') 
+        result = tr.triangulate(data, 'pq30')
     except Exception as e:
         if verbose: print(f"Triangulation Error: {e}")
-        return np.array([], dtype=np.float32)
+        return np.array([], dtype=np.float32), None
 
     if 'triangles' not in result:
-        return np.array([], dtype=np.float32)
+        return np.array([], dtype=np.float32), None
         
     tri_indices = result['triangles']
     tri_verts = result['vertices'][tri_indices]
