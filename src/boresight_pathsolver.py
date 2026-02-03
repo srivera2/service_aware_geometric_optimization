@@ -1756,12 +1756,11 @@ def optimize_boresight_pathsolver(
         
         else:
             # Sum Log(Power) -> Penalizes low values
-            dead_threshold = 1e-18 
-            valid_mask = power_relative > dead_threshold
-            safe_power = dr.select(valid_mask, power_relative, 1.0)
-            log_utility = dr.sum(dr.log(safe_power + 1e-20))
-            count = dr.sum(dr.select(valid_mask, 1.0, 0.0))
-            avg_utility = log_utility / (count + 1e-5)
+            #dead_threshold = 1e-18 
+            #valid_mask = power_relative > dead_threshold
+            log_utility = dr.sum(dr.log(power_relative + 1e-20))
+            #count = dr.sum(dr.select(valid_mask, 1.0, 0.0))
+            avg_utility = log_utility / (num_sample_points + 1e-5)
             loss = -avg_utility
 
         return loss
