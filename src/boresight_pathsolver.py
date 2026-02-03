@@ -585,6 +585,8 @@ def sample_grid_points(
     qrand=None,
     # Making the number of points configurable from now on
     num_points=20,
+    # Pre-loaded building polygons to avoid re-parsing XML every call
+    cached_building_polygons=None,
 ):
 
     width_m, height_m = map_config["size"]
@@ -595,8 +597,46 @@ def sample_grid_points(
 
     center_x, center_y, ground_z = map_config["center"]
     
-    from shapely.geometry import Polygon
+    from shapely.geometry import Polygon, Point
     from shapely import contains_xy
+    from shapely.prepared import prep
+
+    # Use cached building polygons if provided, otherwise load them
+    # This avoids re-parsing the XML file on every call
+    if cached_building_polygons is not None:
+        building_polygons = cached_building_polygons
+    elif exclude_buildings and scene_xml_path is not None:
+        # Load building polygons (expensive - should be cached by caller for repeated calls)
+        from scene_parser import extract_building_info
+        building_polygons = []
+        building_info = extract_building_info(scene_xml_path, verbose=False)
+        for building_id, info in building_info.items():
+            vertices_3d = info["vertices"]
+            vertices_2d = [(v[0], v[1]) for v in vertices_3d]
+            try:
+                building_polygon = Polygon(vertices_2d)
+                if building_polygon.is_valid:
+                    building_polygons.append(building_polygon)
+            except:
+                pass
+    else:
+        building_polygons = []
+
+    # Helper function to filter out points inside buildings (VECTORIZED)
+    def filter_buildings(points_2d):
+        """Filter out points inside any building. Returns boolean mask of valid points."""
+        if not building_polygons or len(points_2d) == 0:
+            return np.ones(len(points_2d), dtype=bool)
+
+        # Use vectorized contains_xy - MUCH faster than Point-by-Point checks
+        valid_mask = np.ones(len(points_2d), dtype=bool)
+        x_coords = points_2d[:, 0]
+        y_coords = points_2d[:, 1]
+        for building_poly in building_polygons:
+            # contains_xy checks all points against polygon at once (no Point objects)
+            inside_building = contains_xy(building_poly, x_coords, y_coords)
+            valid_mask &= ~inside_building
+        return valid_mask
 
     # Quasi-random sampling in continuous space within the zone
     if zone_stats is not None and qrand is not None:
@@ -607,50 +647,101 @@ def sample_grid_points(
 
         # Check if this is a polygon zone (has vertices)
         if "vertices" in zone_params:
-            # Polygon sampling with rejection method
+            # Polygon + building rejection sampling - guarantees exactly num_points
             zone_polygon = Polygon(zone_params["vertices"])
-
-            # Oversample to account for rejection (2x should be enough for most polygons)
-            oversample_factor = 2
-            samples_needed = num_points
-            sampled_points_list = []
-
-            while len(sampled_points_list) < num_points:
-                # Draw from bounding box
-                unit_points = np.array(qrand.random(samples_needed))
-                unit_points = np.clip(unit_points, 0.0, 1.0)
-
-                # Scale to bounding box
-                min_bound_x = zone_center[0] - zone_width / 2
-                min_bound_y = zone_center[1] - zone_height / 2
-                scaled_x = min_bound_x + unit_points[:, 0] * zone_width
-                scaled_y = min_bound_y + unit_points[:, 1] * zone_height
-
-                # Keep only points inside polygon
-                inside_mask = contains_xy(zone_polygon, scaled_x, scaled_y)
-                valid_points = np.column_stack([scaled_x[inside_mask], scaled_y[inside_mask]])
-                sampled_points_list.append(valid_points)
-
-                # Update how many more we need
-                samples_needed = num_points - sum(len(pts) for pts in sampled_points_list)
-
-            # Combine and trim to exact count
-            sampled_points = np.vstack(sampled_points_list)[:num_points]
-        else:
-            # Box sampling (original logic)
-            unit_points = np.array(qrand.random(num_points))
-            unit_points = np.clip(unit_points, 0.0, 1.0)
-
             min_bound_x = zone_center[0] - zone_width / 2
             min_bound_y = zone_center[1] - zone_height / 2
 
-            scaled_x = unit_points[:, 0] * zone_width
-            scaled_y = unit_points[:, 1] * zone_height
+            sampled_points_list = []
+            max_iterations = 100  # Safety limit to prevent infinite loops
+            iteration = 0
 
-            trans_x = min_bound_x + scaled_x
-            trans_y = min_bound_y + scaled_y
+            while len(sampled_points_list) < num_points and iteration < max_iterations:
+                iteration += 1
+                samples_needed = num_points - len(sampled_points_list)
 
-            sampled_points = np.column_stack([trans_x, trans_y])
+                # Oversample to account for both polygon and building rejection
+                # Start with 2x, increase if we're not getting enough valid points
+                oversample_factor = max(2, int(np.ceil(samples_needed / max(1, len(sampled_points_list) / max(1, iteration)))))
+                batch_size = min(samples_needed * oversample_factor, 10000)  # Cap batch size
+
+                # Draw from bounding box using quasi-random sequence
+                unit_points = np.array(qrand.random(batch_size))
+                unit_points = np.clip(unit_points, 0.0, 1.0)
+
+                # Scale to bounding box
+                scaled_x = min_bound_x + unit_points[:, 0] * zone_width
+                scaled_y = min_bound_y + unit_points[:, 1] * zone_height
+                candidate_points = np.column_stack([scaled_x, scaled_y])
+
+                # Stage 1: Keep only points inside polygon
+                inside_polygon = contains_xy(zone_polygon, candidate_points[:, 0], candidate_points[:, 1])
+                polygon_valid_points = candidate_points[inside_polygon]
+
+                if len(polygon_valid_points) == 0:
+                    continue
+
+                # Stage 2: Filter out points inside buildings
+                if building_polygons:
+                    building_valid_mask = filter_buildings(polygon_valid_points)
+                    valid_points = polygon_valid_points[building_valid_mask]
+                else:
+                    valid_points = polygon_valid_points
+
+                # Add valid points (up to what we need)
+                points_to_add = min(len(valid_points), num_points - len(sampled_points_list))
+                if points_to_add > 0:
+                    sampled_points_list.extend(valid_points[:points_to_add].tolist())
+
+            if len(sampled_points_list) < num_points:
+                raise ValueError(
+                    f"Could not sample {num_points} points after {max_iterations} iterations. "
+                    f"Only found {len(sampled_points_list)} valid points. "
+                    "Zone may be too small or mostly covered by buildings."
+                )
+
+            sampled_points = np.array(sampled_points_list)
+
+        else:
+            # Box + building rejection sampling - guarantees exactly num_points
+            min_bound_x = zone_center[0] - zone_width / 2
+            min_bound_y = zone_center[1] - zone_height / 2
+
+            sampled_points_list = []
+            max_iterations = 100
+            iteration = 0
+
+            while len(sampled_points_list) < num_points and iteration < max_iterations:
+                iteration += 1
+                samples_needed = num_points - len(sampled_points_list)
+                oversample_factor = max(2, iteration)  # Increase oversampling if struggling
+                batch_size = min(samples_needed * oversample_factor, 10000)
+
+                unit_points = np.array(qrand.random(batch_size))
+                unit_points = np.clip(unit_points, 0.0, 1.0)
+
+                scaled_x = min_bound_x + unit_points[:, 0] * zone_width
+                scaled_y = min_bound_y + unit_points[:, 1] * zone_height
+                candidate_points = np.column_stack([scaled_x, scaled_y])
+
+                # Filter out points inside buildings
+                if building_polygons:
+                    building_valid_mask = filter_buildings(candidate_points)
+                    valid_points = candidate_points[building_valid_mask]
+                else:
+                    valid_points = candidate_points
+
+                points_to_add = min(len(valid_points), num_points - len(sampled_points_list))
+                if points_to_add > 0:
+                    sampled_points_list.extend(valid_points[:points_to_add].tolist())
+
+            if len(sampled_points_list) < num_points:
+                raise ValueError(
+                    f"Could not sample {num_points} points after {max_iterations} iterations. "
+                    f"Only found {len(sampled_points_list)} valid points."
+                )
+
+            sampled_points = np.array(sampled_points_list)
 
     # Uniform grid sampling: sample entire grid then filter by mask
     else:
@@ -672,54 +763,23 @@ def sample_grid_points(
 
         # Filter by zone mask
         if zone_mask is None:
-            sampled_points = all_points
+            candidate_points = all_points
         else:
             mask_flat = zone_mask.flatten()
-            sampled_points = all_points[mask_flat == 1.0]
+            candidate_points = all_points[mask_flat == 1.0]
 
-    # Filter out building locations if requested
-    if exclude_buildings and scene_xml_path is not None:
-        from scene_parser import extract_building_info
-        from shapely.geometry import Polygon, Point
-
-        # Get building information
-        building_info = extract_building_info(scene_xml_path, verbose=False)
-
-        # Create list of building polygons
-        building_polygons = []
-        for building_id, info in building_info.items():
-            vertices_3d = info["vertices"]
-            vertices_2d = [(v[0], v[1]) for v in vertices_3d]
-            try:
-                building_polygon = Polygon(vertices_2d)
-                if building_polygon.is_valid:
-                    building_polygons.append(building_polygon)
-            except:
-                pass
-
-        # Filter out points inside buildings
+        # Filter out building locations
         if building_polygons:
-            filtered_points = []
-            num_excluded = 0
-            for point_2d in sampled_points:
-                point = Point(point_2d[0], point_2d[1])
-                # Check if point is inside any building
-                inside_building = False
-                for poly in building_polygons:
-                    if poly.contains(point):
-                        inside_building = True
-                        num_excluded += 1
-                        break
-                if not inside_building:
-                    filtered_points.append(point_2d)
+            building_valid_mask = filter_buildings(candidate_points)
+            sampled_points = candidate_points[building_valid_mask]
 
-            if len(filtered_points) == 0:
+            if len(sampled_points) == 0:
                 raise ValueError(
-                    f"All {len(sampled_points)} sampled points are inside buildings! "
-                    "Try increasing num_samples or adjusting the zone mask."
+                    f"All {len(candidate_points)} grid points are inside buildings! "
+                    "Try adjusting the zone mask or cell size."
                 )
-
-            sampled_points = np.array(filtered_points)
+        else:
+            sampled_points = candidate_points
 
     # Add z-coordinate
     z_coords = np.full((len(sampled_points), 1), ground_z)
@@ -1482,11 +1542,25 @@ def optimize_boresight_pathsolver(
 
     # Triangulate using CDT (only need to do this once)
     triangles, _ = triangulate_zone(
-        target_zone, 
+        target_zone,
         building_exclusions,
         buffer_distance=-.01,
         verbose=True
     )
+
+    # PRE-CACHE building polygons for rejection sampling (avoids re-parsing XML every iteration)
+    # Convert building_exclusions (list of coordinate lists) to Shapely Polygons once
+    cached_building_polygons = []
+    for building_coords in building_exclusions:
+        try:
+            from shapely.geometry import Polygon as ShapelyPolygon
+            building_poly = ShapelyPolygon(building_coords)
+            if building_poly.is_valid:
+                cached_building_polygons.append(building_poly)
+        except:
+            pass
+    if verbose:
+        print(f"Cached {len(cached_building_polygons)} building polygons for rejection sampling")
 
     # Print to see the number of sample points after sampling
     if verbose:
@@ -1502,8 +1576,21 @@ def optimize_boresight_pathsolver(
     for rx_name in existing_receivers:
         scene.remove(rx_name)
 
-    # Add receivers to scene
+    # PRE-CREATE all receivers ONCE (outside the optimization loop)
+    # This avoids the expensive remove/add cycle on every iteration
+    rx_objects = {}  # Maps rx_name -> Receiver object for position updates
     rx_names = []
+    if verbose:
+        print(f"Pre-creating {num_sample_points} receivers...")
+    for idx in range(num_sample_points):
+        rx_name = f"opt_rx_{idx}"
+        rx_names.append(rx_name)
+        # Initialize at origin - positions will be updated in compute_loss
+        rx = Receiver(name=rx_name, position=[0.0, 0.0, 0.0])
+        scene.add(rx)
+        rx_objects[rx_name] = rx
+    if verbose:
+        print(f"  Created {len(rx_objects)} receivers (will reposition each iteration)")
 
     # Create PathSolver
     p_solver = PathSolver()
@@ -1584,24 +1671,20 @@ def optimize_boresight_pathsolver(
                 zone_mask=zone_mask,
                 zone_stats=zone_stats,
                 qrand=qrand_op,
-                num_points=num_sample_points
+                num_points=num_sample_points,
+                cached_building_polygons=cached_building_polygons,  # Use pre-cached polygons
             )
 
         # Store for visualization outside the loss function
         sample_points_storage['current'] = new_sample_points
 
-        # Remove existing receivers from scene
-        for rx_name in rx_names:
-            scene.remove(rx_name)
-
-        # Add new receivers at sampled positions
-        rx_names.clear()
+        # REPOSITION existing receivers (much faster than remove/add)
+        # Receivers were pre-created before the optimization loop
         for idx, position in enumerate(new_sample_points):
             rx_name = f"opt_rx_{idx}"
-            rx_names.append(rx_name)
-            position_f32 = [float(position[0]), float(position[1]), float(position[2])]
-            rx = Receiver(name=rx_name, position=position_f32)
-            scene.add(rx)
+            rx_objects[rx_name].position = mi.Point3f(
+                float(position[0]), float(position[1]), float(position[2])
+            )
 
         # Run path solver with updated receivers and antenna orientation
         paths = p_solver(
