@@ -24,6 +24,27 @@ import traceback
 import numpy as np
 
 
+def _serialize_value(v):
+    """Convert a value to a JSON-serializable type."""
+    if isinstance(v, (list, tuple)):
+        return [_serialize_value(x) for x in v]
+    elif isinstance(v, np.ndarray):
+        return v.tolist()
+    elif isinstance(v, (np.floating, np.integer)):
+        return float(v)
+    elif isinstance(v, dict):
+        return _serialize_dict(v)
+    elif isinstance(v, (int, float, str, bool, type(None))):
+        return v
+    else:
+        return str(v)
+
+
+def _serialize_dict(d):
+    """Convert a dict to JSON-serializable format."""
+    return {k: _serialize_value(v) for k, v in d.items()}
+
+
 def process_single_scene(args):
     """
     Process a single scene on a specific GPU.
@@ -226,7 +247,7 @@ def process_single_scene(args):
             'tx_position': gnb_position,
             'zone_center': [float(zone_center_x), float(zone_center_y)],
             'zone_attempts': attempts,
-            'validation_stats': {k: float(v) for k, v in validation_stats.items()},
+            'validation_stats': _serialize_dict(validation_stats),
             'zone_power_initial': zone_power_initial.tolist(),
             'zone_power_optimized': zone_power_optimized.tolist(),
             'elapsed_time': elapsed_time,

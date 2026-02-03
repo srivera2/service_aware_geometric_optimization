@@ -1739,8 +1739,8 @@ def optimize_boresight_pathsolver(
 
         if type == "LSE":
             # LSE (Soft Min)
-            dead_zone_threshold = 1e-20
-            valid_mask = power_relative >= dead_zone_threshold
+            dead_zone_threshold = 1e-30
+            valid_mask = power_relative > dead_zone_threshold
             alpha = 5.0 
             epsilon = 1e-30
             log_P = dr.log(power_relative + epsilon)
@@ -1756,11 +1756,14 @@ def optimize_boresight_pathsolver(
         
         else:
             # Sum Log(Power) -> Penalizes low values
-            #dead_threshold = 1e-18 
-            #valid_mask = power_relative > dead_threshold
-            log_utility = dr.sum(dr.log(power_relative + 1e-20))
-            #count = dr.sum(dr.select(valid_mask, 1.0, 0.0))
-            avg_utility = log_utility / (num_sample_points + 1e-5)
+            dead_zone_threshold = 1e-30
+            valid_mask = power_relative > dead_zone_threshold
+            epsilon = 1e-30
+            log_P = dr.log(power_relative + epsilon)
+            masked_log_P = dr.select(valid_mask, log_P, 0.0)
+            log_utility = dr.sum(masked_log_P)
+            count = dr.sum(dr.select(valid_mask, 1.0, 0.0))
+            avg_utility = log_utility / (count + 1e-5)
             loss = -avg_utility
 
         return loss

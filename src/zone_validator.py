@@ -21,6 +21,7 @@ def validate_zone_coverage(
     p10_max_dbm=-80.0,
     p90_min_dbm=-130.0,
     min_percentile_range_db=15.0,
+    median_max_dbm=-80.0,
     verbose=True
 ):
     """
@@ -170,6 +171,12 @@ def validate_zone_coverage(
         failed_checks.append('insufficient_range')
         if rejection_reason is None:
             rejection_reason = f"Percentile range too small: {percentile_range_db:.1f} dB < {min_percentile_range_db:.1f} dB threshold"
+
+    if median_max_dbm < median_power_dbm:
+        is_valid = False
+        failed_checks.append('median is too high')
+        if rejection_reason is None:
+            rejection_reason = f"Median is greater than {median_max_dbm} dBm"
 
     # Prepare validation stats
     validation_stats = {
