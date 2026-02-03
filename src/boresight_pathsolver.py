@@ -1036,11 +1036,8 @@ def compare_boresight_performance(
         # Extract power values in zone only
         zone_power = rss_watts[zone_mask == 1.0]
 
-        # Filter out dead zones (values below -200 dBm are likely numerical artifacts)
-        # Dead zones occur when PathSolver finds no propagation paths
-        # DEAD_ZONE_THRESHOLD = -200.0  # dBm
-        DEAD_ZONE_THRESHOLD = 0  # 0 watts
-        live_zone_power = zone_power[zone_power > DEAD_ZONE_THRESHOLD]
+        # Penalizing dead zones as a saturated value
+        live_zone_power = zone_power
 
         # Compute statistics on live points only (exclude dead zones)
         # This gives more meaningful metrics for coverage quality
@@ -1090,38 +1087,37 @@ def compare_boresight_performance(
     # Create comparison plots
     fig, axes = plt.subplots(2, 2, figsize=(16, 12))
 
-    # Determine data range for better visualization
-    all_power = np.concatenate(
+    # Helper function to convert Watts to dBm
+    def watts_to_dbm(watts):
+        return 10.0 * np.log10(watts + 1e-30) + 30.0
+
+    # Convert all power values to dBm for better visualization
+    all_power_watts = np.concatenate(
         [
             results["Naive Baseline"]["power_values"],
             results["Optimized"]["power_values"],
         ]
     )
+    all_power_dbm = watts_to_dbm(all_power_watts)
+    naive_power_dbm = watts_to_dbm(results["Naive Baseline"]["power_values"])
+    optimized_power_dbm = watts_to_dbm(results["Optimized"]["power_values"])
+    naive_mean_dbm = watts_to_dbm(results["Naive Baseline"]["mean"])
+    optimized_mean_dbm = watts_to_dbm(results["Optimized"]["mean"])
 
-    # Filter out dead zones for range calculation
-    # For Watts: dead zones are near 0, valid power is > 1e-30
-    live_power = all_power[all_power > 1e-30]
-    if len(live_power) > 0:
-        # Use full range (min to max) for completely inclusive binning
-        data_min = np.min(live_power)
-        data_max = np.max(live_power)
-    else:
-        data_min, data_max = 1e-15, 1e-10  # Default range in Watts
+    data_min_dbm = np.min(all_power_dbm)
+    data_max_dbm = np.max(all_power_dbm)
 
     # Plot 1: Histograms (PDF)
     ax = axes[0, 0]
-    # Use logarithmic binning for better spread across orders of magnitude
-    # This creates bins that are evenly spaced in log-space
-    if data_min > 0 and data_max > data_min:
-        # Extend range slightly beyond data to avoid edge effects
-        bin_min = data_min * 0.5
-        bin_max = data_max * 2.0
-        bins = np.logspace(np.log10(bin_min), np.log10(bin_max), 150)
+    # Use linear binning in dBm space (dB is already logarithmic)
+    if data_max_dbm > data_min_dbm:
+        bins = np.linspace(data_min_dbm, data_max_dbm, 150)
     else:
-        # Fallback to linear bins if log doesn't work
-        bins = np.linspace(data_min, data_max, 150)
+        # Handle edge case where all values are the same
+        bins = np.linspace(data_min_dbm - 1, data_max_dbm + 1, 150)
+
     ax.hist(
-        results["Naive Baseline"]["power_values"],
+        naive_power_dbm,
         bins=bins,
         alpha=0.6,
         label="Naive Baseline",
@@ -1129,7 +1125,7 @@ def compare_boresight_performance(
         density=True,
     )
     ax.hist(
-        results["Optimized"]["power_values"],
+        optimized_power_dbm,
         bins=bins,
         alpha=0.6,
         label="Optimized",
@@ -1137,60 +1133,59 @@ def compare_boresight_performance(
         density=True,
     )
     ax.axvline(
-        results["Naive Baseline"]["mean"],
+        naive_mean_dbm,
         color="orange",
         linestyle="--",
         linewidth=2,
-        label=f"Naive Mean: {results['Naive Baseline']['mean']:.2e} W",
+        label=f"Naive Mean: {naive_mean_dbm:.2f} dBm",
     )
     ax.axvline(
-        results["Optimized"]["mean"],
+        optimized_mean_dbm,
         color="green",
         linestyle="--",
         linewidth=2,
-        label=f"Optimized Mean: {results['Optimized']['mean']:.2e} W",
+        label=f"Optimized Mean: {optimized_mean_dbm:.2f} dBm",
     )
-    ax.set_xlabel("Signal Strength (Watts)")
+    ax.set_xlabel("Signal Strength (dBm)")
     ax.set_ylabel("Probability Density")
     ax.set_title("Power Distribution in Coverage Zone (PDF)")
     ax.legend(fontsize=9)
     ax.grid(True, alpha=0.3)
-    ax.set_xlim(data_min * 0.5, data_max * 2.0)  # Wider margin for better visibility
-    ax.set_xscale("log")  # Use log scale for x-axis to show wide range
+    ax.set_xlim(data_min_dbm, data_max_dbm)
 
     # Plot 2: CDFs
     ax = axes[0, 1]
     for config_name in ["Naive Baseline", "Optimized"]:
-        power = results[config_name]["power_values"]
-        sorted_power = np.sort(power)
+        power_watts = results[config_name]["power_values"]
+        power_dbm = watts_to_dbm(power_watts)
+        sorted_power = np.sort(power_dbm)
         cdf = np.arange(1, len(sorted_power) + 1) / len(sorted_power)
         color = "orange" if config_name == "Naive Baseline" else "green"
         ax.plot(sorted_power, cdf, label=config_name, color=color, linewidth=2)
 
         # Mark median
-        median = results[config_name]["median"]
+        median_watts = results[config_name]["median"]
+        median_dbm = watts_to_dbm(median_watts)
         ax.axvline(
-            median,
+            median_dbm,
             color=color,
             linestyle="--",
             alpha=0.5,
-            label=f"{config_name} Median: {median:.2e} W",
+            label=f"{config_name} Median: {median_dbm:.2f} dBm",
         )
 
-    ax.set_xlabel("Signal Strength (Watts)")
+    ax.set_xlabel("Signal Strength (dBm)")
     ax.set_ylabel("Cumulative Probability")
     ax.set_title("Cumulative Distribution Function (CDF)")
     ax.legend(fontsize=9)
     ax.grid(True, alpha=0.3)
-    # Use adaptive x-axis range
-    ax.set_xlim(data_min * 0.5, data_max * 2.0)  # Wider margin for better visibility
-    ax.set_xscale("log")  # Use log scale for x-axis to show wide range
+    ax.set_xlim(data_min_dbm, data_max_dbm)
 
     # Plot 3: Box plot comparison
     ax = axes[1, 0]
     data_to_plot = [
-        results["Naive Baseline"]["power_values"],
-        results["Optimized"]["power_values"],
+        naive_power_dbm,
+        optimized_power_dbm,
     ]
     bp = ax.boxplot(
         data_to_plot,
@@ -1200,30 +1195,24 @@ def compare_boresight_performance(
     )
     bp["boxes"][0].set_facecolor("orange")
     bp["boxes"][1].set_facecolor("green")
-    ax.set_ylabel("Signal Strength (Watts)")
+    ax.set_ylabel("Signal Strength (dBm)")
     ax.set_title("Power Distribution Comparison (Box Plot)")
     ax.grid(True, alpha=0.3, axis="y")
 
     # Add improvement annotation
-    # Calculate improvement percentage for Watts
-    improvement_pct_mean = (
-        (improvement_mean / results["Naive Baseline"]["mean"]) * 100
-        if results["Naive Baseline"]["mean"] != 0
-        else 0
-    )
-    improvement_pct_median = (
-        (improvement_median / results["Naive Baseline"]["median"]) * 100
-        if results["Naive Baseline"]["median"] != 0
-        else 0
-    )
+    # Calculate improvement in dB
+    improvement_db_mean = optimized_mean_dbm - naive_mean_dbm
+    naive_median_dbm = watts_to_dbm(results["Naive Baseline"]["median"])
+    optimized_median_dbm = watts_to_dbm(results["Optimized"]["median"])
+    improvement_db_median = optimized_median_dbm - naive_median_dbm
 
     ax.text(
         1.5,
-        results["Optimized"]["mean"] * 1.1,  # 10% above optimized mean
-        f"Improvement:\nMean: {improvement_pct_mean:+.1f}%\nMedian: {improvement_pct_median:+.1f}%",
+        optimized_mean_dbm + 2,  # 2 dB above optimized mean
+        f"Improvement:\nMean: {improvement_db_mean:+.2f} dB\nMedian: {improvement_db_median:+.2f} dB",
         bbox=dict(
             boxstyle="round",
-            facecolor="lightgreen" if improvement_pct_mean > 0 else "lightcoral",
+            facecolor="lightgreen" if improvement_db_mean > 0 else "lightcoral",
             alpha=0.8,
         ),
         fontsize=10,
@@ -1233,10 +1222,6 @@ def compare_boresight_performance(
     # Plot 4: Statistics table
     ax = axes[1, 1]
     ax.axis("off")
-
-    # Helper function to convert Watts to dBm
-    def watts_to_dbm(watts):
-        return 10.0 * np.log10(watts + 1e-30) + 30.0
 
     stats_data = [
         ["Metric", "Naive Baseline", "Optimized", "Improvement"],
@@ -1529,7 +1514,7 @@ def optimize_boresight_pathsolver(
 
     # Define differentiable loss function using @dr.wrap
     @dr.wrap(source="torch", target="drjit")
-    def compute_loss(azimuth_deg, elevation_deg, qrand_op, num_sample_points, sample_type='CDT'):
+    def compute_loss(azimuth_deg, elevation_deg, qrand_op, num_sample_points, sample_type='CDT', type='log_power'):
         """
         Compute loss with AD enabled through field_calculator only
 
@@ -1751,15 +1736,33 @@ def optimize_boresight_pathsolver(
             dr.sum(cpx_abs_square((h_real, h_imag)), axis=-1), axis=-1
         )
         power_relative = dr.sum(power_relative, axis=-1)
-        epsilon = 1e-16
 
-        # "Mean of Logs" (Geometric Mean)
-        # Punishes shadows. Drives the "Median" and "10th Percentile" up.
-        # log is concave, so low values contribute more to the loss
-        loss_coverage = dr.sum(dr.log(power_relative + epsilon)) / num_sample_points
-
-        # Negate to maximize (optimizer minimizes)
-        loss = -loss_coverage
+        if type == "LSE":
+            # LSE (Soft Min)
+            dead_zone_threshold = 1e-20
+            valid_mask = power_relative >= dead_zone_threshold
+            alpha = 5.0 
+            epsilon = 1e-30
+            log_P = dr.log(power_relative + epsilon)
+            exponents = -alpha * log_P
+            safe_exponents = dr.select(valid_mask, exponents, -1e9)
+            max_exponent = dr.max(safe_exponents) 
+            shifted_exponents = safe_exponents - max_exponent
+            terms = dr.exp(shifted_exponents)
+            masked_terms = dr.select(valid_mask, terms, 0.0)
+            sum_terms = dr.sum(masked_terms)
+            lse = max_exponent + dr.log(sum_terms + epsilon)
+            loss = (1.0 / alpha) * lse
+        
+        else:
+            # Sum Log(Power) -> Penalizes low values
+            dead_threshold = 1e-18 
+            valid_mask = power_relative > dead_threshold
+            safe_power = dr.select(valid_mask, power_relative, 1.0)
+            log_utility = dr.sum(dr.log(safe_power + 1e-20))
+            count = dr.sum(dr.select(valid_mask, 1.0, 0.0))
+            avg_utility = log_utility / (count + 1e-5)
+            loss = -avg_utility
 
         return loss
 
