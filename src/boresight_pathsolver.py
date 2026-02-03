@@ -1036,11 +1036,8 @@ def compare_boresight_performance(
         # Extract power values in zone only
         zone_power = rss_watts[zone_mask == 1.0]
 
-        # Filter out dead zones (values below -200 dBm are likely numerical artifacts)
-        # Dead zones occur when PathSolver finds no propagation paths
-        # DEAD_ZONE_THRESHOLD = -200.0  # dBm
-        DEAD_ZONE_THRESHOLD = 0  # 0 watts
-        live_zone_power = zone_power[zone_power > DEAD_ZONE_THRESHOLD]
+        # Penalizing dead zones as a saturated value
+        live_zone_power = zone_power
 
         # Compute statistics on live points only (exclude dead zones)
         # This gives more meaningful metrics for coverage quality
@@ -1090,38 +1087,37 @@ def compare_boresight_performance(
     # Create comparison plots
     fig, axes = plt.subplots(2, 2, figsize=(16, 12))
 
-    # Determine data range for better visualization
-    all_power = np.concatenate(
+    # Helper function to convert Watts to dBm
+    def watts_to_dbm(watts):
+        return 10.0 * np.log10(watts + 1e-30) + 30.0
+
+    # Convert all power values to dBm for better visualization
+    all_power_watts = np.concatenate(
         [
             results["Naive Baseline"]["power_values"],
             results["Optimized"]["power_values"],
         ]
     )
+    all_power_dbm = watts_to_dbm(all_power_watts)
+    naive_power_dbm = watts_to_dbm(results["Naive Baseline"]["power_values"])
+    optimized_power_dbm = watts_to_dbm(results["Optimized"]["power_values"])
+    naive_mean_dbm = watts_to_dbm(results["Naive Baseline"]["mean"])
+    optimized_mean_dbm = watts_to_dbm(results["Optimized"]["mean"])
 
-    # Filter out dead zones for range calculation
-    # For Watts: dead zones are near 0, valid power is > 1e-30
-    live_power = all_power[all_power > 1e-30]
-    if len(live_power) > 0:
-        # Use full range (min to max) for completely inclusive binning
-        data_min = np.min(live_power)
-        data_max = np.max(live_power)
-    else:
-        data_min, data_max = 1e-15, 1e-10  # Default range in Watts
+    data_min_dbm = np.min(all_power_dbm)
+    data_max_dbm = np.max(all_power_dbm)
 
     # Plot 1: Histograms (PDF)
     ax = axes[0, 0]
-    # Use logarithmic binning for better spread across orders of magnitude
-    # This creates bins that are evenly spaced in log-space
-    if data_min > 0 and data_max > data_min:
-        # Extend range slightly beyond data to avoid edge effects
-        bin_min = data_min * 0.5
-        bin_max = data_max * 2.0
-        bins = np.logspace(np.log10(bin_min), np.log10(bin_max), 150)
+    # Use linear binning in dBm space (dB is already logarithmic)
+    if data_max_dbm > data_min_dbm:
+        bins = np.linspace(data_min_dbm, data_max_dbm, 150)
     else:
-        # Fallback to linear bins if log doesn't work
-        bins = np.linspace(data_min, data_max, 150)
+        # Handle edge case where all values are the same
+        bins = np.linspace(data_min_dbm - 1, data_max_dbm + 1, 150)
+
     ax.hist(
-        results["Naive Baseline"]["power_values"],
+        naive_power_dbm,
         bins=bins,
         alpha=0.6,
         label="Naive Baseline",
@@ -1129,7 +1125,7 @@ def compare_boresight_performance(
         density=True,
     )
     ax.hist(
-        results["Optimized"]["power_values"],
+        optimized_power_dbm,
         bins=bins,
         alpha=0.6,
         label="Optimized",
@@ -1137,60 +1133,59 @@ def compare_boresight_performance(
         density=True,
     )
     ax.axvline(
-        results["Naive Baseline"]["mean"],
+        naive_mean_dbm,
         color="orange",
         linestyle="--",
         linewidth=2,
-        label=f"Naive Mean: {results['Naive Baseline']['mean']:.2e} W",
+        label=f"Naive Mean: {naive_mean_dbm:.2f} dBm",
     )
     ax.axvline(
-        results["Optimized"]["mean"],
+        optimized_mean_dbm,
         color="green",
         linestyle="--",
         linewidth=2,
-        label=f"Optimized Mean: {results['Optimized']['mean']:.2e} W",
+        label=f"Optimized Mean: {optimized_mean_dbm:.2f} dBm",
     )
-    ax.set_xlabel("Signal Strength (Watts)")
+    ax.set_xlabel("Signal Strength (dBm)")
     ax.set_ylabel("Probability Density")
     ax.set_title("Power Distribution in Coverage Zone (PDF)")
     ax.legend(fontsize=9)
     ax.grid(True, alpha=0.3)
-    ax.set_xlim(data_min * 0.5, data_max * 2.0)  # Wider margin for better visibility
-    ax.set_xscale("log")  # Use log scale for x-axis to show wide range
+    ax.set_xlim(data_min_dbm, data_max_dbm)
 
     # Plot 2: CDFs
     ax = axes[0, 1]
     for config_name in ["Naive Baseline", "Optimized"]:
-        power = results[config_name]["power_values"]
-        sorted_power = np.sort(power)
+        power_watts = results[config_name]["power_values"]
+        power_dbm = watts_to_dbm(power_watts)
+        sorted_power = np.sort(power_dbm)
         cdf = np.arange(1, len(sorted_power) + 1) / len(sorted_power)
         color = "orange" if config_name == "Naive Baseline" else "green"
         ax.plot(sorted_power, cdf, label=config_name, color=color, linewidth=2)
 
         # Mark median
-        median = results[config_name]["median"]
+        median_watts = results[config_name]["median"]
+        median_dbm = watts_to_dbm(median_watts)
         ax.axvline(
-            median,
+            median_dbm,
             color=color,
             linestyle="--",
             alpha=0.5,
-            label=f"{config_name} Median: {median:.2e} W",
+            label=f"{config_name} Median: {median_dbm:.2f} dBm",
         )
 
-    ax.set_xlabel("Signal Strength (Watts)")
+    ax.set_xlabel("Signal Strength (dBm)")
     ax.set_ylabel("Cumulative Probability")
     ax.set_title("Cumulative Distribution Function (CDF)")
     ax.legend(fontsize=9)
     ax.grid(True, alpha=0.3)
-    # Use adaptive x-axis range
-    ax.set_xlim(data_min * 0.5, data_max * 2.0)  # Wider margin for better visibility
-    ax.set_xscale("log")  # Use log scale for x-axis to show wide range
+    ax.set_xlim(data_min_dbm, data_max_dbm)
 
     # Plot 3: Box plot comparison
     ax = axes[1, 0]
     data_to_plot = [
-        results["Naive Baseline"]["power_values"],
-        results["Optimized"]["power_values"],
+        naive_power_dbm,
+        optimized_power_dbm,
     ]
     bp = ax.boxplot(
         data_to_plot,
@@ -1200,30 +1195,24 @@ def compare_boresight_performance(
     )
     bp["boxes"][0].set_facecolor("orange")
     bp["boxes"][1].set_facecolor("green")
-    ax.set_ylabel("Signal Strength (Watts)")
+    ax.set_ylabel("Signal Strength (dBm)")
     ax.set_title("Power Distribution Comparison (Box Plot)")
     ax.grid(True, alpha=0.3, axis="y")
 
     # Add improvement annotation
-    # Calculate improvement percentage for Watts
-    improvement_pct_mean = (
-        (improvement_mean / results["Naive Baseline"]["mean"]) * 100
-        if results["Naive Baseline"]["mean"] != 0
-        else 0
-    )
-    improvement_pct_median = (
-        (improvement_median / results["Naive Baseline"]["median"]) * 100
-        if results["Naive Baseline"]["median"] != 0
-        else 0
-    )
+    # Calculate improvement in dB
+    improvement_db_mean = optimized_mean_dbm - naive_mean_dbm
+    naive_median_dbm = watts_to_dbm(results["Naive Baseline"]["median"])
+    optimized_median_dbm = watts_to_dbm(results["Optimized"]["median"])
+    improvement_db_median = optimized_median_dbm - naive_median_dbm
 
     ax.text(
         1.5,
-        results["Optimized"]["mean"] * 1.1,  # 10% above optimized mean
-        f"Improvement:\nMean: {improvement_pct_mean:+.1f}%\nMedian: {improvement_pct_median:+.1f}%",
+        optimized_mean_dbm + 2,  # 2 dB above optimized mean
+        f"Improvement:\nMean: {improvement_db_mean:+.2f} dB\nMedian: {improvement_db_median:+.2f} dB",
         bbox=dict(
             boxstyle="round",
-            facecolor="lightgreen" if improvement_pct_mean > 0 else "lightcoral",
+            facecolor="lightgreen" if improvement_db_mean > 0 else "lightcoral",
             alpha=0.8,
         ),
         fontsize=10,
@@ -1233,10 +1222,6 @@ def compare_boresight_performance(
     # Plot 4: Statistics table
     ax = axes[1, 1]
     ax.axis("off")
-
-    # Helper function to convert Watts to dBm
-    def watts_to_dbm(watts):
-        return 10.0 * np.log10(watts + 1e-30) + 30.0
 
     stats_data = [
         ["Metric", "Naive Baseline", "Optimized", "Improvement"],
@@ -1542,12 +1527,26 @@ def optimize_boresight_pathsolver(
     #    num_points=num_sample_points
     #)
 
+    # Auto-detect zone type from zone_params
+    if 'vertices' in zone_params:
+        zone_type = 'polygon'
+    elif 'center' in zone_params and 'width' in zone_params and 'height' in zone_params:
+        zone_type = 'box'
+    else:
+        raise ValueError(
+            "zone_params must contain either 'vertices' (for polygon) or "
+            "'center', 'width', 'height' (for box)"
+        )
+
+    if verbose:
+        print(f"Auto-detected zone type: {zone_type}")
+
     # Solve for polygon zone and remove building exclusions.
     target_zone, building_exclusions, _ = get_zone_polygon_with_exclusions(
-    zone_type='polygon',
-    zone_params=zone_params,
-    scene_xml_path=scene_xml_path,
-    exclude_buildings=True
+        zone_type=zone_type,
+        zone_params=zone_params,
+        scene_xml_path=scene_xml_path,
+        exclude_buildings=True
     )
 
     # Triangulate using CDT (only need to do this once)
@@ -1585,7 +1584,7 @@ def optimize_boresight_pathsolver(
 
     # Define differentiable loss function using @dr.wrap
     @dr.wrap(source="torch", target="drjit")
-    def compute_loss(azimuth_deg, elevation_deg, qrand_op, num_sample_points, sample_type='CDT'):
+    def compute_loss(azimuth_deg, elevation_deg, qrand_op, num_sample_points, sample_type='CDT', type='log_power'):
         """
         Compute loss with AD enabled through field_calculator only
 
@@ -1644,10 +1643,10 @@ def optimize_boresight_pathsolver(
         tx = scene.get(tx_name)
         tx.orientation = mi.Point3f(yaw_rad_jittered, pitch_rad_jittered, roll_rad)
 
-        if sample_type is "CDT":
+        if sample_type == "CDT":
             # Generate new sample points using Sobol sequence
             new_sample_points = sample_triangulated_zone(tri_verts=triangles, num_samples=num_sample_points, qrand=qrand_op, ground_z=0.0)
-        
+
         else:
             # Sample Grid Points using Quasi-Monte Carlo (Sobol sequence)
             new_sample_points = sample_grid_points(
@@ -1656,7 +1655,7 @@ def optimize_boresight_pathsolver(
                 exclude_buildings=True,
                 zone_mask=zone_mask,
                 zone_stats=zone_stats,
-                qrand=qrand,
+                qrand=qrand_op,
                 num_points=num_sample_points
             )
 
@@ -1708,6 +1707,59 @@ def optimize_boresight_pathsolver(
         # Extract channel coefficients
         h_real, h_imag = paths.a
 
+        # Check if PathSolver found any paths
+        # Use dr.width() to check actual data entries, not just array structure
+        try:
+            h_real_width = dr.width(h_real) if hasattr(h_real, '__len__') else 0
+        except:
+            h_real_width = 0
+
+        if len(h_real) == 0 or h_real_width == 0:
+            # Initialize all counters individually if needed
+            if not hasattr(compute_loss, "_iter_count"):
+                compute_loss._iter_count = 0
+            if not hasattr(compute_loss, "_failed_first_iter"):
+                compute_loss._failed_first_iter = False
+            if not hasattr(compute_loss, "_empty_path_count"):
+                compute_loss._empty_path_count = 0
+            if not hasattr(compute_loss, "_too_many_failures"):
+                compute_loss._too_many_failures = False
+
+            # Increment empty path counter
+            compute_loss._empty_path_count += 1
+
+            print(f"\n  [WARNING] PathSolver found 0 paths! (Empty count: {compute_loss._empty_path_count}/5)")
+            print(f"            Azimuth={float(azimuth_deg.item()):.1f}°, Elevation={float(elevation_deg.item()):.1f}°")
+
+            # Check if we've exceeded the threshold
+            if compute_loss._empty_path_count > 5:
+                compute_loss._too_many_failures = True
+                print(f"            CRITICAL: More than 5 empty PathSolver results detected!")
+                print(f"            Marking optimization for abandonment.\n")
+                penalty = dr.auto.ad.Float(-1e10) - elevation_deg * 0.1 - azimuth_deg * 0.01
+                return penalty
+
+            if compute_loss._iter_count == 0:
+                # Mark first iteration as failed
+                compute_loss._failed_first_iter = True
+                print(f"            First iteration failed - bad zone/TX setup.")
+                print(f"            Signaling caller to skip this configuration.\n")
+                # Return penalty with synthetic gradient
+                # Gradient pushes elevation up (away from ground)
+                penalty = dr.auto.ad.Float(-1e10) - elevation_deg * 0.1
+                return penalty
+
+            # Later iterations - create synthetic gradient to guide optimizer away
+            print(f"            Injecting synthetic gradient to guide optimizer.\n")
+            # Penalty loss with gradient that encourages increasing elevation (pointing up)
+            penalty = dr.auto.ad.Float(-1e10) - elevation_deg * 0.1 - azimuth_deg * 0.01
+            return penalty
+
+        # Increment iteration counter
+        if not hasattr(compute_loss, "_iter_count"):
+            compute_loss._iter_count = 0
+        compute_loss._iter_count += 1
+
         # DEBUG: Check if any paths were found (only print on first call)
         # We use a simple flag via a mutable default to track first call
         if not hasattr(compute_loss, "_first_call_done"):
@@ -1717,29 +1769,90 @@ def optimize_boresight_pathsolver(
             compute_loss._first_call_done = True
             # Compute total power across all receivers as a quick check
             total_power = dr.sum(dr.sum(cpx_abs_square((h_real, h_imag))))
+            print(f"  [DEBUG] PathSolver found {len(h_real)} paths for {len(new_sample_points)} receivers")
             print(f"  [DEBUG] Total path power (linear): {total_power}")
             if total_power < 1e-25:
                 print(
                     f"  [WARNING] Very low or zero path power - PathSolver may not be finding paths!"
                 )
 
-        # Extract path coefficients
-        h_real, h_imag = paths.a
+        # Additional safety check before tensor reduction
+        # Verify h_real and h_imag have actual data to prevent TensorXf creation with 0 entries
+        try:
+            # Test if we can compute power on a small subset first
+            test_power = cpx_abs_square((h_real, h_imag))
+            if dr.width(test_power) == 0:
+                # Increment empty path counter (initialize if needed)
+                if not hasattr(compute_loss, "_empty_path_count"):
+                    compute_loss._empty_path_count = 0
+                if not hasattr(compute_loss, "_too_many_failures"):
+                    compute_loss._too_many_failures = False
+                compute_loss._empty_path_count += 1
+
+                print(f"\n  [WARNING] cpx_abs_square returned empty tensor! (Empty count: {compute_loss._empty_path_count}/5)")
+                print(f"            h_real width: {dr.width(h_real)}, h_imag width: {dr.width(h_imag)}")
+
+                # Check if we've exceeded the threshold
+                if compute_loss._empty_path_count > 5:
+                    compute_loss._too_many_failures = True
+                    print(f"            CRITICAL: More than 5 empty PathSolver results detected!")
+                    print(f"            Marking optimization for abandonment.\n")
+
+                print(f"            Returning penalty loss.")
+                penalty = dr.auto.ad.Float(-1e10) - elevation_deg * 0.1 - azimuth_deg * 0.01
+                return penalty
+        except Exception as e:
+            # Increment empty path counter
+            if not hasattr(compute_loss, "_empty_path_count"):
+                compute_loss._empty_path_count = 0
+            if not hasattr(compute_loss, "_too_many_failures"):
+                compute_loss._too_many_failures = False
+            compute_loss._empty_path_count += 1
+
+            print(f"\n  [ERROR] Failed to compute cpx_abs_square: {e} (Empty count: {compute_loss._empty_path_count}/5)")
+
+            # Check if we've exceeded the threshold
+            if compute_loss._empty_path_count > 5:
+                compute_loss._too_many_failures = True
+                print(f"           CRITICAL: More than 5 empty PathSolver results detected!")
+                print(f"           Marking optimization for abandonment.\n")
+
+            print(f"         Returning penalty loss.")
+            penalty = dr.auto.ad.Float(-1e10) - elevation_deg * 0.1 - azimuth_deg * 0.01
+            return penalty
 
         # Compute incoherent sum (Raw Channel Gain |h|^2)
         power_relative = dr.sum(
             dr.sum(cpx_abs_square((h_real, h_imag)), axis=-1), axis=-1
         )
         power_relative = dr.sum(power_relative, axis=-1)
-        epsilon = 1e-16
 
-        # "Mean of Logs" (Geometric Mean)
-        # Punishes shadows. Drives the "Median" and "10th Percentile" up.
-        # log is concave, so low values contribute more to the loss
-        loss_coverage = dr.sum(dr.log(power_relative + epsilon)) / num_sample_points
-
-        # Negate to maximize (optimizer minimizes)
-        loss = -loss_coverage
+        if type == "LSE":
+            # LSE (Soft Min)
+            dead_zone_threshold = 1e-20
+            valid_mask = power_relative >= dead_zone_threshold
+            alpha = 5.0 
+            epsilon = 1e-30
+            log_P = dr.log(power_relative + epsilon)
+            exponents = -alpha * log_P
+            safe_exponents = dr.select(valid_mask, exponents, -1e9)
+            max_exponent = dr.max(safe_exponents) 
+            shifted_exponents = safe_exponents - max_exponent
+            terms = dr.exp(shifted_exponents)
+            masked_terms = dr.select(valid_mask, terms, 0.0)
+            sum_terms = dr.sum(masked_terms)
+            lse = max_exponent + dr.log(sum_terms + epsilon)
+            loss = (1.0 / alpha) * lse
+        
+        else:
+            # Sum Log(Power) -> Penalizes low values
+            dead_threshold = 1e-18 
+            valid_mask = power_relative > dead_threshold
+            safe_power = dr.select(valid_mask, power_relative, 1.0)
+            log_utility = dr.sum(dr.log(safe_power + 1e-20))
+            count = dr.sum(dr.select(valid_mask, 1.0, 0.0))
+            avg_utility = log_utility / (count + 1e-5)
+            loss = -avg_utility
 
         return loss
 
@@ -1823,10 +1936,38 @@ def optimize_boresight_pathsolver(
             print(f"  (These should match the naive baseline angles shown above)")
             print(f"{'='*70}\n")
 
-        # Using an independent (random) set of Sobol points using different seeds
-        # qrand_run = torch.quasirandom.SobolEngine(dimension=2, scramble=True, seed=iteration)
-        # Could build in different sampling sequences for customizable performance
         loss = compute_loss(azimuth, elevation, qrand, num_sample_points, 'Rejection')
+
+        # Check if first iteration failed (no paths found)
+        if iteration == 0 and hasattr(compute_loss, "_failed_first_iter") and compute_loss._failed_first_iter:
+            print("\n" + "="*70)
+            print("OPTIMIZATION ABORTED: First iteration found 0 paths")
+            print("="*70)
+            print("This zone/TX configuration cannot find any propagation paths.")
+            print("Possible causes:")
+            print("  - TX is too low (pointing into ground)")
+            print("  - Zone is entirely blocked by buildings")
+            print("  - Scene geometry issues")
+            print("\nReturning None to signal failure to caller.")
+            print("="*70 + "\n")
+            return initial_angles, None, None, None, None, initial_angles
+
+        # Check if too many failures occurred during optimization
+        if hasattr(compute_loss, "_too_many_failures") and compute_loss._too_many_failures:
+            print("\n" + "="*70)
+            print("OPTIMIZATION ABORTED: More than 5 empty PathSolver results")
+            print("="*70)
+            print(f"Empty path count: {compute_loss._empty_path_count}")
+            print(f"Current iteration: {iteration+1}/{num_iterations}")
+            print("\nThis configuration is consistently failing to find propagation paths.")
+            print("Possible causes:")
+            print("  - Optimizer is pointing antenna into ground or sky")
+            print("  - Zone geometry is incompatible with TX placement")
+            print("  - Extreme antenna angles causing no valid paths")
+            print("\nReturning None to signal failure to caller.")
+            print("="*70 + "\n")
+            return initial_angles, None, None, None, None, initial_angles
+
         optimizer.zero_grad()
         loss.backward()
 
