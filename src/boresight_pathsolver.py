@@ -9,9 +9,10 @@ import matplotlib.pyplot as plt
 import torch
 import numpy as np
 import drjit as dr
+import os
 from drjit.auto import Float, Array3f, UInt
 import mitsuba as mi
-from sionna.rt import PathSolver, Receiver, cpx_abs_square
+from sionna.rt import PathSolver, Receiver, cpx_abs_square, RadioMapSolver
 from sionna.rt.path_solvers.paths import Paths
 import time
 from shapely import contains_xy
@@ -1418,6 +1419,7 @@ def optimize_boresight_pathsolver(
     frame_save_interval=1,
     output_dir="/home/tingjunlab/Development/optimize_tx/figures",
 ):
+    import os
     """
     Optimize boresight using PathSolver with automatic differentiation
 
@@ -1596,12 +1598,18 @@ def optimize_boresight_pathsolver(
     p_solver = PathSolver()
     p_solver.loop_mode = "evaluated"  # Required for gradient computation
 
+    # Testing the RadioMapSolver() as the data source
+    rm_solver = RadioMapSolver()
+
     # Storage for sample points (accessible from outside the wrapped function)
     sample_points_storage = {}
 
+    solver = RadioMapSolver()
+    solver.loop_mode = "evaluated" # Required for gradient computation
+
     # Define differentiable loss function using @dr.wrap
     @dr.wrap(source="torch", target="drjit")
-    def compute_loss(azimuth_deg, elevation_deg, qrand_op, num_sample_points, sample_type='CDT', type='log_power'):
+    def compute_loss(azimuth_deg, elevation_deg, qrand_op, num_sample_points, sample_type='CDT', type='Other', solver=solver):
         """
         Compute loss with AD enabled through field_calculator only
 
@@ -1658,175 +1666,55 @@ def optimize_boresight_pathsolver(
         tx = scene.get(tx_name)
         tx.orientation = mi.Point3f(yaw_rad_jittered, pitch_rad_jittered, roll_rad)
 
-        if sample_type == "CDT":
+        #if sample_type == "CDT":
             # Generate new sample points using Sobol sequence
-            new_sample_points = sample_triangulated_zone(tri_verts=triangles, num_samples=num_sample_points, qrand=qrand_op, ground_z=0.0)
+        #    new_sample_points = sample_triangulated_zone(tri_verts=triangles, num_samples=num_sample_points, qrand=qrand_op, ground_z=0.0)
 
-        else:
+        #else:
             # Sample Grid Points using Quasi-Monte Carlo (Sobol sequence)
-            new_sample_points = sample_grid_points(
-                map_config,
-                scene_xml_path=scene_xml_path,
-                exclude_buildings=True,
-                zone_mask=zone_mask,
-                zone_stats=zone_stats,
-                qrand=qrand_op,
-                num_points=num_sample_points,
-                cached_building_polygons=cached_building_polygons,  # Use pre-cached polygons
-            )
+        #    new_sample_points = sample_grid_points(
+        #        map_config,
+        #        scene_xml_path=scene_xml_path,
+        #        exclude_buildings=True,
+        #        zone_mask=zone_mask,
+        #        zone_stats=zone_stats,
+        #        qrand=qrand_op,
+        #        num_points=num_sample_points,
+        #        cached_building_polygons=cached_building_polygons,  # Use pre-cached polygons
+        #    )
 
         # Store for visualization outside the loss function
-        sample_points_storage['current'] = new_sample_points
+        #sample_points_storage['current'] = new_sample_points
 
         # REPOSITION existing receivers (much faster than remove/add)
-        # Receivers were pre-created before the optimization loop
-        for idx, position in enumerate(new_sample_points):
-            rx_name = f"opt_rx_{idx}"
-            rx_objects[rx_name].position = mi.Point3f(
-                float(position[0]), float(position[1]), float(position[2])
-            )
-
+        #for idx, position in enumerate(new_sample_points):
+        #    rx_name = f"opt_rx_{idx}"
+        #    rx_objects[rx_name].position = mi.Point3f(
+        #        float(position[0]), float(position[1]), float(position[2])
+        #    )
+        
         # Run path solver with updated receivers and antenna orientation
-        paths = p_solver(
-            scene,
-            los=True,
-            refraction=False,
-            specular_reflection=True,
-            diffuse_reflection=False,
-            diffraction=True,
-            edge_diffraction=True,
-        )
+        #paths = p_solver(
+        #    scene,
+        #    los=True,
+        #    refraction=False,
+        #    specular_reflection=True,
+        #    diffuse_reflection=False,
+        #    diffraction=True,
+        #    edge_diffraction=True,
+        #)
+        rm = solver(scene, cell_size=(1., 1.), samples_per_tx=10000)
 
-        # Extract channel coefficients
-        h_real, h_imag = paths.a
-
-        # Check if PathSolver found any paths
-        # Use dr.width() to check actual data entries, not just array structure
-        try:
-            h_real_width = dr.width(h_real) if hasattr(h_real, '__len__') else 0
-        except:
-            h_real_width = 0
-
-        if len(h_real) == 0 or h_real_width == 0:
-            # Initialize all counters individually if needed
-            if not hasattr(compute_loss, "_iter_count"):
-                compute_loss._iter_count = 0
-            if not hasattr(compute_loss, "_failed_first_iter"):
-                compute_loss._failed_first_iter = False
-            if not hasattr(compute_loss, "_empty_path_count"):
-                compute_loss._empty_path_count = 0
-            if not hasattr(compute_loss, "_too_many_failures"):
-                compute_loss._too_many_failures = False
-
-            # Increment empty path counter
-            compute_loss._empty_path_count += 1
-
-            print(f"\n  [WARNING] PathSolver found 0 paths! (Empty count: {compute_loss._empty_path_count}/5)")
-            print(f"            Azimuth={float(azimuth_deg.item()):.1f}°, Elevation={float(elevation_deg.item()):.1f}°")
-
-            # Check if we've exceeded the threshold
-            if compute_loss._empty_path_count > 5:
-                compute_loss._too_many_failures = True
-                print(f"            CRITICAL: More than 5 empty PathSolver results detected!")
-                print(f"            Marking optimization for abandonment.\n")
-                penalty = dr.auto.ad.Float(-1e10) - elevation_deg * 0.1 - azimuth_deg * 0.01
-                return penalty
-
-            if compute_loss._iter_count == 0:
-                # Mark first iteration as failed
-                compute_loss._failed_first_iter = True
-                print(f"            First iteration failed - bad zone/TX setup.")
-                print(f"            Signaling caller to skip this configuration.\n")
-                # Return penalty with synthetic gradient
-                # Gradient pushes elevation up (away from ground)
-                penalty = dr.auto.ad.Float(-1e10) - elevation_deg * 0.1
-                return penalty
-
-            # Later iterations - create synthetic gradient to guide optimizer away
-            print(f"            Injecting synthetic gradient to guide optimizer.\n")
-            # Penalty loss with gradient that encourages increasing elevation (pointing up)
-            penalty = dr.auto.ad.Float(-1e10) - elevation_deg * 0.1 - azimuth_deg * 0.01
-            return penalty
-
-        # Increment iteration counter
-        if not hasattr(compute_loss, "_iter_count"):
-            compute_loss._iter_count = 0
-        compute_loss._iter_count += 1
-
-        # DEBUG: Check if any paths were found (only print on first call)
-        # We use a simple flag via a mutable default to track first call
-        if not hasattr(compute_loss, "_first_call_done"):
-            compute_loss._first_call_done = False
-
-        if verbose and not compute_loss._first_call_done:
-            compute_loss._first_call_done = True
-            # Compute total power across all receivers as a quick check
-            total_power = dr.sum(dr.sum(cpx_abs_square((h_real, h_imag))))
-            print(f"  [DEBUG] PathSolver found {len(h_real)} paths for {len(new_sample_points)} receivers")
-            print(f"  [DEBUG] Total path power (linear): {total_power}")
-            if total_power < 1e-25:
-                print(
-                    f"  [WARNING] Very low or zero path power - PathSolver may not be finding paths!"
-                )
-
-        # Additional safety check before tensor reduction
-        # Verify h_real and h_imag have actual data to prevent TensorXf creation with 0 entries
-        try:
-            # Test if we can compute power on a small subset first
-            test_power = cpx_abs_square((h_real, h_imag))
-            if dr.width(test_power) == 0:
-                # Increment empty path counter (initialize if needed)
-                if not hasattr(compute_loss, "_empty_path_count"):
-                    compute_loss._empty_path_count = 0
-                if not hasattr(compute_loss, "_too_many_failures"):
-                    compute_loss._too_many_failures = False
-                compute_loss._empty_path_count += 1
-
-                print(f"\n  [WARNING] cpx_abs_square returned empty tensor! (Empty count: {compute_loss._empty_path_count}/5)")
-                print(f"            h_real width: {dr.width(h_real)}, h_imag width: {dr.width(h_imag)}")
-
-                # Check if we've exceeded the threshold
-                if compute_loss._empty_path_count > 5:
-                    compute_loss._too_many_failures = True
-                    print(f"            CRITICAL: More than 5 empty PathSolver results detected!")
-                    print(f"            Marking optimization for abandonment.\n")
-
-                print(f"            Returning penalty loss.")
-                penalty = dr.auto.ad.Float(-1e10) - elevation_deg * 0.1 - azimuth_deg * 0.01
-                return penalty
-        except Exception as e:
-            # Increment empty path counter
-            if not hasattr(compute_loss, "_empty_path_count"):
-                compute_loss._empty_path_count = 0
-            if not hasattr(compute_loss, "_too_many_failures"):
-                compute_loss._too_many_failures = False
-            compute_loss._empty_path_count += 1
-
-            print(f"\n  [ERROR] Failed to compute cpx_abs_square: {e} (Empty count: {compute_loss._empty_path_count}/5)")
-
-            # Check if we've exceeded the threshold
-            if compute_loss._empty_path_count > 5:
-                compute_loss._too_many_failures = True
-                print(f"           CRITICAL: More than 5 empty PathSolver results detected!")
-                print(f"           Marking optimization for abandonment.\n")
-
-            print(f"         Returning penalty loss.")
-            penalty = dr.auto.ad.Float(-1e10) - elevation_deg * 0.1 - azimuth_deg * 0.01
-            return penalty
-
-        # Compute incoherent sum (Raw Channel Gain |h|^2)
-        power_relative = dr.sum(
-            dr.sum(cpx_abs_square((h_real, h_imag)), axis=-1), axis=-1
-        )
-        power_relative = dr.sum(power_relative, axis=-1)
+        # Copy RSS tensor
+        rss = rm.rss
 
         if type == "LSE":
             # LSE (Soft Min)
             dead_zone_threshold = 1e-30
-            valid_mask = power_relative > dead_zone_threshold
+            valid_mask = rss > dead_zone_threshold
             alpha = 5.0 
             epsilon = 1e-30
-            log_P = dr.log(power_relative + epsilon)
+            log_P = dr.log(rss + epsilon)
             exponents = -alpha * log_P
             safe_exponents = dr.select(valid_mask, exponents, -1e9)
             max_exponent = dr.max(safe_exponents) 
@@ -1840,9 +1728,9 @@ def optimize_boresight_pathsolver(
         else:
             # Sum Log(Power) -> Penalizes low values
             dead_zone_threshold = 1e-30
-            valid_mask = power_relative > dead_zone_threshold
+            valid_mask = rss > dead_zone_threshold
             epsilon = 1e-30
-            log_P = dr.log(power_relative + epsilon)
+            log_P = dr.log(rss + epsilon)
             masked_log_P = dr.select(valid_mask, log_P, 0.0)
             log_utility = dr.sum(masked_log_P)
             count = dr.sum(dr.select(valid_mask, 1.0, 0.0))
@@ -1931,7 +1819,7 @@ def optimize_boresight_pathsolver(
             print(f"  (These should match the naive baseline angles shown above)")
             print(f"{'='*70}\n")
 
-        loss = compute_loss(azimuth, elevation, qrand, num_sample_points, 'Rejection')
+        loss = compute_loss(azimuth, elevation, qrand, num_sample_points, 'Rejection', 'Other', solver)
 
         # Check if first iteration failed (no paths found)
         if iteration == 0 and hasattr(compute_loss, "_failed_first_iter") and compute_loss._failed_first_iter:
@@ -2045,6 +1933,7 @@ def optimize_boresight_pathsolver(
     # Cleanup receivers
     # This is required to make sure the RadioMap calculation doesn't have any extraneous recievers
     for rx_name in rx_names:
+        # Check if receiver still exists before removing
         if rx_name in [obj.name for obj in scene.receivers.values()]:
             scene.remove(rx_name)
 
@@ -2052,6 +1941,7 @@ def optimize_boresight_pathsolver(
     tx = scene.get(tx_name)
 
     # Set final antenna orientation using best angles (non-AD) - use pure Python floats
+
     # Failing to do this can cause issues with the RadioMap solver...
     final_yaw_rad, final_pitch_rad = azimuth_elevation_to_yaw_pitch(
         best_azimuth_final, best_elevation_final

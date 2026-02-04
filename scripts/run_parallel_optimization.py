@@ -272,6 +272,7 @@ def main():
         'p10_max_dbm': -80.0,
         'p90_min_dbm': -130.0,
         'min_percentile_range_db': 15.0,
+        'median_max_dbm': -65.0          
     }
 
     # Run optimization
