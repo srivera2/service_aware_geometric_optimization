@@ -15,6 +15,7 @@ import mitsuba as mi
 import warnings
 import sys
 import os
+os.environ["DRJIT_LIBLLVM_PATH"] = "/usr/lib/x86_64-linux-gnu/libLLVM.so.20.1"
 import pickle
 import argparse
 from datetime import datetime
