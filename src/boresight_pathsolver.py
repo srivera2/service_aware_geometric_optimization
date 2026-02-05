@@ -1819,7 +1819,7 @@ def optimize_boresight_pathsolver(
             # CVaR-50 (Average of the Bottom 50%)
             # Optimizes the tail by penalizing users below the dynamic mean.
             
-            # 1. Setup & Conversion to dB
+            # Remove dead zones from gradient calculations
             dead_zone_threshold = 1e-30
             valid_mask = power_relative > dead_zone_threshold
             epsilon = 1e-30
@@ -1832,9 +1832,11 @@ def optimize_boresight_pathsolver(
             # 2. Determine the Dynamic Target ("The Waterline")
             # We calculate the mean of the VALID users to find the 'middle'.
             # We assume roughly 50% of users will be below this.
+            
             masked_val_db = dr.select(valid_mask, val_db, 0.0)
             valid_count = dr.sum(dr.select(valid_mask, 1.0, 0.0))
-            batch_mean = dr.sum(val_db) / (num_sample_points + 1e-5)
+            
+            batch_mean = dr.sum(masked_val_db) / (valid_count + 1e-5)
             
             # CRITICAL: Detach the target.
             # We want the optimizer to raise the users, NOT lower the target.
@@ -1858,45 +1860,27 @@ def optimize_boresight_pathsolver(
             loss = dr.sum(safe_loss) / (tail_count + 1e-5)
         
         elif type == "threshold":
-            # Fixed Hinge Loss: "Get everyone above -90 dBm"
-            # This is the most stable way to force the median up.
-            
-            # 1. Define Constants
-            # Dead Threshold: -140 dBm (Users below this are physics-limited/dead)
             # Target: -90 dBm (The goal line we want users to cross)
             dead_threshold = 1e-17 
-            target_db = -90.0
-            
-            # 2. Identify "Alive" Users
-            # We only optimize users who have a faint signal trace.
-            # Trying to optimize -200 dBm users causes gradient paralysis.
+            target_db = -70.0
+
+            # Filter to calculate gradient only using alive transmitters
             is_alive = power_relative > dead_threshold
-            
-            # 3. Convert to dB (Numerically Safe)
-            # Replace dead values with 1.0 so log(1)=0. 
-            # We will mask the result later, so this placeholder value doesn't matter.
             epsilon = 1e-30
             safe_power = dr.select(is_alive, power_relative, 1.0)
             vals_db = 10.0 * dr.log(safe_power + epsilon) / dr.log(10.0)
             
-            # 4. Compute Hinge Error
-            # Error = Target - Actual
-            # Positive Error = User is below target (Needs help)
-            # Negative Error = User is above target (Ignore)
+            # Hinge error
             error = target_db - vals_db
             
-            # 5. Calculate Loss
-            # If Dead: Loss = 0.0 (Ignore)
-            # If Good (>Target): Loss = 0.0 (Ignore)
-            # If Marginal (Alive but Bad): Loss = Error (Push!)
+            # Params: Mask, True Value, False Value
             active_loss = dr.select(is_alive, dr.maximum(error, 0.0), 0.0)
             
-            # 6. Normalize
-            # Only divide by the count of users we are ACTUALLY trying to fix.
-            # This keeps the gradient magnitude consistent.
+            # Normalize
             pushing_mask = is_alive & (error > 0)
             pushing_count = dr.sum(dr.select(pushing_mask, 1.0, 0.0))
             
+            # Minimize the total contributing error
             loss = dr.sum(active_loss) / (pushing_count + 1e-5)
 
         else:

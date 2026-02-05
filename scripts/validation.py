@@ -44,7 +44,7 @@ CONFIG = {
 
     # Test matrix
     'samplers': ["Rejection", "CDT"],
-    'frequencies': [2.4e9, 5.2e9, 7.1e9, 9.7e9],
+    'frequencies': [1.0e9, 3.0e9, 5.0e9, 7.0e9, 9.0e9],
     'lds_methods': ["Sobol", "Halton", "Latin"],
 
     # Map configuration
@@ -68,9 +68,9 @@ CONFIG = {
 
     # Validation thresholds
     'validation_thresholds': {
-        'p10_min_dbm': -200.0,
-        'p10_max_dbm': -94.0,
-        'p90_min_dbm': -105.0,
+        'p10_min_dbm': -140.0,
+        'p10_max_dbm': -90.0,
+        'p90_min_dbm': -80.0,
         'min_percentile_range_db': 40.0,
         'median_max_dbm': -60.0
     },
@@ -125,7 +125,7 @@ def setup_scene(scene_xml_path):
 
     # Disable scattering
     for radio_material in scene.radio_materials.values():
-        radio_material.scattering_coefficient = 0.0
+        radio_material.scattering_coefficient = 0.4
 
     return scene
 
@@ -318,8 +318,8 @@ def run_validation(config=None):
                         'zone_power_optimized': zone_power_optimized,
                     }
 
-                    improvement = np.mean(zone_power_optimized) - np.mean(zone_power_initial)
-                    print(f"    Mean improvement: {improvement:+.2f} dB")
+                    improvement = np.median(zone_power_optimized) - np.median(zone_power_initial)
+                    print(f"    Median improvement: {improvement:+.2f} dB")
 
         print(f"\nCompleted {scene_name}")
         print("=" * 80 + "\n")
