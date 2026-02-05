@@ -644,6 +644,16 @@ def sample_triangulated_zone(tri_verts, num_samples, qrand, ground_z=0.0):
     z_col = np.full((actual_total, 1), ground_z)
     sampled_points_3d = np.hstack([points_2d, z_col])
 
+    # --- Step 7: Ensure exact count (stochastic rounding can produce more/fewer) ---
+    if actual_total > num_samples:
+        # Truncate to exactly num_samples
+        sampled_points_3d = sampled_points_3d[:num_samples]
+    elif actual_total < num_samples:
+        # Pad by duplicating random existing points
+        deficit = num_samples - actual_total
+        pad_indices = np.random.choice(actual_total, size=deficit, replace=True)
+        sampled_points_3d = np.vstack([sampled_points_3d, sampled_points_3d[pad_indices]])
+
     return sampled_points_3d.astype(np.float32)
 
 

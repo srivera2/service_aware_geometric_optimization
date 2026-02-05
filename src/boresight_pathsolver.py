@@ -1099,27 +1099,16 @@ def compare_boresight_performance(
         # Penalizing dead zones as a saturated value
         live_zone_power = zone_power
 
-        # Compute statistics on live points only (exclude dead zones)
-        # This gives more meaningful metrics for coverage quality
-        if len(live_zone_power) > 0:
-            mean_val = np.mean(live_zone_power)
-            median_val = np.median(live_zone_power)
-            std_val = np.std(live_zone_power)
-            min_val = np.min(live_zone_power)
-            max_val = np.max(live_zone_power)
-            p10_val = np.percentile(live_zone_power, 10)
-            p90_val = np.percentile(live_zone_power, 90)
-            coverage_fraction = len(live_zone_power) / len(zone_power)
-        else:
-            # All points are dead zones - use raw values
-            mean_val = np.mean(zone_power)
-            median_val = np.median(zone_power)
-            std_val = np.std(zone_power)
-            min_val = np.min(zone_power)
-            max_val = np.max(zone_power)
-            p10_val = np.percentile(zone_power, 10)
-            p90_val = np.percentile(zone_power, 90)
-            coverage_fraction = 0.0
+        # All points are dead zones - use raw values
+        # This was biasing the results!!! Keep this as-is
+        mean_val = np.mean(zone_power)
+        median_val = np.median(zone_power)
+        std_val = np.std(zone_power)
+        min_val = np.min(zone_power)
+        max_val = np.max(zone_power)
+        p10_val = np.percentile(zone_power, 10)
+        p90_val = np.percentile(zone_power, 90)
+        coverage_fraction = 0.0
 
         # Store results
         results[config_name] = {
@@ -1413,6 +1402,7 @@ def optimize_boresight_pathsolver(
     tx_placement_mode="skip",  # "center", "fixed", "line", "skip" (skip = don't move TX)
     # If true, the center position of the roof polygon is used
     # Else, use the start position
+    sampler = 'Rejection',
     Tx_start_pos=[0.0, 0.0],
     save_radiomap_frames=False,
     frame_save_interval=1,
@@ -1507,17 +1497,6 @@ def optimize_boresight_pathsolver(
         print("This LDS is not supported. Using Sobol as default")
         qrand = scipy.stats.qmc.Sobol(d=3, scramble=True, seed=None)
 
-    # Sample Grid Points using Quasi-Monte Carlo (Sobol sequence)
-    #sample_points = sample_grid_points(
-    #    map_config,
-    #    scene_xml_path=scene_xml_path,
-    #    exclude_buildings=True,
-    #    zone_mask=zone_mask,
-    #    zone_stats=zone_stats,
-    #    qrand=qrand,
-    #    num_points=num_sample_points
-    #)
-
     # Auto-detect zone type from zone_params
     if 'vertices' in zone_params:
         zone_type = 'polygon'
@@ -1601,7 +1580,7 @@ def optimize_boresight_pathsolver(
 
     # Define differentiable loss function using @dr.wrap
     @dr.wrap(source="torch", target="drjit")
-    def compute_loss(azimuth_deg, elevation_deg, qrand_op, num_sample_points, sample_type='CDT', type='log_power'):
+    def compute_loss(azimuth_deg, elevation_deg, qrand_op, num_sample_points, sample_type='CDT', type='threshold'):
         """
         Compute loss with AD enabled through field_calculator only
 
@@ -1659,7 +1638,6 @@ def optimize_boresight_pathsolver(
         tx.orientation = mi.Point3f(yaw_rad_jittered, pitch_rad_jittered, roll_rad)
 
         if sample_type == "CDT":
-            # Generate new sample points using Sobol sequence
             new_sample_points = sample_triangulated_zone(tri_verts=triangles, num_samples=num_sample_points, qrand=qrand_op, ground_z=0.0)
 
         else:
@@ -1837,6 +1815,90 @@ def optimize_boresight_pathsolver(
             lse = max_exponent + dr.log(sum_terms + epsilon)
             loss = (1.0 / alpha) * lse
         
+        elif type == "CVaR":
+            # CVaR-50 (Average of the Bottom 50%)
+            # Optimizes the tail by penalizing users below the dynamic mean.
+            
+            # 1. Setup & Conversion to dB
+            dead_zone_threshold = 1e-30
+            valid_mask = power_relative > dead_zone_threshold
+            epsilon = 1e-30
+            
+            # Convert to dB for stable Hinge Loss calculation
+            # (Linear watts range is too wide for stable subtraction)
+            log_P = dr.log(power_relative + epsilon)
+            val_db = 10.0 * log_P / dr.log(10.0)
+            
+            # 2. Determine the Dynamic Target ("The Waterline")
+            # We calculate the mean of the VALID users to find the 'middle'.
+            # We assume roughly 50% of users will be below this.
+            masked_val_db = dr.select(valid_mask, val_db, 0.0)
+            valid_count = dr.sum(dr.select(valid_mask, 1.0, 0.0))
+            batch_mean = dr.sum(val_db) / (num_sample_points + 1e-5)
+            
+            # CRITICAL: Detach the target.
+            # We want the optimizer to raise the users, NOT lower the target.
+            target = dr.detach(batch_mean)
+            
+            # 3. Calculate Deficit (Hinge Loss)
+            # Deficit > 0 if user is BELOW target (Needs Improvement)
+            # Deficit <= 0 if user is ABOVE target (Ignored)
+            deficit = target - val_db
+            
+            # Apply ReLU (Max(0, x)) and ensure dead zones don't contribute infinite error
+            loss_contribution = dr.maximum(deficit, 0.0)
+            safe_loss = dr.select(valid_mask, loss_contribution, 0.0)
+            
+            # 4. Normalize by the "Tail Count"
+            # We divide by the number of users *contributing* to the loss (the bottom 50%).
+            # This ensures dense gradients even if the tail shrinks.
+            tail_mask = (deficit > 0.0) & valid_mask
+            tail_count = dr.sum(dr.select(tail_mask, 1.0, 0.0))
+            
+            loss = dr.sum(safe_loss) / (tail_count + 1e-5)
+        
+        elif type == "threshold":
+            # Fixed Hinge Loss: "Get everyone above -90 dBm"
+            # This is the most stable way to force the median up.
+            
+            # 1. Define Constants
+            # Dead Threshold: -140 dBm (Users below this are physics-limited/dead)
+            # Target: -90 dBm (The goal line we want users to cross)
+            dead_threshold = 1e-17 
+            target_db = -90.0
+            
+            # 2. Identify "Alive" Users
+            # We only optimize users who have a faint signal trace.
+            # Trying to optimize -200 dBm users causes gradient paralysis.
+            is_alive = power_relative > dead_threshold
+            
+            # 3. Convert to dB (Numerically Safe)
+            # Replace dead values with 1.0 so log(1)=0. 
+            # We will mask the result later, so this placeholder value doesn't matter.
+            epsilon = 1e-30
+            safe_power = dr.select(is_alive, power_relative, 1.0)
+            vals_db = 10.0 * dr.log(safe_power + epsilon) / dr.log(10.0)
+            
+            # 4. Compute Hinge Error
+            # Error = Target - Actual
+            # Positive Error = User is below target (Needs help)
+            # Negative Error = User is above target (Ignore)
+            error = target_db - vals_db
+            
+            # 5. Calculate Loss
+            # If Dead: Loss = 0.0 (Ignore)
+            # If Good (>Target): Loss = 0.0 (Ignore)
+            # If Marginal (Alive but Bad): Loss = Error (Push!)
+            active_loss = dr.select(is_alive, dr.maximum(error, 0.0), 0.0)
+            
+            # 6. Normalize
+            # Only divide by the count of users we are ACTUALLY trying to fix.
+            # This keeps the gradient magnitude consistent.
+            pushing_mask = is_alive & (error > 0)
+            pushing_count = dr.sum(dr.select(pushing_mask, 1.0, 0.0))
+            
+            loss = dr.sum(active_loss) / (pushing_count + 1e-5)
+
         else:
             # Sum Log(Power) -> Penalizes low values
             dead_zone_threshold = 1e-30
@@ -1931,7 +1993,7 @@ def optimize_boresight_pathsolver(
             print(f"  (These should match the naive baseline angles shown above)")
             print(f"{'='*70}\n")
 
-        loss = compute_loss(azimuth, elevation, qrand, num_sample_points, 'Rejection')
+        loss = compute_loss(azimuth, elevation, qrand, num_sample_points, sampler)
 
         # Check if first iteration failed (no paths found)
         if iteration == 0 and hasattr(compute_loss, "_failed_first_iter") and compute_loss._failed_first_iter:
