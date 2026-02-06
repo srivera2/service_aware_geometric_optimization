@@ -9,15 +9,19 @@ Usage:
     python validation.py --output results_custom.pkl --max-scenes 10
 """
 
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend for headless/tmux environments
 import matplotlib.pyplot as plt
 import numpy as np
 import mitsuba as mi
+import drjit as dr
 import warnings
 import sys
 import os
 os.environ["DRJIT_LIBLLVM_PATH"] = "/usr/lib/x86_64-linux-gnu/libLLVM.so.20.1"
 import pickle
 import argparse
+import gc
 from datetime import datetime
 
 # Add the src directory to the Python path
@@ -44,7 +48,7 @@ CONFIG = {
 
     # Test matrix
     'samplers': ["Rejection", "CDT"],
-    'frequencies': [1.0e9, 3.0e9, 5.0e9, 7.0e9, 9.0e9],
+    'frequencies': [1.0e9, 5.0e9, 9.0e9],
     'lds_methods': ["Sobol", "Halton", "Latin"],
 
     # Map configuration
@@ -77,7 +81,7 @@ CONFIG = {
 
     # Optimization settings
     'optimization': {
-        'num_sample_points': 50,
+        'num_sample_points': 64,
         'learning_rate': 2.0,
         'num_iterations': 100,
     },
@@ -321,8 +325,23 @@ def run_validation(config=None):
                     improvement = np.median(zone_power_optimized) - np.median(zone_power_initial)
                     print(f"    Median improvement: {improvement:+.2f} dB")
 
+                    # Flush DrJIT caches between configs to prevent JIT state buildup
+                    dr.flush_malloc_cache()
+
         print(f"\nCompleted {scene_name}")
         print("=" * 80 + "\n")
+
+        # Release scene resources to prevent memory accumulation
+        del scene, tx, tx_placer, zone_mask
+        gc.collect()
+
+        # Flush DrJIT's internal JIT kernel cache and malloc cache
+        # Without this, compiled LLVM kernels accumulate across scenes and
+        # eventually exhaust memory, causing the process to hang
+        dr.flush_kernel_cache()
+        dr.flush_malloc_cache()
+        if mi.variant().startswith("cuda"):
+            mi.cuda_malloc_trim()
 
     return results
 
