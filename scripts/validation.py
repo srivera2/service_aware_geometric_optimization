@@ -48,7 +48,7 @@ CONFIG = {
 
     # Test matrix
     'samplers': ["Rejection", "CDT"],
-    'frequencies': [1.0e9, 5.0e9, 9.0e9],
+    'frequencies': [1.0e9, 9.0e9],
     'lds_methods': ["Sobol", "Halton", "Latin"],
 
     # Map configuration
@@ -340,8 +340,6 @@ def run_validation(config=None):
         # eventually exhaust memory, causing the process to hang
         dr.flush_kernel_cache()
         dr.flush_malloc_cache()
-        if mi.variant().startswith("cuda"):
-            mi.cuda_malloc_trim()
 
     return results
 

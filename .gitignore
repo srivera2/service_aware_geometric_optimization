@@ -1,0 +1,3 @@
+scene/scenes/*
+scripts/nohup.out
+scripts/*.pkl
