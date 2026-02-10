@@ -1447,6 +1447,10 @@ def optimize_boresight_pathsolver(
     # TX height already extracted above (tx_z is already detached)
     tx_height = tx_z
 
+    # Initialize TxPlacement for accessing building info and edge projection
+    # We need this regardless of tx_placement_mode for the edge constraint
+    tx_placement = TxPlacement(scene, tx_name, scene_xml_path, building_id, create_if_missing=False)
+
     # Handle TX placement based on mode
     if tx_placement_mode == "skip":
         # Don't move the TX - use its current position
@@ -1459,9 +1463,6 @@ def optimize_boresight_pathsolver(
                 f"  Current TX position: ({x_start_position:.2f}, {y_start_position:.2f}, {tx_height:.2f})"
             )
     else:
-        # Initialize TxPlacement for modes that need to move the TX
-        tx_placement = TxPlacement(scene, tx_name, scene_xml_path, building_id)
-
         # Sets the initial location based on mode
         if tx_placement_mode == "center":
             tx_placement.set_rooftop_center()
@@ -1580,7 +1581,7 @@ def optimize_boresight_pathsolver(
 
     # Define differentiable loss function using @dr.wrap
     @dr.wrap(source="torch", target="drjit")
-    def compute_loss(azimuth_deg, elevation_deg, qrand_op, num_sample_points, sample_type='CDT', type='threshold'):
+    def compute_loss(azimuth_deg, elevation_deg, qrand_op, num_sample_points, sample_type='Rej', type='CVaR'):
         """
         Compute loss with AD enabled through field_calculator only
 
@@ -1600,6 +1601,8 @@ def optimize_boresight_pathsolver(
         # We need to access .array to get the actual DrJit scalars
         dr.enable_grad(azimuth_deg.array)
         dr.enable_grad(elevation_deg.array)
+        #dr.enable_grad(tx_x.array)
+        #dr.enable_grad(tx_y.array)
 
         # Convert degrees to radians for angle conversion
         # Use DrJit's pi constant for differentiability
@@ -1607,7 +1610,7 @@ def optimize_boresight_pathsolver(
         dr.disable_grad(deg_to_rad)  # Conversion factor is constant
 
         # Remember to bring this back to .array
-        azimuth_rad = azimuth_deg * deg_to_rad
+        azimuth_rad = azimuth_deg.array * deg_to_rad
         elevation_rad = elevation_deg.array * deg_to_rad
 
         # Convert azimuth/elevation to yaw/pitch (roll = 0)
@@ -1620,7 +1623,7 @@ def optimize_boresight_pathsolver(
 
         # Adding jitter to smooth out the "Needle" effect and avoid overfitting to sample points
         # Use numpy for random jitter since this happens outside the differentiable path
-        jitter_std_deg = 0.3  # Small jitter in degrees
+        jitter_std_deg = 0.1  # Small jitter in degrees
         jitter_std_rad = jitter_std_deg * (np.pi / 180.0)
 
         # Generate random jitter using numpy (converted to DrJit Float)
@@ -1636,6 +1639,9 @@ def optimize_boresight_pathsolver(
         # Set antenna orientation directly using yaw, pitch, roll
         tx = scene.get(tx_name)
         tx.orientation = mi.Point3f(yaw_rad_jittered, pitch_rad_jittered, roll_rad)
+
+        # TX position is set externally before optimization starts
+        # (Position optimization removed due to DrJit kernel complexity issues)
 
         if sample_type == "CDT":
             new_sample_points = sample_triangulated_zone(tri_verts=triangles, num_samples=num_sample_points, qrand=qrand_op, ground_z=0.0)
@@ -1916,6 +1922,14 @@ def optimize_boresight_pathsolver(
     elevation = torch.tensor(
         initial_elevation, device="cuda", dtype=torch.float32, requires_grad=True
     )
+    # Adding in transmitter positions x, y
+    # Ignoring z for now
+    tx_x = torch.tensor(
+        tx_position[0], device="cuda", dtype=torch.float32, requires_grad = True
+    )
+    tx_y = torch.tensor(
+        tx_position[1], device="cuda", dtype=torch.float32, requires_grad = True
+    )
 
     print(f"\n{'='*70}")
     print("PYTORCH TENSOR INITIALIZATION")
@@ -2053,8 +2067,9 @@ def optimize_boresight_pathsolver(
                 f"  Loss: {loss.item():.4f}, Mean Power in Zone: {mean_power_in_zone_dbm:.2f} dBm"
             )
 
+        # Clip the norm to control the optimization behavior
         torch.nn.utils.clip_grad_norm_(elevation.grad, max_norm=0.5)
-        torch.nn.utils.clip_grad_norm_(elevation.grad, max_norm=0.5)
+        torch.nn.utils.clip_grad_norm_(azimuth.grad, max_norm=0.5)
 
         # Update
         optimizer.step()
@@ -2070,6 +2085,18 @@ def optimize_boresight_pathsolver(
             # Wrap azimuth around if needed (360° → 0°)
             if azimuth.item() >= 360.0:
                 azimuth.fill_(azimuth.item() % 360.0)
+
+        # Apply constraints on Transmitter Position
+        # Constrain to the edge of the building boundary
+        with torch.no_grad():
+            # Project tx_x, tx_y to the nearest point on the building edge
+            proj_x, proj_y = tx_placement.project_to_polygon_edge(
+                tx_x.item(),
+                tx_y.item()
+            )
+            # Update the tensors to be on the edge
+            tx_x.copy_(torch.tensor(proj_x, device="cuda", dtype=torch.float32))
+            tx_y.copy_(torch.tensor(proj_y, device="cuda", dtype=torch.float32))
 
         # Track
         loss_history.append(loss.item())

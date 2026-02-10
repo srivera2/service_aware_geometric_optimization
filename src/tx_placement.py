@@ -61,6 +61,37 @@ class TxPlacement:
         nearest_point = boundary.interpolate(boundary.project(point))
         return float(nearest_point.x), float(nearest_point.y)
 
+    def project_to_polygon_edge(self, x, y):
+        """
+        Project point (x, y) to the nearest point on the polygon boundary (edge).
+        Unlike project_to_polygon, this ALWAYS projects to the edge, even if the
+        point is inside the polygon.
+
+        Parameters:
+        -----------
+        x : float
+            X coordinate
+        y : float
+            Y coordinate
+
+        Returns:
+        --------
+        proj_x : float
+            Projected X coordinate on the edge
+        proj_y : float
+            Projected Y coordinate on the edge
+        """
+        # Extract 2D coordinates from vertices
+        vertices_2d = self.building['vertices'][:, :2]  # Take only x, y columns
+
+        point = Point(float(x), float(y))
+        poly = Polygon(vertices_2d)
+
+        # Always project to the boundary (edge), regardless of whether inside or outside
+        boundary = poly.boundary
+        nearest_point = boundary.interpolate(boundary.project(point))
+        return float(nearest_point.x), float(nearest_point.y)
+
     def set_rooftop_center(self):
         """
         Places the transmitter at the center of the building's roof with optional offset.
