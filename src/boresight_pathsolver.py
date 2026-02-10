@@ -1581,7 +1581,11 @@ def optimize_boresight_pathsolver(
 
     # Define differentiable loss function using @dr.wrap
     @dr.wrap(source="torch", target="drjit")
+<<<<<<< HEAD
     def compute_loss(azimuth_deg, elevation_deg, qrand_op, num_sample_points, sample_type='Rej', type='CVaR'):
+=======
+    def compute_loss(azimuth_deg, elevation_deg, qrand_op, num_sample_points, sample_type='CDT', type='CVaR'):
+>>>>>>> 27f2badbc1a7403e753072e310ce873ff86bc56b
         """
         Compute loss with AD enabled through field_calculator only
 
