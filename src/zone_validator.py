@@ -40,8 +40,8 @@ def validate_zone_coverage(
         Name of the transmitter
     zone_mask : np.ndarray
         Binary mask defining the target zone
-    zone_stats : dict
-        Zone statistics from create_zone_mask()
+    zone_params : dict
+        Zone parameters (must contain 'center', 'width', 'height')
     map_config : dict
         Map configuration with 'center', 'size', 'cell_size'
     p10_min_dbm : float
@@ -269,12 +269,12 @@ def find_valid_zone(
     --------
     zone_mask : np.ndarray or None
         Valid zone mask, or None if no valid zone found
-    zone_stats : dict or None
-        Zone statistics, or None if no valid zone found
+    zone_params : dict or None
+        Zone parameters (containing 'center', 'width', 'height'), or None if no valid zone found
     zone_center : list or None
         [x, y] coordinates of zone center, or None if no valid zone found
     validation_stats : dict or None
-        Validation statistics for the found zone
+        Validation statistics for the found zone, or None if no valid zone found
     attempt_count : int
         Number of attempts taken
     """
@@ -339,7 +339,8 @@ def find_valid_zone(
         if is_valid:
             if verbose:
                 print(f"\n✓ Found valid zone after {attempt + 1} attempt(s)!")
-            return zone_mask, [zone_center_x, zone_center_y], validation_stats, attempt + 1
+            # Return zone_params directly (no longer wrapping in zone_stats)
+            return zone_mask, zone_params, [zone_center_x, zone_center_y], validation_stats, attempt + 1
 
     if verbose:
         print(f"\n✗ Failed to find valid zone after {max_attempts} attempts")

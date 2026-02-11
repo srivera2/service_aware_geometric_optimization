@@ -336,7 +336,7 @@ def run_validation(config=None, checkpoint_file='validation_checkpoint.pkl',
                 verbose=True
             )
 
-        # find_valid_zone returns 4 values on success, 5 on failure
+        # find_valid_zone returns 5 values: zone_mask, zone_params, zone_center, validation_stats, attempts
         if zone_result[0] is None:
             attempts = zone_result[-1]
             print(f"Could not find valid zone after {attempts} attempts - skipping\n")
@@ -355,12 +355,12 @@ def run_validation(config=None, checkpoint_file='validation_checkpoint.pkl',
             dr.flush_malloc_cache()
             continue
 
-        zone_mask, zone_center, validation_stats, attempts = zone_result
+        zone_mask, zone_params, zone_center, validation_stats, attempts = zone_result
 
         zone_center_x, zone_center_y = zone_center
 
-        # Reconstruct zone_params and get zone_stats from create_zone_mask
-        zone_params = {**config['zone_params_template'], 'center': [zone_center_x, zone_center_y]}
+        # Create zone_stats for compatibility with create_zone_mask if needed elsewhere
+        # (zone_params is now returned directly from find_valid_zone)
         _, _, zone_stats = create_zone_mask(
             map_config=config['map_config'],
             zone_type='box',
@@ -413,7 +413,6 @@ def run_validation(config=None, checkpoint_file='validation_checkpoint.pkl',
                                     scene_xml_path=scene_xml_path,
                                     zone_mask=zone_mask,
                                     zone_params=zone_params,
-                                    zone_stats=zone_stats,
                                     num_sample_points=config['optimization']['num_sample_points'],
                                     learning_rate=config['optimization']['learning_rate'],
                                     num_iterations=config['optimization']['num_iterations'],

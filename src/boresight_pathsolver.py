@@ -581,7 +581,7 @@ def sample_grid_points(
     scene_xml_path=None,
     exclude_buildings=True,
     zone_mask=None,
-    zone_stats=None,
+    zone_params=None,
     qrand=None,
     # Making the number of points configurable from now on
     num_points=20,
@@ -637,11 +637,17 @@ def sample_grid_points(
             inside_building = contains_xy(building_poly, x_coords, y_coords)
             valid_mask &= ~inside_building
         return valid_mask
+    
+    print(zone_params)
+    print(qrand)
 
     # Quasi-random sampling in continuous space within the zone
-    if zone_stats is not None and qrand is not None:
-        zone_params = zone_stats.get("zone_params")
-        zone_center = zone_params.get("center", zone_stats["look_at_xyz"][:2])
+    if zone_params is not None and qrand is not None:
+        # Extract zone parameters directly
+        zone_center = zone_params.get("center")
+        if zone_center is None:
+            # Fallback: compute from map_config if center not in zone_params
+            zone_center = [map_config["center"][0], map_config["center"][1]]
         zone_width = zone_params["width"]
         zone_height = zone_params["height"]
 
@@ -1017,6 +1023,8 @@ def compare_boresight_performance(
     zone_mask,
     naive_angles,
     optimized_angles,
+    naive_transmitter_pos=None,
+    optimized_transmitter_pos=None,
     title="Boresight Optimization Comparison",
 ):
     """
@@ -1039,6 +1047,10 @@ def compare_boresight_performance(
         [azimuth_deg, elevation_deg] naive baseline antenna angles
     optimized_angles : list or array
         [azimuth_deg, elevation_deg] optimized antenna angles
+    naive_transmitter_pos : list or array, optional
+        [x, y, z] naive baseline transmitter position
+    optimized_transmitter_pos : list or array, optional
+        [x, y, z] optimized transmitter position
     title : str
         Title for the comparison plot
 
@@ -1057,9 +1069,9 @@ def compare_boresight_performance(
 
     results = {}
 
-    for config_name, angles in [
-        ("Naive Baseline", naive_angles),
-        ("Optimized", optimized_angles),
+    for config_name, angles, tx_pos in [
+        ("Naive Baseline", naive_angles, naive_transmitter_pos),
+        ("Optimized", optimized_angles, optimized_transmitter_pos),
     ]:
         print(f"Computing RadioMap for {config_name}...")
 
@@ -1067,6 +1079,11 @@ def compare_boresight_performance(
         azimuth_deg, elevation_deg = angles[0], angles[1]
         yaw_rad, pitch_rad = azimuth_elevation_to_yaw_pitch(azimuth_deg, elevation_deg)
         tx.orientation = mi.Point3f(float(yaw_rad), float(pitch_rad), 0.0)
+
+        # Set transmitter position if provided
+        if tx_pos is not None:
+            tx.position = mi.Point3f(tx_pos)
+            #print(f"  Position: x={tx_pos[0]:.2f}, y={tx_pos[1]:.2f}, z={tx_pos[2]:.2f}")
 
         print(f"  Angles: Azimuth={azimuth_deg:.1f}°, Elevation={elevation_deg:.1f}°")
 
@@ -1082,8 +1099,6 @@ def compare_boresight_performance(
             los=True,
             specular_reflection=True,
             diffuse_reflection=False,
-            diffraction=True,
-            edge_diffraction=True,
             refraction=False,
             stop_threshold=None,
         )
@@ -1389,7 +1404,6 @@ def optimize_boresight_pathsolver(
     map_config,
     scene_xml_path,
     zone_mask=None,
-    zone_stats=None,
     zone_params=None,
     num_sample_points=100,
     building_id=10,
@@ -1419,10 +1433,20 @@ def optimize_boresight_pathsolver(
 
     # Get TX position for angle calculations
     tx = scene.get(tx_name)
-    tx_x = float(dr.detach(tx.position[0])[0])
-    tx_y = float(dr.detach(tx.position[1])[0])
-    tx_z = float(dr.detach(tx.position[2])[0])
+    #tx_x = float(dr.detach(tx.position[0])[0])
+    #tx_y = float(dr.detach(tx.position[1])[0])
+    #tx_z = float(dr.detach(tx.position[2])[0])
+    #tx_position = [tx_x, tx_y, tx_z]
+
+    # Get TX position (new)
+    tx = scene.get(tx_name)
+    tx_x = tx.position[0]
+    tx_y = tx.position[1]
+    tx_z = tx.position[2]
     tx_position = [tx_x, tx_y, tx_z]
+
+    # Save initial position (detached from AD graph)
+    initial_tx_position = [dr.detach(tx_position[i]) for i in range(3)]
 
     # Get transmit power for proper power calculation
     tx_power_dbm = float(tx.power_dbm[0])
@@ -1460,7 +1484,7 @@ def optimize_boresight_pathsolver(
         if verbose:
             print(f"TX placement mode: skip (using current position)")
             print(
-                f"  Current TX position: ({x_start_position:.2f}, {y_start_position:.2f}, {tx_height:.2f})"
+                #f"  Current TX position: ({x_start_position:.2f}, {y_start_position:.2f}, {tx_height:.2f})"
             )
     else:
         # Sets the initial location based on mode
@@ -1479,9 +1503,9 @@ def optimize_boresight_pathsolver(
             )
 
     if verbose:
-        print(f"TX height: {tx_height:.1f}m")
+        #print(f"TX height: {tx_height:.1f}m")
         print(
-            f"Boresight Z constraint: must be < {tx_height:.1f}m (no pointing upward)\n"
+            #f"Boresight Z constraint: must be < {tx_height:.1f}m (no pointing upward)\n"
         )
 
     # Select LDS from available list
@@ -1581,11 +1605,7 @@ def optimize_boresight_pathsolver(
 
     # Define differentiable loss function using @dr.wrap
     @dr.wrap(source="torch", target="drjit")
-<<<<<<< HEAD
-    def compute_loss(azimuth_deg, elevation_deg, qrand_op, num_sample_points, sample_type='Rej', type='CVaR'):
-=======
-    def compute_loss(azimuth_deg, elevation_deg, qrand_op, num_sample_points, sample_type='CDT', type='CVaR'):
->>>>>>> 27f2badbc1a7403e753072e310ce873ff86bc56b
+    def compute_loss(azimuth_deg, elevation_deg, x_pos, y_pos, qrand_op, num_sample_points, sample_type='Rej', loss_type='LSE'):
         """
         Compute loss with AD enabled through field_calculator only
 
@@ -1603,8 +1623,15 @@ def optimize_boresight_pathsolver(
         # CRITICAL: Enable gradients for each input parameter
         # The @dr.wrap decorator converts PyTorch 0-D tensors → DrJit Float scalars
         # We need to access .array to get the actual DrJit scalars
+
+        # DEBUG: Print types to understand TensorXf vs Float conversion
+
         dr.enable_grad(azimuth_deg.array)
         dr.enable_grad(elevation_deg.array)
+        # Position gradients
+        dr.enable_grad(x_pos.array)
+        dr.enable_grad(y_pos.array)
+        #dr.enable_grad(tx_y.array)
         #dr.enable_grad(tx_x.array)
         #dr.enable_grad(tx_y.array)
 
@@ -1614,8 +1641,8 @@ def optimize_boresight_pathsolver(
         dr.disable_grad(deg_to_rad)  # Conversion factor is constant
 
         # Remember to bring this back to .array
-        azimuth_rad = azimuth_deg.array * deg_to_rad
-        elevation_rad = elevation_deg.array * deg_to_rad
+        azimuth_rad = azimuth_deg * deg_to_rad
+        elevation_rad = elevation_deg * deg_to_rad
 
         # Convert azimuth/elevation to yaw/pitch (roll = 0)
         # yaw = azimuth (rotation around Z-axis)
@@ -1641,11 +1668,15 @@ def optimize_boresight_pathsolver(
         pitch_rad_jittered = pitch_rad + pitch_jitter
 
         # Set antenna orientation directly using yaw, pitch, roll
-        tx = scene.get(tx_name)
-        tx.orientation = mi.Point3f(yaw_rad_jittered, pitch_rad_jittered, roll_rad)
+        scene.get(tx_name).orientation = [yaw_rad_jittered, pitch_rad_jittered, roll_rad]
+        print(f"TX orientation: {scene.get(tx_name).orientation}")
 
-        # TX position is set externally before optimization starts
-        # (Position optimization removed due to DrJit kernel complexity issues)
+        # Minimal arithmetic - just identity to register in gradient graph
+        x_pos_val = x_pos * dr.auto.ad.Float(1.0)
+        y_pos_val = y_pos * dr.auto.ad.Float(1.0)
+
+        scene.get(tx_name).position = [x_pos_val, y_pos_val, tx_position[2]]
+        print(f"Tx position: {scene.get(tx_name).position}")
 
         if sample_type == "CDT":
             new_sample_points = sample_triangulated_zone(tri_verts=triangles, num_samples=num_sample_points, qrand=qrand_op, ground_z=0.0)
@@ -1657,7 +1688,7 @@ def optimize_boresight_pathsolver(
                 scene_xml_path=scene_xml_path,
                 exclude_buildings=True,
                 zone_mask=zone_mask,
-                zone_stats=zone_stats,
+                zone_params=zone_params,
                 qrand=qrand_op,
                 num_points=num_sample_points,
                 cached_building_polygons=cached_building_polygons,  # Use pre-cached polygons
@@ -1681,8 +1712,6 @@ def optimize_boresight_pathsolver(
             refraction=False,
             specular_reflection=True,
             diffuse_reflection=False,
-            diffraction=True,
-            edge_diffraction=True,
         )
 
         # Extract channel coefficients
@@ -1808,7 +1837,7 @@ def optimize_boresight_pathsolver(
         )
         power_relative = dr.sum(power_relative, axis=-1)
 
-        if type == "LSE":
+        if loss_type == "LSE":
             # LSE (Soft Min)
             dead_zone_threshold = 1e-30
             valid_mask = power_relative > dead_zone_threshold
@@ -1825,7 +1854,7 @@ def optimize_boresight_pathsolver(
             lse = max_exponent + dr.log(sum_terms + epsilon)
             loss = (1.0 / alpha) * lse
         
-        elif type == "CVaR":
+        elif loss_type == "CVaR":
             # CVaR-50 (Average of the Bottom 50%)
             # Optimizes the tail by penalizing users below the dynamic mean.
             
@@ -1869,7 +1898,7 @@ def optimize_boresight_pathsolver(
             
             loss = dr.sum(safe_loss) / (tail_count + 1e-5)
         
-        elif type == "threshold":
+        elif loss_type == "threshold":
             # Target: -90 dBm (The goal line we want users to cross)
             dead_threshold = 1e-17 
             target_db = -70.0
@@ -1908,9 +1937,12 @@ def optimize_boresight_pathsolver(
         return loss
 
     # Calculate the initial azimuth and elevation angles based on the position of the transmitter + center of the zone
+    # Add z-coordinate (target_height) to zone center which only has [x, y]
+    target_z = map_config.get('target_height', 1.5)
+    look_at_xyz = list(zone_params['center'])[:2] + [target_z]
     initial_azimuth, initial_elevation = compute_initial_angles_from_position(
         [x_start_position, y_start_position, tx_height],
-        zone_stats["look_at_xyz"],
+        look_at_xyz,
         verbose=False,
     )
 
@@ -1928,11 +1960,11 @@ def optimize_boresight_pathsolver(
     )
     # Adding in transmitter positions x, y
     # Ignoring z for now
-    tx_x = torch.tensor(
-        tx_position[0], device="cuda", dtype=torch.float32, requires_grad = True
+    x_pos = torch.tensor(
+        tx_position[0], device="cuda", dtype=torch.float32, requires_grad=True
     )
-    tx_y = torch.tensor(
-        tx_position[1], device="cuda", dtype=torch.float32, requires_grad = True
+    y_pos = torch.tensor(
+        tx_position[1], device="cuda", dtype=torch.float32, requires_grad=True
     )
 
     print(f"\n{'='*70}")
@@ -1940,13 +1972,16 @@ def optimize_boresight_pathsolver(
     print(f"{'='*70}")
     print(f"PyTorch azimuth tensor initialized to: {azimuth.item():.2f}°")
     print(f"PyTorch elevation tensor initialized to: {elevation.item():.2f}°")
-    print(f"These values will be used as starting point for optimization")
+    print(f"PyTorch tx_x tensor initialized to: {x_pos.item():.2f}m")
+    print(f"")
+    print(f"STEP 1: Position parameters created but NOT being optimized yet")
+    print(f"        Testing if passing through @dr.wrap breaks PathSolver")
     print(f"{'='*70}\n")
 
     # Optimizer: Adam shows the best performance
-    # Optimize azimuth and elevation angles directly (2 parameters instead of 3)
-    # Adding a heavier beta term for momentum through noisy measurements
-    optimizer = torch.optim.Adam([azimuth, elevation], lr=learning_rate, betas=(0.98, 0.999))
+    # STEP 1: Only optimize angles (2 parameters)
+    # TODO STEP 3: Add tx_x, tx_y to optimizer after Step 1 passes
+    optimizer = torch.optim.Adam([azimuth, elevation, x_pos, y_pos], lr=learning_rate, betas=(0.98, 0.999))
 
     # Learning rate scheduler: required to jump out of local minima for difficult loss surfaces...
     use_scheduler = num_iterations >= 50
@@ -1995,7 +2030,14 @@ def optimize_boresight_pathsolver(
             print(f"  (These should match the naive baseline angles shown above)")
             print(f"{'='*70}\n")
 
-        loss = compute_loss(azimuth, elevation, qrand, num_sample_points, sampler)
+        # DEBUG: Verify tensor setup before compute_loss
+        if iteration == 0:
+            print(f"[TENSOR DEBUG] azimuth requires_grad: {azimuth.requires_grad}")
+            print(f"[TENSOR DEBUG] elevation requires_grad: {elevation.requires_grad}")
+            print(f"[TENSOR DEBUG] x_pos requires_grad: {x_pos.requires_grad}")
+            print(f"[TENSOR DEBUG] x_pos value: {x_pos.item()}")
+
+        loss = compute_loss(azimuth, elevation, x_pos, y_pos, qrand, num_sample_points, sampler)
 
         # Check if first iteration failed (no paths found)
         if iteration == 0 and hasattr(compute_loss, "_failed_first_iter") and compute_loss._failed_first_iter:
@@ -2009,7 +2051,10 @@ def optimize_boresight_pathsolver(
             print("  - Scene geometry issues")
             print("\nReturning None to signal failure to caller.")
             print("="*70 + "\n")
-            return initial_angles, None, None, None, None, initial_angles
+            initial_pos = [float(tx_position[0]) if hasattr(tx_position[0], 'item') else float(tx_position[0]),
+                           float(tx_position[1]) if hasattr(tx_position[1], 'item') else float(tx_position[1]),
+                           float(tx_position[2]) if hasattr(tx_position[2], 'item') else float(tx_position[2])]
+            return initial_angles, None, None, None, None, initial_angles, initial_pos, initial_pos
 
         # Check if too many failures occurred during optimization
         if hasattr(compute_loss, "_too_many_failures") and compute_loss._too_many_failures:
@@ -2025,10 +2070,23 @@ def optimize_boresight_pathsolver(
             print("  - Extreme antenna angles causing no valid paths")
             print("\nReturning None to signal failure to caller.")
             print("="*70 + "\n")
-            return initial_angles, None, None, None, None, initial_angles
+            initial_pos = [float(tx_position[0]) if hasattr(tx_position[0], 'item') else float(tx_position[0]),
+                           float(tx_position[1]) if hasattr(tx_position[1], 'item') else float(tx_position[1]),
+                           float(tx_position[2]) if hasattr(tx_position[2], 'item') else float(tx_position[2])]
+            return initial_angles, None, None, None, None, initial_angles, initial_pos, initial_pos
 
         optimizer.zero_grad()
+        print("Back-propagating")
         loss.backward()
+
+        # DEBUG: Check gradient computation
+        print(f"[GRAD DEBUG] azimuth.grad: {azimuth.grad}")
+        print(f"[GRAD DEBUG] elevation.grad: {elevation.grad}")
+        print(f"[GRAD DEBUG] x_pos.grad: {x_pos.grad}")
+        if x_pos.grad is not None:
+            print(f"[GRAD DEBUG] x_pos.grad value: {x_pos.grad.item()}")
+        else:
+            print("[GRAD DEBUG] x_pos.grad is None - gradient not computed!")
 
         # Visualize the Sobol sampling pattern (only save every N iterations to reduce file count)
         if save_radiomap_frames and (iteration % frame_save_interval == 0):
@@ -2062,7 +2120,7 @@ def optimize_boresight_pathsolver(
 
         if verbose:
             print(
-                f"  Gradients: dAz={grad_azimuth_val:+.3e}°, dEl={grad_elevation_val:+.3e}° (norm={grad_norm:.3e})"
+                f"  Gradients: dAz={grad_azimuth_val:+.3e}°, dEl={grad_elevation_val:+.3e}°"
             )
             # Convert loss back to mean power in dBm
             # Since loss = -mean(dBm), we just negate it to get mean(dBm)
@@ -2076,6 +2134,7 @@ def optimize_boresight_pathsolver(
         torch.nn.utils.clip_grad_norm_(azimuth.grad, max_norm=0.5)
 
         # Update
+        print("Stepping optimizer")
         optimizer.step()
 
         # Update learning rate if scheduler is enabled
@@ -2092,15 +2151,15 @@ def optimize_boresight_pathsolver(
 
         # Apply constraints on Transmitter Position
         # Constrain to the edge of the building boundary
-        with torch.no_grad():
+        #with torch.no_grad():
             # Project tx_x, tx_y to the nearest point on the building edge
-            proj_x, proj_y = tx_placement.project_to_polygon_edge(
-                tx_x.item(),
-                tx_y.item()
-            )
+        #    proj_x, proj_y = tx_placement.project_to_polygon_edge(
+        #        tx_x.item(),
+        #        tx_y.item()
+        #    )
             # Update the tensors to be on the edge
-            tx_x.copy_(torch.tensor(proj_x, device="cuda", dtype=torch.float32))
-            tx_y.copy_(torch.tensor(proj_y, device="cuda", dtype=torch.float32))
+        #    tx_x.copy_(torch.tensor(proj_x, device="cuda", dtype=torch.float32))
+        #    tx_y.copy_(torch.tensor(proj_y, device="cuda", dtype=torch.float32))
 
         # Track
         loss_history.append(loss.item())
@@ -2111,7 +2170,7 @@ def optimize_boresight_pathsolver(
             # Save the values to a list
             final_az_list = np.append(final_az_list, azimuth.item())
             final_el_list = np.append(final_el_list, elevation.item())
-    
+
     # Save the average of the final 10 values
     best_azimuth_final = np.mean(final_az_list)
     best_elevation_final = np.mean(final_el_list)
@@ -2135,6 +2194,9 @@ def optimize_boresight_pathsolver(
     )
     tx.orientation = mi.Point3f(float(final_yaw_rad), float(final_pitch_rad), 0.0)
 
+    # Extract final position from scene after optimization
+    final_tx_position = [dr.detach(tx.position[i]) for i in range(3)]
+
     # Compute final coverage statistics
     coverage_stats = {
         "loss_type": loss_type,
@@ -2150,10 +2212,12 @@ def optimize_boresight_pathsolver(
         print(
             f"Best angles: Azimuth={best_azimuth_final:.1f}°, Elevation={best_elevation_final:.1f}°"
         )
+        #if final_tx_position[0] != initial_tx_position[0]:
+        #    print(f"TX Position change (Δx): {final_tx_position[0] - initial_tx_position[0]:.2f}m")
         print(f"Total time: {elapsed_time:.1f}s")
         print(f"Time per iteration: {elapsed_time/num_iterations:.2f}s")
         print(f"{'='*70}\n")
 
-    # Return angles instead of Cartesian coordinates
+    # Return angles and positions
     best_angles = [best_azimuth_final, best_elevation_final]
-    return best_angles, loss_history, angle_history, gradient_history, coverage_stats, initial_angles
+    return best_angles, loss_history, angle_history, gradient_history, coverage_stats, initial_angles, initial_tx_position, final_tx_position
