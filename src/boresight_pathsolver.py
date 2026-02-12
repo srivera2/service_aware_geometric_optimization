@@ -1098,7 +1098,7 @@ def compare_boresight_performance(
             size=map_config["size"],
             los=True,
             specular_reflection=True,
-            diffuse_reflection=False,
+            diffuse_reflection=True,
             refraction=False,
             stop_threshold=None,
         )
@@ -1605,7 +1605,7 @@ def optimize_boresight_pathsolver(
 
     # Define differentiable loss function using @dr.wrap
     @dr.wrap(source="torch", target="drjit")
-    def compute_loss(azimuth_deg, elevation_deg, x_pos, y_pos, qrand_op, num_sample_points, sample_type='Rej', loss_type='LSE'):
+    def compute_loss(azimuth_deg, elevation_deg, x_pos, y_pos, qrand_op, num_sample_points, sample_type='Rej', loss_type='CVaR'):
         """
         Compute loss with AD enabled through field_calculator only
 
@@ -1711,7 +1711,7 @@ def optimize_boresight_pathsolver(
             los=True,
             refraction=False,
             specular_reflection=True,
-            diffuse_reflection=False,
+            diffuse_reflection=True,
         )
 
         # Extract channel coefficients
@@ -1881,23 +1881,26 @@ def optimize_boresight_pathsolver(
             # We want the optimizer to raise the users, NOT lower the target.
             target = dr.detach(batch_mean)
             
-            # 3. Calculate Deficit (Hinge Loss)
-            # Deficit > 0 if user is BELOW target (Needs Improvement)
-            # Deficit <= 0 if user is ABOVE target (Ignored)
+            # 3. Deficit-Weighted (Quadratic) Hinge Loss
+            # Squaring the hinge amplifies gradient from the weakest receivers:
+            #   1 dB below mean  → gradient = 2
+            #   10 dB below mean → gradient = 20
+            #   30 dB below mean → gradient = 60
+            # This focuses the optimizer on the worst performers without any
+            # adversarial counter-gradient from a surplus penalty.
             deficit = target - val_db
-            
-            # Apply ReLU (Max(0, x)) and ensure dead zones don't contribute infinite error
-            loss_contribution = dr.maximum(deficit, 0.0)
+            hinge = dr.maximum(deficit, 0.0)
+            loss_contribution = hinge * hinge
             safe_loss = dr.select(valid_mask, loss_contribution, 0.0)
-            
+
             # 4. Normalize by the "Tail Count"
             # We divide by the number of users *contributing* to the loss (the bottom 50%).
             # This ensures dense gradients even if the tail shrinks.
             tail_mask = (deficit > 0.0) & valid_mask
             tail_count = dr.sum(dr.select(tail_mask, 1.0, 0.0))
-            
+
             loss = dr.sum(safe_loss) / (tail_count + 1e-5)
-        
+
         elif loss_type == "threshold":
             # Target: -90 dBm (The goal line we want users to cross)
             dead_threshold = 1e-17 
@@ -1981,22 +1984,23 @@ def optimize_boresight_pathsolver(
     # Optimizer: Adam shows the best performance
     # STEP 1: Only optimize angles (2 parameters)
     # TODO STEP 3: Add tx_x, tx_y to optimizer after Step 1 passes
-    optimizer = torch.optim.Adam([azimuth, elevation, x_pos, y_pos], lr=learning_rate, betas=(0.98, 0.999))
+    optimizer = torch.optim.Adam([azimuth, elevation, x_pos, y_pos], lr=learning_rate, betas=(0.9, 0.999))
 
     # Learning rate scheduler: required to jump out of local minima for difficult loss surfaces...
     use_scheduler = num_iterations >= 50
 
     if use_scheduler:
-        # Use exponential decay for smoother convergence after grid search
-        # This is more stable than ReduceLROnPlateau for noisy loss landscapes
-        scheduler = torch.optim.lr_scheduler.ExponentialLR(
-            optimizer, gamma=0.95  # Decay by 5% each iteration (smooth reduction)
+        # Cosine annealing with warm restarts: periodically resets LR to escape local minima.
+        # T_0 = restart period (iterations), T_mult = multiply period after each restart.
+        # With T_0=25, T_mult=2: restarts at iter 25, 75 (25+50), giving 3 exploration phases.
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer, T_0=25, T_mult=2, eta_min=learning_rate * 0.01
         )
         if verbose:
-            print(f"Learning rate scheduler enabled (exponential decay, gamma=0.95)")
+            print(f"Learning rate scheduler enabled (cosine annealing with warm restarts)")
             print(f"  Initial LR: {learning_rate:.4f}")
-            print(f"  LR after 50 iters: {learning_rate * (0.95**50):.6f}")
-            print(f"  LR after 100 iters: {learning_rate * (0.95**100):.6f}")
+            print(f"  Restart period: T_0=25, T_mult=2 (restarts at iter 25, 75)")
+            print(f"  Min LR: {learning_rate * 0.01:.6f}")
 
     # Create output directory for frame saving
     if save_radiomap_frames:
@@ -2129,9 +2133,9 @@ def optimize_boresight_pathsolver(
                 f"  Loss: {loss.item():.4f}, Mean Power in Zone: {mean_power_in_zone_dbm:.2f} dBm"
             )
 
-        # Clip the norm to control the optimization behavior
-        torch.nn.utils.clip_grad_norm_(elevation.grad, max_norm=0.5)
-        torch.nn.utils.clip_grad_norm_(azimuth.grad, max_norm=0.5)
+        # No gradient clipping — Adam's adaptive second moment handles gradient
+        # scaling natively. External clipping destroys the quadratic hinge's
+        # differential signal (weak users should produce larger gradients).
 
         # Update
         print("Stepping optimizer")
@@ -2150,16 +2154,14 @@ def optimize_boresight_pathsolver(
                 azimuth.fill_(azimuth.item() % 360.0)
 
         # Apply constraints on Transmitter Position
-        # Constrain to the edge of the building boundary
-        #with torch.no_grad():
-            # Project tx_x, tx_y to the nearest point on the building edge
-        #    proj_x, proj_y = tx_placement.project_to_polygon_edge(
-        #        tx_x.item(),
-        #        tx_y.item()
-        #    )
-            # Update the tensors to be on the edge
-        #    tx_x.copy_(torch.tensor(proj_x, device="cuda", dtype=torch.float32))
-        #    tx_y.copy_(torch.tensor(proj_y, device="cuda", dtype=torch.float32))
+        # Constrain to the roof polygon (interior is fine, snap to edge if outside)
+        with torch.no_grad():
+            proj_x, proj_y = tx_placement.project_to_polygon(
+                x_pos.item(),
+                y_pos.item()
+            )
+            x_pos.data.fill_(proj_x)
+            y_pos.data.fill_(proj_y)
 
         # Track
         loss_history.append(loss.item())
