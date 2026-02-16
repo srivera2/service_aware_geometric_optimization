@@ -125,3 +125,42 @@ class TxPlacement:
             return p_tx
 
         return place_on_line
+
+    def get_start_positions(self, simplify_tolerance=1.0):
+        """
+        Returns diverse starting positions from the roof polygon vertices + centroid.
+        Uses Shapely simplify() to reduce mesh vertices to key polygon corners.
+
+        Parameters:
+        -----------
+        simplify_tolerance : float
+            Tolerance for Shapely polygon simplification (meters).
+            Higher values → fewer vertices. Default 1.0m works well
+            for typical building polygons.
+
+        Returns:
+        --------
+        positions : list of [x, y]
+            Diverse starting positions, all guaranteed inside the polygon.
+        """
+        vertices_2d = self.building['vertices'][:, :2]
+        poly = Polygon(vertices_2d)
+
+        # Simplify to key corners (removes collinear/near-collinear points)
+        simplified = poly.simplify(simplify_tolerance, preserve_topology=True)
+        corner_coords = list(simplified.exterior.coords[:-1])  # Drop duplicate closing vertex
+
+        # Add centroid
+        centroid = poly.centroid
+        positions = [[centroid.x, centroid.y]]
+
+        # Add simplified vertices, projecting to interior if simplification shifted them outside
+        for x, y in corner_coords:
+            pt = Point(x, y)
+            if poly.contains(pt) or poly.touches(pt):
+                positions.append([x, y])
+            else:
+                proj_x, proj_y = self.project_to_polygon(x, y)
+                positions.append([proj_x, proj_y])
+
+        return positions

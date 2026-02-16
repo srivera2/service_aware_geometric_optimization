@@ -1496,7 +1496,7 @@ def optimize_boresight_pathsolver(
             x_start_position = Tx_start_pos[0]
             y_start_position = Tx_start_pos[1]
             z_pos = tx_placement.building["z_height"]
-            tx.position = mi.Point3f(x_start_position, y_start_position, z_pos)
+            tx.position = mi.Point3f(float(x_start_position), float(y_start_position), float(z_pos))
         else:
             raise ValueError(
                 f"Unknown tx_placement_mode: {tx_placement_mode}. Must be 'skip', 'center', 'fixed', or 'line'"
@@ -1654,7 +1654,7 @@ def optimize_boresight_pathsolver(
 
         # Adding jitter to smooth out the "Needle" effect and avoid overfitting to sample points
         # Use numpy for random jitter since this happens outside the differentiable path
-        jitter_std_deg = 0.1  # Small jitter in degrees
+        jitter_std_deg = .5  # Small jitter in degrees
         jitter_std_rad = jitter_std_deg * (np.pi / 180.0)
 
         # Generate random jitter using numpy (converted to DrJit Float)
@@ -1678,21 +1678,17 @@ def optimize_boresight_pathsolver(
         scene.get(tx_name).position = [x_pos_val, y_pos_val, tx_position[2]]
         print(f"Tx position: {scene.get(tx_name).position}")
 
-        if sample_type == "CDT":
-            new_sample_points = sample_triangulated_zone(tri_verts=triangles, num_samples=num_sample_points, qrand=qrand_op, ground_z=0.0)
-
-        else:
-            # Sample Grid Points using Quasi-Monte Carlo (Sobol sequence)
-            new_sample_points = sample_grid_points(
-                map_config,
-                scene_xml_path=scene_xml_path,
-                exclude_buildings=True,
-                zone_mask=zone_mask,
-                zone_params=zone_params,
-                qrand=qrand_op,
-                num_points=num_sample_points,
-                cached_building_polygons=cached_building_polygons,  # Use pre-cached polygons
-            )
+        # Sample grid points via rejection sampling (global)
+        new_sample_points = sample_grid_points(
+            map_config,
+            scene_xml_path=scene_xml_path,
+            exclude_buildings=True,
+            zone_mask=zone_mask,
+            zone_params=zone_params,
+            qrand=qrand_op,
+            num_points=num_sample_points,
+            cached_building_polygons=cached_building_polygons,  # Use pre-cached polygons
+        )
 
         # Store for visualization outside the loss function
         sample_points_storage['current'] = new_sample_points
@@ -1855,51 +1851,29 @@ def optimize_boresight_pathsolver(
             loss = (1.0 / alpha) * lse
         
         elif loss_type == "CVaR":
-            # CVaR-50 (Average of the Bottom 50%)
-            # Optimizes the tail by penalizing users below the dynamic mean.
-            
-            # Remove dead zones from gradient calculations
-            dead_zone_threshold = 1e-30
-            valid_mask = power_relative > dead_zone_threshold
-            epsilon = 1e-30
-            
-            # Convert to dB for stable Hinge Loss calculation
-            # (Linear watts range is too wide for stable subtraction)
-            log_P = dr.log(power_relative + epsilon)
-            val_db = 10.0 * log_P / dr.log(10.0)
-            
-            # 2. Determine the Dynamic Target ("The Waterline")
-            # We calculate the mean of the VALID users to find the 'middle'.
-            # We assume roughly 50% of users will be below this.
-            
-            masked_val_db = dr.select(valid_mask, val_db, 0.0)
-            valid_count = dr.sum(dr.select(valid_mask, 1.0, 0.0))
-            
-            batch_mean = dr.sum(masked_val_db) / (valid_count + 1e-5)
-            
-            # CRITICAL: Detach the target.
-            # We want the optimizer to raise the users, NOT lower the target.
-            target = dr.detach(batch_mean)
-            
+            # 1. Convert to dB and Floor Clamp
+            # -120dB floor provides a finite gradient for dead zones
+            val_db = 10.0 * dr.log(power_relative + 1e-35) / dr.log(10.0)
+
+            # 2. Determine the Target via NumPy (The Waterline)
+            # We detach to ensure the goalpost doesn't "cheat" by moving itself
+            val_db_np = np.array(dr.detach(val_db))
+            target_scalar = np.median(val_db_np)
+            target = type(val_db)(target_scalar)
+
             # 3. Deficit-Weighted (Quadratic) Hinge Loss
-            # Squaring the hinge amplifies gradient from the weakest receivers:
-            #   1 dB below mean  → gradient = 2
-            #   10 dB below mean → gradient = 20
-            #   30 dB below mean → gradient = 60
-            # This focuses the optimizer on the worst performers without any
-            # adversarial counter-gradient from a surplus penalty.
             deficit = target - val_db
             hinge = dr.maximum(deficit, 0.0)
             loss_contribution = hinge * hinge
-            safe_loss = dr.select(valid_mask, loss_contribution, 0.0)
 
-            # 4. Normalize by the "Tail Count"
-            # We divide by the number of users *contributing* to the loss (the bottom 50%).
-            # This ensures dense gradients even if the tail shrinks.
-            tail_mask = (deficit > 0.0) & valid_mask
+            # 4. Normalize by the Tail Count
+            # This is the "Conditional" part of CVaR. 
+            # We only average over the users who are actually failing.
+            tail_mask = deficit > 0.0
             tail_count = dr.sum(dr.select(tail_mask, 1.0, 0.0))
-
-            loss = dr.sum(safe_loss) / (tail_count + 1e-5)
+            
+            # Divide total loss by the number of contributors
+            loss = dr.sum(loss_contribution) / (tail_count + 1e-5)
 
         elif loss_type == "threshold":
             # Target: -90 dBm (The goal line we want users to cross)
@@ -2078,9 +2052,7 @@ def optimize_boresight_pathsolver(
                            float(tx_position[1]) if hasattr(tx_position[1], 'item') else float(tx_position[1]),
                            float(tx_position[2]) if hasattr(tx_position[2], 'item') else float(tx_position[2])]
             return initial_angles, None, None, None, None, initial_angles, initial_pos, initial_pos
-
-        optimizer.zero_grad()
-        print("Back-propagating")
+        
         loss.backward()
 
         # DEBUG: Check gradient computation
@@ -2133,16 +2105,18 @@ def optimize_boresight_pathsolver(
                 f"  Loss: {loss.item():.4f}, Mean Power in Zone: {mean_power_in_zone_dbm:.2f} dBm"
             )
 
-        # No gradient clipping — Adam's adaptive second moment handles gradient
-        # scaling natively. External clipping destroys the quadratic hinge's
-        # differential signal (weak users should produce larger gradients).
+        accumulation_steps = 10
+        if (iteration + 1) % accumulation_steps == 0:
+            # Average the accumulated gradients instead of using the sum
+            for param in [azimuth, elevation, x_pos, y_pos]:
+                if param.grad is not None:
+                    param.grad /= accumulation_steps
+            print("Stepping optimizer")
+            optimizer.step()
+            optimizer.zero_grad()
 
-        # Update
-        print("Stepping optimizer")
-        optimizer.step()
-
-        # Update learning rate if scheduler is enabled
-        if use_scheduler:
+        # Update learning rate if scheduler is enabled (only on optimizer step iterations)
+        if use_scheduler and (iteration + 1) % accumulation_steps == 0:
             scheduler.step()
 
         # Apply constraints on angles
@@ -2164,8 +2138,8 @@ def optimize_boresight_pathsolver(
             y_pos.data.fill_(proj_y)
 
         # Track
-        loss_history.append(loss.item())
-        angle_history.append([azimuth.item(), elevation.item()])
+        #loss_history.append(loss.item())
+        #angle_history.append([float(dr.detach(azimuth)), float(dr.detach(elevation))])
 
         # Modified to reflect robust value over the lowest loss
         if iteration > (num_iterations - 10):
