@@ -32,6 +32,7 @@ from triangulate import sample_triangulated_zone, get_zone_polygon_with_exclusio
 import sklearn
 from sklearn.cluster import DBSCAN
 from sklearn.cluster import HDBSCAN
+import math as m
 
 
 def create_zone_mask(
@@ -1638,14 +1639,15 @@ def optimize_boresight_pathsolver(
             loss = -avg_utility
 
         # Use DBSCAN to cluster dead zones by spatial position (x, y columns only)
-        clusters = HDBSCAN(
-            min_cluster_size=5,       
-            min_samples=25,           
-            cluster_selection_epsilon=1.0,
-            allow_single_cluster=False,
-            copy=True
-        ).fit(dead_zone[:, :2])
-        
+        #clusters = HDBSCAN(
+        #    min_cluster_size=5,       
+        #    min_samples=25,           
+        #    cluster_selection_epsilon=1.0,
+        #    allow_single_cluster=False,
+        #    copy=True
+        #).fit(dead_zone[:, :2])
+        clusters = DBSCAN(eps=20, min_samples=10).fit(dead_zone[:,:2])
+
         labels = clusters.labels_
         # Save number of clusters and noise points
         n_clusters_ = len(set(labels)) - (1 if -1 in labels else 0)
@@ -1789,12 +1791,13 @@ def optimize_boresight_pathsolver(
 
                 if len(pts) >= 3:
                     try:
-                        hull = ConvexHull(pts)
-                        hull_verts = np.append(hull.vertices, hull.vertices[0])
-                        ax.plot(pts[hull_verts, 0], pts[hull_verts, 1],
-                                color=colors[i], linewidth=1.5)
-                        ax.fill(pts[hull_verts, 0], pts[hull_verts, 1],
-                                color=colors[i], alpha=0.15)
+                        import alphashape
+                        shape = alphashape.alphashape(pts, alpha=0.05)
+                        buffered_shape = shapely.buffer(shape, 30.0)
+                        if not buffered_shape.is_empty and buffered_shape.geom_type == 'Polygon':
+                            x, y = buffered_shape.exterior.xy
+                            ax.plot(x, y, color=colors[i], linewidth=1.5)
+                            ax.fill(x, y, color=colors[i], alpha=0.15)
                     except Exception as e:
                         print(f"  ConvexHull failed for cluster {cluster_id}: {e}")
 
