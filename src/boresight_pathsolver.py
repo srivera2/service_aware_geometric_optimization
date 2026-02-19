@@ -14,7 +14,8 @@ import mitsuba as mi
 from sionna.rt import PathSolver, Receiver, cpx_abs_square
 from sionna.rt.path_solvers.paths import Paths
 import time
-from shapely import contains_xy
+import shapely
+from shapely import contains_xy, concave_hull
 from shapely.geometry import Point, Polygon
 from tx_placement import TxPlacement
 from angle_utils import (
@@ -25,345 +26,12 @@ from angle_utils import (
     clamp_elevation,
 )
 import scipy
+from scipy.spatial import ConvexHull
 import triangulate
 from triangulate import sample_triangulated_zone, get_zone_polygon_with_exclusions, triangulate_zone
-
-def create_optimization_gif(
-    frame_dir,
-    output_path="optimization.gif",
-    duration=200,
-    loop=0,
-    sector_angles=None,
-    tx_position=None,
-    map_config=None,
-):
-    """
-    Create GIF from saved optimization frames with optional sector coverage overlay
-
-    Parameters:
-    -----------
-    frame_dir : str
-        Directory containing frame_*.png files
-    output_path : str
-        Path to save the output GIF
-    duration : int
-        Duration of each frame in milliseconds (default: 200ms)
-    loop : int
-        Number of times to loop (0 = infinite)
-    sector_angles : list of dict or None
-        List of sector definitions to overlay on frames. Each dict should contain:
-        - 'angle_start': Start angle in degrees (0° = East, counter-clockwise)
-        - 'angle_end': End angle in degrees
-        - 'color': (Optional) Color for the sector overlay (default: 'red')
-        - 'alpha': (Optional) Transparency for the sector (default: 0.2)
-        Example: [{'angle_start': 0, 'angle_end': 120, 'color': 'red', 'alpha': 0.2}]
-    tx_position : tuple or None
-        (x, y, z) position of transmitter for sector overlay origin
-    map_config : dict or None
-        Map configuration with 'center', 'size'. Required if sector_angles is provided.
-
-    Returns:
-    --------
-    str : Path to created GIF
-    """
-    import os
-    import glob
-
-    try:
-        from PIL import Image
-        import matplotlib.pyplot as plt
-        import matplotlib.patches as patches
-        from matplotlib.patches import Wedge
-        import io
-    except ImportError:
-        print("PIL or matplotlib not found, trying imageio...")
-        import imageio
-
-        # Get all frame files in order
-        frame_files = sorted(glob.glob(os.path.join(frame_dir, "frame_*.png")))
-
-        if not frame_files:
-            print(f"No frames found in {frame_dir}")
-            return None
-
-        print(f"Creating GIF from {len(frame_files)} frames...")
-
-        # Read images and create GIF
-        images = [imageio.imread(f) for f in frame_files]
-        imageio.mimsave(output_path, images, duration=duration / 1000.0, loop=loop)
-
-        print(f"GIF saved to: {output_path}")
-        return output_path
-
-    # Get all frame files in order
-    frame_files = sorted(glob.glob(os.path.join(frame_dir, "frame_*.png")))
-
-    if not frame_files:
-        print(f"No frames found in {frame_dir}")
-        return None
-
-    print(f"Creating GIF from {len(frame_files)} frames...")
-
-    # Process frames with sector overlay if requested
-    if sector_angles is not None and tx_position is not None and map_config is not None:
-        print(f"Adding sector overlays to frames...")
-        processed_images = []
-
-        for frame_file in frame_files:
-            # Load the frame
-            img = Image.open(frame_file)
-
-            # Create figure from image
-            fig, ax = plt.subplots(figsize=(img.width / 100, img.height / 100), dpi=100)
-            ax.imshow(img)
-            ax.axis("off")
-
-            # Calculate sector overlay position
-            # Map tx_position to image coordinates
-            center_x, center_y, _ = map_config["center"]
-            width_m, height_m = map_config["size"]
-
-            # Image extent (data coordinates)
-            extent = [
-                center_x - width_m / 2,
-                center_x + width_m / 2,
-                center_y - height_m / 2,
-                center_y + height_m / 2,
-            ]
-
-            # TX position in data coordinates
-            # Convert to float to handle numpy arrays or mitsuba objects
-            tx_x = float(tx_position[0])
-            tx_y = float(tx_position[1])
-
-            # Calculate radius for sector visualization (should cover the map)
-            max_radius = float(np.sqrt(width_m**2 + height_m**2))
-
-            # Draw each sector
-            for sector in sector_angles:
-                angle_start = sector["angle_start"]
-                angle_end = sector["angle_end"]
-                color = sector.get("color", "red")
-                alpha = sector.get("alpha", 0.2)
-
-                # Convert angles: matplotlib uses degrees counter-clockwise from East
-                # Our convention: 0° = East, counter-clockwise
-                # matplotlib Wedge: theta1 is start, theta2 is end (counter-clockwise from East)
-
-                # Handle wraparound case (e.g., sector from 350° to 10°)
-                if angle_end < angle_start:
-                    # Draw two wedges: one from angle_start to 360, another from 0 to angle_end
-                    wedge1 = Wedge(
-                        (tx_x, tx_y),
-                        max_radius,
-                        angle_start,
-                        360,
-                        facecolor=color,
-                        edgecolor=color,
-                        alpha=alpha,
-                        linewidth=2,
-                    )
-                    wedge2 = Wedge(
-                        (tx_x, tx_y),
-                        max_radius,
-                        0,
-                        angle_end,
-                        facecolor=color,
-                        edgecolor=color,
-                        alpha=alpha,
-                        linewidth=2,
-                    )
-                    ax.add_patch(wedge1)
-                    ax.add_patch(wedge2)
-
-                    # Draw boundary lines
-                    for angle_deg in [angle_start, angle_end]:
-                        angle_rad = np.radians(angle_deg)
-                        dx = max_radius * np.cos(angle_rad)
-                        dy = max_radius * np.sin(angle_rad)
-                        ax.plot(
-                            [tx_x, tx_x + dx],
-                            [tx_y, tx_y + dy],
-                            color=color,
-                            linewidth=2,
-                            alpha=0.8,
-                        )
-                else:
-                    # Normal sector
-                    wedge = Wedge(
-                        (tx_x, tx_y),
-                        max_radius,
-                        angle_start,
-                        angle_end,
-                        facecolor=color,
-                        edgecolor=color,
-                        alpha=alpha,
-                        linewidth=2,
-                    )
-                    ax.add_patch(wedge)
-
-                    # Draw boundary lines to make sector more visible
-                    for angle_deg in [angle_start, angle_end]:
-                        angle_rad = np.radians(angle_deg)
-                        dx = max_radius * np.cos(angle_rad)
-                        dy = max_radius * np.sin(angle_rad)
-                        ax.plot(
-                            [tx_x, tx_x + dx],
-                            [tx_y, tx_y + dy],
-                            color=color,
-                            linewidth=2,
-                            alpha=0.8,
-                        )
-
-            # Set the correct limits to match the original image
-            ax.set_xlim(extent[0], extent[1])
-            ax.set_ylim(extent[2], extent[3])
-
-            # Save to buffer
-            buf = io.BytesIO()
-            plt.savefig(buf, format="png", dpi=100, bbox_inches="tight", pad_inches=0)
-            buf.seek(0)
-            processed_img = Image.open(buf)
-            processed_images.append(processed_img.copy())
-            buf.close()
-            plt.close(fig)
-
-        images = processed_images
-    else:
-        # Load images without modification
-        images = [Image.open(f) for f in frame_files]
-
-    # Save as GIF
-    images[0].save(
-        output_path,
-        save_all=True,
-        append_images=images[1:],
-        duration=duration,
-        loop=loop,
-        optimize=False,
-    )
-
-    print(f"GIF saved to: {output_path}")
-    print(f"  Total frames: {len(images)}")
-    print(f"  Frame duration: {duration}ms")
-    print(f"  Total duration: {len(images) * duration / 1000:.1f}s")
-
-    return output_path
-
-
-def estimate_achievable_power(
-    tx_position,
-    map_config,
-    antenna_gain_dBi=8.0,
-    tx_power_dBm=30.0,
-    frequency_GHz=3.5,
-    path_loss_exponent=2.5,
-    beamwidth_3dB=65.0,
-):
-    """
-    Estimate achievable power levels at different locations on the map
-
-    This helps auto-scale target power levels to be realistic based on:
-    - Distance from TX to coverage area
-    - Antenna characteristics (gain, beamwidth)
-    - Path loss model
-
-    Parameters:
-    -----------
-    tx_position : tuple
-        (x, y, z) position of transmitter
-    map_config : dict
-        Map configuration with 'center', 'size'
-    antenna_gain_dBi : float
-        Antenna gain in main lobe (dBi). TR38.901 typical: 8 dBi
-    tx_power_dBm : float
-        Transmit power in dBm
-    frequency_GHz : float
-        Carrier frequency in GHz
-    path_loss_exponent : float
-        Path loss exponent (2.0 = free space, 2.5-4 = urban)
-    beamwidth_3dB : float
-        3dB beamwidth in degrees. TR38.901 typical: 65°
-
-    Returns:
-    --------
-    dict with keys:
-        'peak_power_dbm': Maximum achievable power (center of main lobe, closest point)
-        'min_power_dbm': Minimum achievable power (edge of map, sidelobe)
-        'mainlobe_power_dbm': Typical power in main lobe at map edges
-        'sidelobe_power_dbm': Typical power in sidelobes
-    """
-    tx_x, tx_y, tx_z = tx_position
-    center_x, center_y, center_z = map_config["center"]
-    width_m, height_m = map_config["size"]
-
-    # Convert to scalars to avoid numpy array propagation
-    tx_x = float(tx_x)
-    tx_y = float(tx_y)
-    tx_z = float(tx_z)
-    center_x = float(center_x)
-    center_y = float(center_y)
-    center_z = float(center_z)
-    width_m = float(width_m)
-    height_m = float(height_m)
-
-    # Compute distances to key map locations
-    # Center of map (ground level)
-    dist_to_center = np.sqrt(
-        (center_x - tx_x) ** 2 + (center_y - tx_y) ** 2 + (center_z - tx_z) ** 2
-    )
-
-    # Corner of map (furthest point)
-    corner_x = center_x + width_m / 2
-    corner_y = center_y + height_m / 2
-    dist_to_corner = np.sqrt(
-        (corner_x - tx_x) ** 2 + (corner_y - tx_y) ** 2 + (center_z - tx_z) ** 2
-    )
-
-    # Free space path loss calculation
-    freq_MHz = frequency_GHz * 1000
-    fspl_1m = 20 * np.log10(freq_MHz) + 32.44
-
-    # Path loss at different distances
-    pl_center = fspl_1m + 10 * path_loss_exponent * np.log10(max(dist_to_center, 1.0))
-    pl_corner = fspl_1m + 10 * path_loss_exponent * np.log10(max(dist_to_corner, 1.0))
-
-    # Antenna pattern approximation (simplified)
-    # Main lobe: full gain
-    # At 3dB beamwidth edge: gain - 3dB
-    # Sidelobes: typically 15-20 dB below main lobe
-    sidelobe_attenuation = 18.0  # dB below main lobe (typical for directive antenna)
-
-    # EIRP (Effective Isotropic Radiated Power)
-    eirp_mainlobe = tx_power_dBm + antenna_gain_dBi
-    eirp_sidelobe = tx_power_dBm + antenna_gain_dBi - sidelobe_attenuation
-
-    # Received power = EIRP - Path Loss
-    # We compute power at different antenna directions and distances
-    # to provide reasonable targets for different coverage goals
-
-    # Peak: center of map, main lobe (best case)
-    peak_power_dbm = eirp_mainlobe - pl_center
-
-    # Main lobe at edge of map (far but well-covered)
-    mainlobe_edge_power_dbm = eirp_mainlobe - pl_corner
-
-    # Sidelobe at edge (weakest achievable - use for "low" coverage)
-    sidelobe_edge_power_dbm = eirp_sidelobe - pl_corner
-
-    # Minimum achievable (sidelobe at furthest point)
-    min_power_dbm = eirp_sidelobe - pl_corner
-
-    return {
-        "peak_power_dbm": peak_power_dbm,  # ~-52 dBm (TX at 45.5, -33.7, 34m, map centered at 45.5, -33.7, 0)
-        "min_power_dbm": min_power_dbm,  # ~-96 dBm (sidelobe, corner)
-        "mainlobe_power_dbm": mainlobe_edge_power_dbm,  # ~-78 dBm (main lobe, corner)
-        "sidelobe_power_dbm": sidelobe_edge_power_dbm,  # ~-96 dBm (sidelobe, corner)
-        "center_distance_m": dist_to_center,
-        "corner_distance_m": dist_to_corner,
-        "path_loss_center_dB": pl_center,
-        "path_loss_corner_dB": pl_corner,
-    }
+import sklearn
+from sklearn.cluster import DBSCAN
+from sklearn.cluster import HDBSCAN
 
 
 def create_zone_mask(
@@ -793,6 +461,17 @@ def sample_grid_points(
 
     return sampled_points_3d
 
+def filter_and_append(rx_data, dead_zone, threshold):
+    # rx_data has columns [x, y, power] — filter rows where power < threshold
+    dead_mask = rx_data[:, 2] < threshold
+    dead_points = rx_data[dead_mask]  # keeps all 3 columns: [x, y, power]
+    # Append dead points along rows (axis=0 preserves the (N, 3) shape)
+    if dead_zone.size == 0:
+        dead_zone = dead_points
+    else:
+        dead_zone = np.append(dead_zone, dead_points, axis=0)
+
+    return dead_zone
 
 def visualize_receiver_placement(
     sample_points,
@@ -1105,6 +784,7 @@ def compare_boresight_performance(
 
         # Extract signal strength
         rss_watts = rm.rss.numpy()[0, :, :]
+        
         # Commenting this out to test if the linear average is improved
         # signal_strength_dBm = 10.0 * np.log10(rss_watts + 1e-30) + 30.0
 
@@ -1603,9 +1283,63 @@ def optimize_boresight_pathsolver(
     # Storage for sample points (accessible from outside the wrapped function)
     sample_points_storage = {}
 
+    def accumulate_samples(dead_zone, qrand_op):
+        # Sample grid points via rejection sampling (global)
+        new_sample_points = sample_grid_points(
+            map_config,
+            scene_xml_path=scene_xml_path,
+            exclude_buildings=True,
+            zone_mask=zone_mask,
+            zone_params=zone_params,
+            qrand=qrand_op,
+            num_points=num_sample_points,
+            cached_building_polygons=cached_building_polygons,  # Use pre-cached polygons
+        )
+
+        # Store for visualization outside the loss function
+        sample_points_storage['current'] = new_sample_points
+
+        # REPOSITION existing receivers (much faster than remove/add)
+        # Receivers were pre-created before the optimization loop
+        for idx, position in enumerate(new_sample_points):
+            rx_name = f"opt_rx_{idx}"
+            rx_objects[rx_name].position = mi.Point3f(
+                float(position[0]), float(position[1]), float(position[2])
+            )
+
+        # Run path solver with updated receivers and antenna orientation
+        paths = p_solver(
+            scene,
+            los=True,
+            refraction=False,
+            specular_reflection=True,
+            diffuse_reflection=True,
+        )
+
+        # Extract channel coefficients and convert to numpy
+        h_real, h_imag = paths.a
+        h_real_np = np.array(h_real)
+        h_imag_np = np.array(h_imag)
+
+        # Compute per-receiver power: |h|^2 summed over all dims except receiver
+        # h shape: (num_rx, num_tx, max_paths, num_rx_ant, num_tx_ant)
+        power_all = h_real_np**2 + h_imag_np**2
+        power_per_rx = power_all.sum(axis=tuple(range(1, power_all.ndim)))  # (num_rx,)
+
+        # Build combined array: [x, y, power] per receiver
+        rx_data = np.column_stack([
+            new_sample_points[:, 0],  # x
+            new_sample_points[:, 1],  # y
+            power_per_rx,             # power
+        ])  # shape: (num_rx, 3)
+
+        dead_zone = filter_and_append(rx_data, dead_zone, 10e-13)
+
+        return dead_zone
+    
     # Define differentiable loss function using @dr.wrap
     @dr.wrap(source="torch", target="drjit")
-    def compute_loss(azimuth_deg, elevation_deg, x_pos, y_pos, qrand_op, num_sample_points, sample_type='Rej', loss_type='CVaR'):
+    def compute_loss(azimuth_deg, elevation_deg, x_pos, y_pos, qrand_op, num_sample_points, dead_zone, loss_type='CVaR'):
         """
         Compute loss with AD enabled through field_calculator only
 
@@ -1620,20 +1354,12 @@ def optimize_boresight_pathsolver(
         p_solver : PathSolver
             PathSolver instance used to access _field_calculator
         """
-        # CRITICAL: Enable gradients for each input parameter
-        # The @dr.wrap decorator converts PyTorch 0-D tensors → DrJit Float scalars
-        # We need to access .array to get the actual DrJit scalars
-
-        # DEBUG: Print types to understand TensorXf vs Float conversion
 
         dr.enable_grad(azimuth_deg.array)
         dr.enable_grad(elevation_deg.array)
         # Position gradients
         dr.enable_grad(x_pos.array)
         dr.enable_grad(y_pos.array)
-        #dr.enable_grad(tx_y.array)
-        #dr.enable_grad(tx_x.array)
-        #dr.enable_grad(tx_y.array)
 
         # Convert degrees to radians for angle conversion
         # Use DrJit's pi constant for differentiability
@@ -1835,7 +1561,7 @@ def optimize_boresight_pathsolver(
 
         if loss_type == "LSE":
             # LSE (Soft Min)
-            dead_zone_threshold = 1e-30
+            dead_zone_threshold = 1e-14
             valid_mask = power_relative > dead_zone_threshold
             alpha = 5.0 
             epsilon = 1e-30
@@ -1877,7 +1603,7 @@ def optimize_boresight_pathsolver(
 
         elif loss_type == "threshold":
             # Target: -90 dBm (The goal line we want users to cross)
-            dead_threshold = 1e-17 
+            dead_threshold = 1e-14
             target_db = -70.0
 
             # Filter to calculate gradient only using alive transmitters
@@ -1901,7 +1627,7 @@ def optimize_boresight_pathsolver(
 
         else:
             # Sum Log(Power) -> Penalizes low values
-            dead_zone_threshold = 1e-30
+            dead_zone_threshold = 1e-14
             valid_mask = power_relative > dead_zone_threshold
             epsilon = 1e-30
             log_P = dr.log(power_relative + epsilon)
@@ -1911,7 +1637,24 @@ def optimize_boresight_pathsolver(
             avg_utility = log_utility / (count + 1e-5)
             loss = -avg_utility
 
-        return loss
+        # Use DBSCAN to cluster dead zones by spatial position (x, y columns only)
+        clusters = HDBSCAN(
+            min_cluster_size=5,       
+            min_samples=25,           
+            cluster_selection_epsilon=1.0,
+            allow_single_cluster=False,
+            copy=True
+        ).fit(dead_zone[:, :2])
+        
+        labels = clusters.labels_
+        # Save number of clusters and noise points
+        n_clusters_ = len(set(labels)) - (1 if -1 in labels else 0)
+        n_noise_ = list(labels).count(-1)
+
+        print("Estimated number of clusters: %d" % n_clusters_)
+        print("Estimated number of noise points: %d" % n_noise_)
+
+        return loss, clusters
 
     # Calculate the initial azimuth and elevation angles based on the position of the transmitter + center of the zone
     # Add z-coordinate (target_height) to zone center which only has [x, y]
@@ -1996,6 +1739,9 @@ def optimize_boresight_pathsolver(
     final_el_list = np.array([])
     final_az_list = np.array([])
 
+    # Creating empty numpy array of dead zone (x, y columns)
+    dead_areas = np.zeros((0, 3))
+
     # Start the optimization
     start_time = time.time()
     for iteration in range(num_iterations):
@@ -2015,7 +1761,55 @@ def optimize_boresight_pathsolver(
             print(f"[TENSOR DEBUG] x_pos requires_grad: {x_pos.requires_grad}")
             print(f"[TENSOR DEBUG] x_pos value: {x_pos.item()}")
 
-        loss = compute_loss(azimuth, elevation, x_pos, y_pos, qrand, num_sample_points, sampler)
+        # Accumulate dead zone samples every iteration
+        dead_areas = accumulate_samples(dead_areas, qrand)
+
+        # Every 5th accumulated batch, compute loss and reset
+        if (iteration + 1) % 10 == 0:
+            dead_zone_pos = dead_areas[:,:2]
+            loss, clusters = compute_loss(azimuth, elevation, x_pos, y_pos, qrand, num_sample_points, dead_areas, sampler)
+            # Reset the dead zone for the next accumulation window
+            dead_areas = np.zeros((0, 3))
+
+        loss, clusters = compute_loss(azimuth, elevation, x_pos, y_pos, qrand, num_sample_points, dead_areas, sampler)
+        # Take convex hull of each cluster (2D: x, y only)
+        labels = clusters.labels_
+        unique_labels = set(labels) - {-1}
+        dead_xy = dead_areas[:, :2]
+
+        if len(unique_labels) > 0:
+            fig, ax = plt.subplots()
+            colors = plt.cm.tab10(np.linspace(0, 1, max(len(unique_labels), 1)))
+
+            for i, cluster_id in enumerate(sorted(unique_labels)):
+                mask = labels == cluster_id
+                pts = dead_xy[mask]
+                ax.scatter(pts[:, 0], pts[:, 1], color=colors[i],
+                           label=f'Cluster {cluster_id}', alpha=0.5, s=10)
+
+                if len(pts) >= 3:
+                    try:
+                        hull = ConvexHull(pts)
+                        hull_verts = np.append(hull.vertices, hull.vertices[0])
+                        ax.plot(pts[hull_verts, 0], pts[hull_verts, 1],
+                                color=colors[i], linewidth=1.5)
+                        ax.fill(pts[hull_verts, 0], pts[hull_verts, 1],
+                                color=colors[i], alpha=0.15)
+                    except Exception as e:
+                        print(f"  ConvexHull failed for cluster {cluster_id}: {e}")
+
+            noise_mask = labels == -1
+            if np.any(noise_mask):
+                ax.scatter(dead_xy[noise_mask, 0], dead_xy[noise_mask, 1],
+                           color='gray', label='Noise', alpha=0.3, s=5, marker='x')
+
+            ax.set_xlabel('X')
+            ax.set_ylabel('Y')
+            ax.set_aspect('equal')
+            ax.legend()
+            ax.set_title(f'Dead Zone Clusters (iter {iteration+1})')
+            plt.show()
+
 
         # Check if first iteration failed (no paths found)
         if iteration == 0 and hasattr(compute_loss, "_failed_first_iter") and compute_loss._failed_first_iter:
