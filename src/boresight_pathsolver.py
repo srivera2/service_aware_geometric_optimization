@@ -27,12 +27,14 @@ from angle_utils import (
 )
 import scipy
 from scipy.spatial import ConvexHull
-import triangulate
-from triangulate import sample_triangulated_zone, get_zone_polygon_with_exclusions, triangulate_zone
+from triangulate import (
+    get_zone_polygon_with_exclusions,
+)
 import sklearn
 from sklearn.cluster import DBSCAN
 from sklearn.cluster import HDBSCAN
 import math as m
+import alphashape
 
 
 def create_zone_mask(
@@ -62,7 +64,9 @@ def create_zone_mask(
         # Use endpoint=False to ensure proper cell spacing
         # With endpoint=False, linspace creates n_x cells of exactly cell_w width
         x = (
-            np.linspace(center_x - width_m / 2, center_x + width_m / 2, n_x, endpoint=False)
+            np.linspace(
+                center_x - width_m / 2, center_x + width_m / 2, n_x, endpoint=False
+            )
             + cell_w / 2
         )
         y = (
@@ -98,7 +102,7 @@ def create_zone_mask(
 
         # Look-at is simply the center of the box
         look_at_pos = np.array([bx, by, target_height], dtype=np.float32)
-    
+
     elif zone_type == "polygon":
         print("Creating polygon")
         # Set up outer area (map size)
@@ -110,15 +114,25 @@ def create_zone_mask(
         n_y = int(height_m / cell_h)
 
         # Create coordinate grids
-        x = (np.linspace(center_x - width_m / 2, center_x + width_m / 2, n_x, endpoint=False) + cell_w / 2)
-        y = (np.linspace(center_y - height_m / 2, center_y + height_m / 2, n_y, endpoint=False) + cell_h / 2)
+        x = (
+            np.linspace(
+                center_x - width_m / 2, center_x + width_m / 2, n_x, endpoint=False
+            )
+            + cell_w / 2
+        )
+        y = (
+            np.linspace(
+                center_y - height_m / 2, center_y + height_m / 2, n_y, endpoint=False
+            )
+            + cell_h / 2
+        )
         X, Y = np.meshgrid(x, y)
 
         # Initialize mask (all zeros = outside zone)
         mask = np.zeros((n_y, n_x), dtype=np.float32)
 
         # Get the vertices of the polygon from zone_params
-        vertices = zone_params.get("vertices", [(0,0), (10,0), (10,-10), (0,-10)])
+        vertices = zone_params.get("vertices", [(0, 0), (10, 0), (10, -10), (0, -10)])
 
         from shapely.geometry import Polygon
         from shapely import contains_xy
@@ -132,13 +146,15 @@ def create_zone_mask(
 
         # Set the look at position at the centroid of the polygon
         centroid = zone.centroid
-        look_at_pos = np.array([centroid.x, centroid.y, target_height], dtype=np.float32)
+        look_at_pos = np.array(
+            [centroid.x, centroid.y, target_height], dtype=np.float32
+        )
 
         # Store bounding box for LDS sampling
         minx, miny, maxx, maxy = zone.bounds
-        zone_params['center'] = [(minx + maxx) / 2, (miny + maxy) / 2]
-        zone_params['width'] = maxx - minx
-        zone_params['height'] = maxy - miny
+        zone_params["center"] = [(minx + maxx) / 2, (miny + maxy) / 2]
+        zone_params["width"] = maxx - minx
+        zone_params["height"] = maxy - miny
 
     else:
         print("Polygon configuration is not clear. Double check your configuration")
@@ -246,227 +262,87 @@ def create_zone_mask(
 
 
 def sample_grid_points(
-    map_config,
-    scene_xml_path=None,
-    exclude_buildings=True,
-    zone_mask=None,
-    zone_params=None,
-    qrand=None,
-    # Making the number of points configurable from now on
-    num_points=20,
-    # Pre-loaded building polygons to avoid re-parsing XML every call
-    cached_building_polygons=None,
+    polygon,
+    num_points,
+    qrand,
+    building_polygons=None,
+    ground_z=0.0,
+    dead_polygons=None,
+    dead_fraction=0.8,
 ):
-
-    width_m, height_m = map_config["size"]
-    cell_w, cell_h = map_config["cell_size"]
-
-    n_x = int(width_m / cell_w)
-    n_y = int(height_m / cell_h)
-
-    center_x, center_y, ground_z = map_config["center"]
-    
-    from shapely.geometry import Polygon, Point
     from shapely import contains_xy
-    from shapely.prepared import prep
+    from shapely.ops import unary_union
 
-    # Use cached building polygons if provided, otherwise load them
-    # This avoids re-parsing the XML file on every call
-    if cached_building_polygons is not None:
-        building_polygons = cached_building_polygons
-    elif exclude_buildings and scene_xml_path is not None:
-        # Load building polygons (expensive - should be cached by caller for repeated calls)
-        from scene_parser import extract_building_info
-        building_polygons = []
-        building_info = extract_building_info(scene_xml_path, verbose=False)
-        for building_id, info in building_info.items():
-            vertices_3d = info["vertices"]
-            vertices_2d = [(v[0], v[1]) for v in vertices_3d]
-            try:
-                building_polygon = Polygon(vertices_2d)
-                if building_polygon.is_valid:
-                    building_polygons.append(building_polygon)
-            except:
-                pass
+    if dead_polygons is not None:
+        dead_union = unary_union(dead_polygons)
+        alive_diff = polygon.difference(dead_union)
+        dead_num = int(dead_fraction * num_points)
+        alive_num = num_points - dead_num
+        alive_pts, _, __, ___, ____ = sample_grid_points(
+            alive_diff,
+            alive_num,
+            qrand,
+            building_polygons,
+            ground_z,
+        )
+        dead_pts, _, __, ___, ____ = sample_grid_points(
+            dead_union, dead_num, qrand, building_polygons, ground_z
+        )
+        return np.vstack([dead_pts, alive_pts]), dead_union, alive_diff, dead_pts, alive_pts
     else:
-        building_polygons = []
+        dead_union = None
+        alive_diff = None
+        alive_pts = None
+        dead_pts = None
 
-    # Helper function to filter out points inside buildings (VECTORIZED)
-    def filter_buildings(points_2d):
-        """Filter out points inside any building. Returns boolean mask of valid points."""
-        if not building_polygons or len(points_2d) == 0:
-            return np.ones(len(points_2d), dtype=bool)
+    minx, miny, maxx, maxy = polygon.bounds
+    w, h = maxx - minx, maxy - miny
 
-        # Use vectorized contains_xy - MUCH faster than Point-by-Point checks
-        valid_mask = np.ones(len(points_2d), dtype=bool)
-        x_coords = points_2d[:, 0]
-        y_coords = points_2d[:, 1]
-        for building_poly in building_polygons:
-            # contains_xy checks all points against polygon at once (no Point objects)
-            inside_building = contains_xy(building_poly, x_coords, y_coords)
-            valid_mask &= ~inside_building
-        return valid_mask
+    sampled = []
+    for iteration in range(1, 101):
+        needed = num_points - len(sampled)
+        if needed == 0:
+            break
+        batch = np.clip(
+            np.array(qrand.random(min(needed * max(2, iteration), 10000))), 0.0, 1.0
+        )
+        x = minx + batch[:, 0] * w
+        y = miny + batch[:, 1] * h
+        pts = np.column_stack([x, y])
+
+        pts = pts[contains_xy(polygon, x, y)]
+
+        if building_polygons and len(pts):
+            mask = np.ones(len(pts), dtype=bool)
+            for bp in building_polygons:
+                mask &= ~contains_xy(bp, pts[:, 0], pts[:, 1])
+            pts = pts[mask]
+
+        sampled.extend(pts[:needed].tolist())
+
+    if len(sampled) < num_points:
+        raise ValueError(
+            f"Could only sample {len(sampled)}/{num_points} points after 100 iterations."
+        )
+
+    pts2d = np.array(sampled)
+    return np.hstack([pts2d, np.full((len(pts2d), 1), ground_z)]), dead_union, alive_diff, dead_pts, alive_pts
+
+
+def filter_and_append(rx_data, dead_zone, tail_percentile=20.0):
+    """
+    Dynamically isolates the worst X% of receivers in the current batch.
+    """
+    # rx_data has columns [x, y, power]
+    power_array = rx_data[:, 2]
     
-    print(zone_params)
-    print(qrand)
-
-    # Quasi-random sampling in continuous space within the zone
-    if zone_params is not None and qrand is not None:
-        # Extract zone parameters directly
-        zone_center = zone_params.get("center")
-        if zone_center is None:
-            # Fallback: compute from map_config if center not in zone_params
-            zone_center = [map_config["center"][0], map_config["center"][1]]
-        zone_width = zone_params["width"]
-        zone_height = zone_params["height"]
-
-        # Check if this is a polygon zone (has vertices)
-        if "vertices" in zone_params:
-            # Polygon + building rejection sampling - guarantees exactly num_points
-            zone_polygon = Polygon(zone_params["vertices"])
-            min_bound_x = zone_center[0] - zone_width / 2
-            min_bound_y = zone_center[1] - zone_height / 2
-
-            sampled_points_list = []
-            max_iterations = 100  # Safety limit to prevent infinite loops
-            iteration = 0
-
-            while len(sampled_points_list) < num_points and iteration < max_iterations:
-                iteration += 1
-                samples_needed = num_points - len(sampled_points_list)
-
-                # Oversample to account for both polygon and building rejection
-                # Start with 2x, increase if we're not getting enough valid points
-                oversample_factor = max(2, int(np.ceil(samples_needed / max(1, len(sampled_points_list) / max(1, iteration)))))
-                batch_size = min(samples_needed * oversample_factor, 10000)  # Cap batch size
-
-                # Draw from bounding box using quasi-random sequence
-                unit_points = np.array(qrand.random(batch_size))
-                unit_points = np.clip(unit_points, 0.0, 1.0)
-
-                # Scale to bounding box
-                scaled_x = min_bound_x + unit_points[:, 0] * zone_width
-                scaled_y = min_bound_y + unit_points[:, 1] * zone_height
-                candidate_points = np.column_stack([scaled_x, scaled_y])
-
-                # Stage 1: Keep only points inside polygon
-                inside_polygon = contains_xy(zone_polygon, candidate_points[:, 0], candidate_points[:, 1])
-                polygon_valid_points = candidate_points[inside_polygon]
-
-                if len(polygon_valid_points) == 0:
-                    continue
-
-                # Stage 2: Filter out points inside buildings
-                if building_polygons:
-                    building_valid_mask = filter_buildings(polygon_valid_points)
-                    valid_points = polygon_valid_points[building_valid_mask]
-                else:
-                    valid_points = polygon_valid_points
-
-                # Add valid points (up to what we need)
-                points_to_add = min(len(valid_points), num_points - len(sampled_points_list))
-                if points_to_add > 0:
-                    sampled_points_list.extend(valid_points[:points_to_add].tolist())
-
-            if len(sampled_points_list) < num_points:
-                raise ValueError(
-                    f"Could not sample {num_points} points after {max_iterations} iterations. "
-                    f"Only found {len(sampled_points_list)} valid points. "
-                    "Zone may be too small or mostly covered by buildings."
-                )
-
-            sampled_points = np.array(sampled_points_list)
-
-        else:
-            # Box + building rejection sampling - guarantees exactly num_points
-            min_bound_x = zone_center[0] - zone_width / 2
-            min_bound_y = zone_center[1] - zone_height / 2
-
-            sampled_points_list = []
-            max_iterations = 100
-            iteration = 0
-
-            while len(sampled_points_list) < num_points and iteration < max_iterations:
-                iteration += 1
-                samples_needed = num_points - len(sampled_points_list)
-                oversample_factor = max(2, iteration)  # Increase oversampling if struggling
-                batch_size = min(samples_needed * oversample_factor, 10000)
-
-                unit_points = np.array(qrand.random(batch_size))
-                unit_points = np.clip(unit_points, 0.0, 1.0)
-
-                scaled_x = min_bound_x + unit_points[:, 0] * zone_width
-                scaled_y = min_bound_y + unit_points[:, 1] * zone_height
-                candidate_points = np.column_stack([scaled_x, scaled_y])
-
-                # Filter out points inside buildings
-                if building_polygons:
-                    building_valid_mask = filter_buildings(candidate_points)
-                    valid_points = candidate_points[building_valid_mask]
-                else:
-                    valid_points = candidate_points
-
-                points_to_add = min(len(valid_points), num_points - len(sampled_points_list))
-                if points_to_add > 0:
-                    sampled_points_list.extend(valid_points[:points_to_add].tolist())
-
-            if len(sampled_points_list) < num_points:
-                raise ValueError(
-                    f"Could not sample {num_points} points after {max_iterations} iterations. "
-                    f"Only found {len(sampled_points_list)} valid points."
-                )
-
-            sampled_points = np.array(sampled_points_list)
-
-    # Uniform grid sampling: sample entire grid then filter by mask
-    else:
-        x = (
-            np.linspace(
-                center_x - width_m / 2, center_x + width_m / 2, n_x, endpoint=False
-            )
-            + cell_w / 2
-        )
-        y = (
-            np.linspace(
-                center_y - height_m / 2, center_y + height_m / 2, n_y, endpoint=False
-            )
-            + cell_h / 2
-        )
-
-        X, Y = np.meshgrid(x, y)
-        all_points = np.column_stack([X.flatten(), Y.flatten()])
-
-        # Filter by zone mask
-        if zone_mask is None:
-            candidate_points = all_points
-        else:
-            mask_flat = zone_mask.flatten()
-            candidate_points = all_points[mask_flat == 1.0]
-
-        # Filter out building locations
-        if building_polygons:
-            building_valid_mask = filter_buildings(candidate_points)
-            sampled_points = candidate_points[building_valid_mask]
-
-            if len(sampled_points) == 0:
-                raise ValueError(
-                    f"All {len(candidate_points)} grid points are inside buildings! "
-                    "Try adjusting the zone mask or cell size."
-                )
-        else:
-            sampled_points = candidate_points
-
-    # Add z-coordinate
-    z_coords = np.full((len(sampled_points), 1), ground_z)
-    sampled_points_3d = np.hstack([sampled_points, z_coords])
-
-    return sampled_points_3d
-
-def filter_and_append(rx_data, dead_zone, threshold):
-    # rx_data has columns [x, y, power] — filter rows where power < threshold
-    dead_mask = rx_data[:, 2] < threshold
-    dead_points = rx_data[dead_mask]  # keeps all 3 columns: [x, y, power]
-    # Append dead points along rows (axis=0 preserves the (N, 3) shape)
+    # Dynamically find the threshold for the bottom 20% of this specific batch
+    dynamic_threshold = np.percentile(power_array, tail_percentile)
+    
+    # Filter rows where power is below the dynamic threshold
+    dead_mask = power_array <= dynamic_threshold
+    dead_points = rx_data[dead_mask] 
+    
     if dead_zone.size == 0:
         dead_zone = dead_points
     else:
@@ -474,14 +350,19 @@ def filter_and_append(rx_data, dead_zone, threshold):
 
     return dead_zone
 
+
 def visualize_receiver_placement(
     sample_points,
-    zone_mask,
     map_config,
-    tx_position=None,
+    zone_mask=None,
+    current_tx_position=None,
     scene_xml_path=None,
     title="Receiver Sampling Visualization",
     figsize=(14, 10),
+    zone_polygon=None,
+    dead_polygons=None,
+    box_polygon=None,
+    building_id=None,
 ):
     """
     Visualize where receivers are placed relative to zone mask and buildings
@@ -514,7 +395,6 @@ def visualize_receiver_placement(
         The generated figure
     """
     import matplotlib.pyplot as plt
-    import matplotlib.patches as mpatches
     from shapely.geometry import Polygon
 
     width_m, height_m = map_config["size"]
@@ -531,135 +411,115 @@ def visualize_receiver_placement(
         center_y + height_m / 2,
     ]
 
-    # Show zone mask with alpha for visibility
-    im = ax.imshow(
-        zone_mask,
-        origin="lower",
-        cmap="RdYlGn",
-        alpha=0.3,
-        extent=extent,
-        vmin=0,
-        vmax=1,
+    # Show zone mask as background if provided
+    if zone_mask is not None:
+        im = ax.imshow(
+            zone_mask,
+            origin="lower",
+            cmap="RdYlGn",
+            alpha=0.3,
+            extent=extent,
+            vmin=0,
+            vmax=1,
+        )
+        cbar = plt.colorbar(im, ax=ax, label="Zone Mask")
+        cbar.set_ticks([0, 1])
+        cbar.set_ticklabels(["Interference", "Target"])
+
+    # --- Zone and building overlay ---
+    # Strategy: layered fills inside the coverage box.
+    #   1. Fill box green  (alive zone background)
+    #   2. Fill dead zones red  (on top of green)
+    #   3. Fill all buildings gray  (on top of both)
+    #   4. Draw coverage box outline in blue dashed
+    # This avoids all polygon-difference topology issues and handles holes correctly.
+
+    def _fill_geom(geom, **kwargs):
+        """Fill a Polygon or MultiPolygon (exterior only — later layers cover holes)."""
+        if geom is None or geom.is_empty:
+            return
+        if geom.geom_type == 'Polygon':
+            ax.fill(*geom.exterior.xy, **kwargs)
+        elif geom.geom_type in ('MultiPolygon', 'GeometryCollection'):
+            for part in geom.geoms:
+                if part.geom_type == 'Polygon':
+                    ax.fill(*part.exterior.xy, **kwargs)
+
+    # 1. Alive zone: fill coverage box green
+    draw_box = box_polygon if box_polygon is not None else zone_polygon
+    if draw_box is not None:
+        _fill_geom(draw_box, alpha=0.15, fc='green', ec='none', zorder=1, label='Alive Zone')
+
+    # 2. Dead zones: fill red
+    if dead_polygons:
+        for i, dp in enumerate(dead_polygons):
+            _fill_geom(dp, alpha=0.35, fc='red', ec='darkred', linewidth=1.0,
+                       zorder=2, label='Dead Zone' if i == 0 else None)
+
+    # 3. All buildings: gray fill; TX building gets a highlighted edge
+    if scene_xml_path is not None:
+        try:
+            from scene_parser import extract_building_info
+            building_info = extract_building_info(scene_xml_path, verbose=False)
+            tx_building_drawn = False
+            for bid, info in building_info.items():
+                vertices_2d = [(v[0], v[1]) for v in info["vertices"]]
+                try:
+                    bpoly = Polygon(vertices_2d)
+                    is_tx_building = (str(bid) == str(building_id))
+                    ax.fill(*bpoly.exterior.xy,
+                            facecolor='#c0392b' if is_tx_building else 'dimgray',
+                            edgecolor='black',
+                            alpha=0.75 if is_tx_building else 0.55,
+                            linewidth=2.0 if is_tx_building else 0.8,
+                            zorder=3,
+                            label=('TX Building' if is_tx_building and not tx_building_drawn
+                                   else None))
+                    if is_tx_building:
+                        tx_building_drawn = True
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"Warning: Could not overlay buildings: {e}")
+
+    # 4. Coverage box outline
+    if draw_box is not None:
+        if draw_box.geom_type == 'Polygon':
+            ax.plot(*draw_box.exterior.xy, color='blue', linewidth=2,
+                    linestyle='--', label='Coverage Zone', zorder=4)
+        elif draw_box.geom_type == 'MultiPolygon':
+            for i, part in enumerate(draw_box.geoms):
+                ax.plot(*part.exterior.xy, color='blue', linewidth=2,
+                        linestyle='--', label='Coverage Zone' if i == 0 else None, zorder=4)
+
+    # Plot all sample points
+    ax.scatter(
+        sample_points[:, 0],
+        sample_points[:, 1],
+        c="white",
+        s=20,
+        alpha=0.8,
+        marker="o",
+        edgecolors="black",
+        linewidths=0.5,
+        zorder=5,
+        label=f"Receivers ({len(sample_points)})",
     )
 
-    # Separate receivers by zone
-    cell_w, cell_h = map_config["cell_size"]
-    n_x = int(width_m / cell_w)
-    n_y = int(height_m / cell_h)
-
-    target_receivers = []
-    interference_receivers = []
-
-    for idx, point in enumerate(sample_points):
-        x, y = point[0], point[1]
-        # Convert to grid indices
-        # Grid cells are centered, so we use floor division to find the cell
-        i = int((x - (center_x - width_m / 2)) / cell_w)
-        j = int((y - (center_y - height_m / 2)) / cell_h)
-
-        # Debug: check if clipping is changing the indices
-        i_orig, j_orig = i, j
-        i = np.clip(i, 0, n_x - 1)
-        j = np.clip(j, 0, n_y - 1)
-
-        if zone_mask[j, i] > 0.5:  # Target zone
-            target_receivers.append([x, y])
-        else:  # Interference zone
-            interference_receivers.append([x, y])
-            # Debug: Print details about misclassified points
-            if (
-                len(interference_receivers) <= 2
-            ):  # Only print first 2 misclassified points
-                print(
-                    f"  [DEBUG] Point at ({x:.2f}, {y:.2f}) classified as interference:"
-                )
-                print(f"    Grid indices: i={i_orig}->{i}, j={j_orig}->{j}")
-                print(f"    Mask value: {zone_mask[j, i]:.2f}")
-
-    target_receivers = np.array(target_receivers)
-    interference_receivers = np.array(interference_receivers)
-
-    # Plot receivers
-    if len(target_receivers) > 0:
-        ax.scatter(
-            target_receivers[:, 0],
-            target_receivers[:, 1],
-            c="green",
-            s=30,
-            alpha=0.7,
-            marker="o",
-            edgecolors="darkgreen",
-            linewidths=0.5,
-            label=f"Target Zone RX ({len(target_receivers)})",
-        )
-
-    if len(interference_receivers) > 0:
-        ax.scatter(
-            interference_receivers[:, 0],
-            interference_receivers[:, 1],
-            c="red",
-            s=30,
-            alpha=0.7,
-            marker="s",
-            edgecolors="darkred",
-            linewidths=0.5,
-            label=f"Interference Zone RX ({len(interference_receivers)})",
-        )
-
-    # Plot transmitter if provided
-    if tx_position is not None:
+    # Plot transmitter position
+    if current_tx_position is not None:
         ax.plot(
-            tx_position[0],
-            tx_position[1],
+            current_tx_position[0],
+            current_tx_position[1],
             "b*",
             markersize=20,
             label="Transmitter",
             markeredgecolor="navy",
             markeredgewidth=1.5,
+            zorder=6,
         )
 
-    # Overlay building footprints if scene XML provided
-    if scene_xml_path is not None:
-        try:
-            from scene_parser import extract_building_info
-
-            building_info = extract_building_info(scene_xml_path, verbose=False)
-
-            for building_id, info in building_info.items():
-                vertices_3d = info["vertices"]
-                vertices_2d = [(v[0], v[1]) for v in vertices_3d]
-
-                try:
-                    building_polygon = Polygon(vertices_2d)
-                    x_coords, y_coords = building_polygon.exterior.xy
-                    ax.fill(
-                        x_coords,
-                        y_coords,
-                        facecolor="gray",
-                        edgecolor="black",
-                        alpha=0.5,
-                        linewidth=1,
-                    )
-                except:
-                    pass
-
-            # Add building legend entry
-            building_patch = mpatches.Patch(
-                facecolor="gray", edgecolor="black", alpha=0.5, label="Buildings"
-            )
-            handles, labels = ax.get_legend_handles_labels()
-            handles.append(building_patch)
-            ax.legend(handles=handles, loc="upper right", fontsize=10)
-        except Exception as e:
-            print(f"Warning: Could not overlay buildings: {e}")
-            ax.legend(loc="upper right", fontsize=10)
-    else:
-        ax.legend(loc="upper right", fontsize=10)
-
-    # Add colorbar for zone mask
-    cbar = plt.colorbar(im, ax=ax, label="Zone Mask")
-    cbar.set_ticks([0, 1])
-    cbar.set_ticklabels(["Interference", "Target"])
+    ax.legend(loc="upper right", fontsize=10)
 
     # Labels and title
     ax.set_xlabel("X (m)", fontsize=12)
@@ -669,17 +529,9 @@ def visualize_receiver_placement(
     ax.set_aspect("equal")
 
     # Add text box with sampling statistics
-    total_rx = len(sample_points)
-    num_target = len(target_receivers)
-    num_interference = len(interference_receivers)
-    pct_target = 100.0 * num_target / total_rx if total_rx > 0 else 0
-    pct_interference = 100.0 * num_interference / total_rx if total_rx > 0 else 0
-
-    stats_text = (
-        f"Total Receivers: {total_rx}\n"
-        f"Target Zone: {num_target} ({pct_target:.1f}%)\n"
-        f"Interference Zone: {num_interference} ({pct_interference:.1f}%)"
-    )
+    stats_text = f"Total Receivers: {len(sample_points)}"
+    if dead_polygons:
+        stats_text += f"\nDead Zones: {len(dead_polygons)}"
 
     ax.text(
         0.02,
@@ -763,16 +615,16 @@ def compare_boresight_performance(
         # Set transmitter position if provided
         if tx_pos is not None:
             tx.position = mi.Point3f(tx_pos)
-            #print(f"  Position: x={tx_pos[0]:.2f}, y={tx_pos[1]:.2f}, z={tx_pos[2]:.2f}")
+            # print(f"  Position: x={tx_pos[0]:.2f}, y={tx_pos[1]:.2f}, z={tx_pos[2]:.2f}")
 
         print(f"  Angles: Azimuth={azimuth_deg:.1f}°, Elevation={elevation_deg:.1f}°")
 
         # Generate RadioMap
         rm = rm_solver(
             scene,
-            max_depth=5,
-            samples_per_tx=int(6e8),
-            cell_size=map_config["cell_size"],
+            max_depth=8,
+            samples_per_tx=int(10e8),
+            cell_size=[0.5,0.5],
             center=map_config["center"],
             orientation=[0, 0, 0],
             size=map_config["size"],
@@ -785,7 +637,7 @@ def compare_boresight_performance(
 
         # Extract signal strength
         rss_watts = rm.rss.numpy()[0, :, :]
-        
+
         # Commenting this out to test if the linear average is improved
         # signal_strength_dBm = 10.0 * np.log10(rss_watts + 1e-30) + 30.0
 
@@ -1084,24 +936,15 @@ def optimize_boresight_pathsolver(
     tx_name,
     map_config,
     scene_xml_path,
-    zone_mask=None,
     zone_params=None,
     num_sample_points=100,
     building_id=10,
     learning_rate=1.0,
     num_iterations=20,
-    loss_type="coverage_maximize",
     verbose=True,
-    seed=None,
     lds="Sobol",  # Random seed for reproducible sampling
     tx_placement_mode="skip",  # "center", "fixed", "line", "skip" (skip = don't move TX)
-    # If true, the center position of the roof polygon is used
-    # Else, use the start position
-    sampler = 'Rejection',
     Tx_start_pos=[0.0, 0.0],
-    save_radiomap_frames=False,
-    frame_save_interval=1,
-    output_dir="/home/tingjunlab/Development/optimize_tx/figures",
 ):
     """
     Optimize boresight using PathSolver with automatic differentiation
@@ -1114,10 +957,6 @@ def optimize_boresight_pathsolver(
 
     # Get TX position for angle calculations
     tx = scene.get(tx_name)
-    #tx_x = float(dr.detach(tx.position[0])[0])
-    #tx_y = float(dr.detach(tx.position[1])[0])
-    #tx_z = float(dr.detach(tx.position[2])[0])
-    #tx_position = [tx_x, tx_y, tx_z]
 
     # Get TX position (new)
     tx = scene.get(tx_name)
@@ -1133,28 +972,14 @@ def optimize_boresight_pathsolver(
     tx_power_dbm = float(tx.power_dbm[0])
     print(f"Transmit Power in dBm: {tx_power_dbm}")
 
-    # Determine if initial_boresight is angles or position
-    # If it's a position [x, y, z], convert to angles
-    # If grid search is used, angles will be overridden anyway
-
-    if verbose:
-        print(f"\n{'='*70}")
-        print("Binary Mask Zone Coverage Optimization")
-        print(f"{'='*70}")
-        print(f"Transmit power: {tx_power_dbm:.2f} dBm")
-        print(f"Learning rate: {learning_rate}")
-        print(f"Iterations: {num_iterations}")
-        print(f"Sample points: {num_sample_points}")
-        print(f"Loss type: {loss_type}")
-        print(f"Map config: {map_config}")
-        print(f"{'='*70}\n")
-
     # TX height already extracted above (tx_z is already detached)
     tx_height = tx_z
 
     # Initialize TxPlacement for accessing building info and edge projection
     # We need this regardless of tx_placement_mode for the edge constraint
-    tx_placement = TxPlacement(scene, tx_name, scene_xml_path, building_id, create_if_missing=False)
+    tx_placement = TxPlacement(
+        scene, tx_name, scene_xml_path, building_id, create_if_missing=False
+    )
 
     # Handle TX placement based on mode
     if tx_placement_mode == "skip":
@@ -1165,7 +990,7 @@ def optimize_boresight_pathsolver(
         if verbose:
             print(f"TX placement mode: skip (using current position)")
             print(
-                #f"  Current TX position: ({x_start_position:.2f}, {y_start_position:.2f}, {tx_height:.2f})"
+                # f"  Current TX position: ({x_start_position:.2f}, {y_start_position:.2f}, {tx_height:.2f})"
             )
     else:
         # Sets the initial location based on mode
@@ -1177,17 +1002,13 @@ def optimize_boresight_pathsolver(
             x_start_position = Tx_start_pos[0]
             y_start_position = Tx_start_pos[1]
             z_pos = tx_placement.building["z_height"]
-            tx.position = mi.Point3f(float(x_start_position), float(y_start_position), float(z_pos))
+            tx.position = mi.Point3f(
+                float(x_start_position), float(y_start_position), float(z_pos)
+            )
         else:
             raise ValueError(
                 f"Unknown tx_placement_mode: {tx_placement_mode}. Must be 'skip', 'center', 'fixed', or 'line'"
             )
-
-    if verbose:
-        #print(f"TX height: {tx_height:.1f}m")
-        print(
-            #f"Boresight Z constraint: must be < {tx_height:.1f}m (no pointing upward)\n"
-        )
 
     # Select LDS from available list
     # Changing the dimension to 3 to support CDT + Turk's
@@ -1204,52 +1025,61 @@ def optimize_boresight_pathsolver(
         qrand = scipy.stats.qmc.Sobol(d=3, scramble=True, seed=None)
 
     # Auto-detect zone type from zone_params
-    if 'vertices' in zone_params:
-        zone_type = 'polygon'
-    elif 'center' in zone_params and 'width' in zone_params and 'height' in zone_params:
-        zone_type = 'box'
+    if "vertices" in zone_params:
+        zone_type = "polygon"
+    elif "center" in zone_params and "width" in zone_params and "height" in zone_params:
+        zone_type = "box"
     else:
         raise ValueError(
             "zone_params must contain either 'vertices' (for polygon) or "
             "'center', 'width', 'height' (for box)"
         )
 
-    if verbose:
-        print(f"Auto-detected zone type: {zone_type}")
-
     # Solve for polygon zone and remove building exclusions.
-    target_zone, building_exclusions, _ = get_zone_polygon_with_exclusions(
+    _, building_exclusions, _ = get_zone_polygon_with_exclusions(
         zone_type=zone_type,
         zone_params=zone_params,
         scene_xml_path=scene_xml_path,
-        exclude_buildings=True
+        exclude_buildings=True,
     )
 
-    # Triangulate using CDT (only need to do this once)
-    triangles, _ = triangulate_zone(
-        target_zone,
-        building_exclusions,
-        buffer_distance=-.01,
-        verbose=True
-    )
+    # Build a clean outer boundary polygon (no holes) for dead-zone clipping and visualization.
+    from shapely.geometry import Polygon as ShapelyPolygon
+    if zone_type == "box":
+        bx, by = zone_params["center"][0], zone_params["center"][1]
+        bw, bh = zone_params["width"], zone_params["height"]
+        box_polygon = ShapelyPolygon([
+            (bx - bw / 2, by - bh / 2),
+            (bx + bw / 2, by - bh / 2),
+            (bx + bw / 2, by + bh / 2),
+            (bx - bw / 2, by + bh / 2),
+        ])
+    else:
+        box_polygon = ShapelyPolygon(zone_params["vertices"])
 
     # PRE-CACHE building polygons for rejection sampling (avoids re-parsing XML every iteration)
     # Convert building_exclusions (list of coordinate lists) to Shapely Polygons once
     cached_building_polygons = []
     for building_coords in building_exclusions:
         try:
-            from shapely.geometry import Polygon as ShapelyPolygon
             building_poly = ShapelyPolygon(building_coords)
             if building_poly.is_valid:
                 cached_building_polygons.append(building_poly)
         except:
             pass
     if verbose:
-        print(f"Cached {len(cached_building_polygons)} building polygons for rejection sampling")
+        print(
+            f"Cached {len(cached_building_polygons)} building polygons for rejection sampling"
+        )
 
-    # Print to see the number of sample points after sampling
-    if verbose:
-        print(f"Actual sample points after building exclusion: {num_sample_points}")
+    # Zone polygon for sampling: box minus in-zone building footprints.
+    # Using difference avoids the polygon-with-holes invalidity that plagued the old approach.
+    if cached_building_polygons:
+        zone_polygon = box_polygon.difference(
+            shapely.ops.unary_union(cached_building_polygons)
+        )
+    else:
+        zone_polygon = box_polygon
 
     # CRITICAL: Remove ALL existing receivers from the scene first
     # This ensures paths.a indexing matches our optimization receivers exactly
@@ -1284,24 +1114,21 @@ def optimize_boresight_pathsolver(
     # Storage for sample points (accessible from outside the wrapped function)
     sample_points_storage = {}
 
+    # This function is used to accumulate "dead" samples to isolate the shape of the dead zones
     def accumulate_samples(dead_zone, qrand_op):
-        # Sample grid points via rejection sampling (global)
-        new_sample_points = sample_grid_points(
-            map_config,
-            scene_xml_path=scene_xml_path,
-            exclude_buildings=True,
-            zone_mask=zone_mask,
-            zone_params=zone_params,
-            qrand=qrand_op,
-            num_points=num_sample_points,
-            cached_building_polygons=cached_building_polygons,  # Use pre-cached polygons
+        # Sample grid points via rejection sampling (full zone w/o any masking)
+        new_sample_points, _, __, ___, ____ = sample_grid_points(
+            zone_polygon,
+            num_sample_points,
+            qrand_op,
+            building_polygons=cached_building_polygons,
+            ground_z=map_config["center"][2],
         )
 
         # Store for visualization outside the loss function
-        sample_points_storage['current'] = new_sample_points
+        sample_points_storage["current"] = new_sample_points
 
         # REPOSITION existing receivers (much faster than remove/add)
-        # Receivers were pre-created before the optimization loop
         for idx, position in enumerate(new_sample_points):
             rx_name = f"opt_rx_{idx}"
             rx_objects[rx_name].position = mi.Point3f(
@@ -1328,19 +1155,93 @@ def optimize_boresight_pathsolver(
         power_per_rx = power_all.sum(axis=tuple(range(1, power_all.ndim)))  # (num_rx,)
 
         # Build combined array: [x, y, power] per receiver
-        rx_data = np.column_stack([
-            new_sample_points[:, 0],  # x
-            new_sample_points[:, 1],  # y
-            power_per_rx,             # power
-        ])  # shape: (num_rx, 3)
+        rx_data = np.column_stack(
+            [
+                new_sample_points[:, 0],  # x
+                new_sample_points[:, 1],  # y
+                power_per_rx,  # power
+            ]
+        )  # shape: (num_rx, 3)
 
-        dead_zone = filter_and_append(rx_data, dead_zone, 10e-13)
+        dead_zone = filter_and_append(rx_data, dead_zone, 20.0)
 
         return dead_zone
     
+    def calculate_weighted_median(values, weights):
+        """
+        Calculates the weighted median of a 1D numpy array.
+        Used to anchor the CVaR target to the true physical distribution.
+        """
+        # 1. Sort values and align weights to the sorted order
+        sort_indices = np.argsort(values)
+        sorted_values = values[sort_indices]
+        sorted_weights = weights[sort_indices]
+        
+        # 2. Find the cumulative sum of the weights
+        cumulative_weights = np.cumsum(sorted_weights)
+        
+        # 3. Find the 50% cutoff point of the total weight
+        cutoff = 0.5 * np.sum(sorted_weights)
+        
+        # 4. Return the value where the cumulative weight crosses the cutoff
+        median_idx = np.searchsorted(cumulative_weights, cutoff)
+        
+        # Handle edge case where searchsorted goes out of bounds
+        median_idx = min(median_idx, len(sorted_values) - 1)
+        
+        return sorted_values[median_idx]
+    
+    def compute_robust_weights(box_polygon, dead_zones, num_dead_samples, num_alive_samples):
+        """
+        Computes Self-Normalized Importance Weights based on spatial areas.
+        """
+        total_samples = num_dead_samples + num_alive_samples
+        
+        # 1. Calculate Physical Areas
+        total_area = box_polygon.area
+        
+        # Calculate union of dead zones to avoid double-counting overlapping areas
+        if dead_zones:
+            from shapely.ops import unary_union
+            dead_area = unary_union(dead_zones).area
+        else:
+            dead_area = 0.0
+            
+        alive_area = total_area - dead_area
+        
+        # 2. Calculate Area Fractions (True Probability)
+        prob_dead_true = dead_area / total_area
+        prob_alive_true = alive_area / total_area
+        
+        # 3. Calculate Sample Fractions (Sampled Probability)
+        # Add epsilon to prevent division by zero if dead zones disappear
+        prob_dead_sampled = (num_dead_samples + 1e-9) / total_samples
+        prob_alive_sampled = (num_alive_samples + 1e-9) / total_samples
+        
+        # 4. Compute Base Weights (P / Q)
+        w_dead = prob_dead_true / prob_dead_sampled
+        w_alive = prob_alive_true / prob_alive_sampled
+        
+        # 5. Build the Array (Assuming dead samples are first in the array)
+        weights_np = np.empty(total_samples)
+        weights_np[:num_dead_samples] = w_dead
+        weights_np[num_dead_samples:] = w_alive
+        
+        # 6. Clip extreme weights (Robustness against vanishing dead zones)
+        max_weight_limit = 5.0
+        weights_np = np.clip(weights_np, a_min=0.01, a_max=max_weight_limit)
+        
+        # 7. Self-Normalize (CRITICAL for Adam Optimizer)
+        # Forces the sum of weights to equal the batch size
+        weights_np = weights_np * (total_samples / np.sum(weights_np))
+        
+        return weights_np
+
     # Define differentiable loss function using @dr.wrap
+    loss_type = "CVaR"
+
     @dr.wrap(source="torch", target="drjit")
-    def compute_loss(azimuth_deg, elevation_deg, x_pos, y_pos, qrand_op, num_sample_points, dead_zone, loss_type='CVaR'):
+    def compute_loss(azimuth_deg, elevation_deg, x_pos, y_pos, loss_type=loss_type):
         """
         Compute loss with AD enabled through field_calculator only
 
@@ -1356,6 +1257,7 @@ def optimize_boresight_pathsolver(
             PathSolver instance used to access _field_calculator
         """
 
+        # Orientation gradients
         dr.enable_grad(azimuth_deg.array)
         dr.enable_grad(elevation_deg.array)
         # Position gradients
@@ -1381,7 +1283,7 @@ def optimize_boresight_pathsolver(
 
         # Adding jitter to smooth out the "Needle" effect and avoid overfitting to sample points
         # Use numpy for random jitter since this happens outside the differentiable path
-        jitter_std_deg = .5  # Small jitter in degrees
+        jitter_std_deg = 0.5  # Small jitter in degrees
         jitter_std_rad = jitter_std_deg * (np.pi / 180.0)
 
         # Generate random jitter using numpy (converted to DrJit Float)
@@ -1395,7 +1297,11 @@ def optimize_boresight_pathsolver(
         pitch_rad_jittered = pitch_rad + pitch_jitter
 
         # Set antenna orientation directly using yaw, pitch, roll
-        scene.get(tx_name).orientation = [yaw_rad_jittered, pitch_rad_jittered, roll_rad]
+        scene.get(tx_name).orientation = [
+            yaw_rad_jittered,
+            pitch_rad_jittered,
+            roll_rad,
+        ]
         print(f"TX orientation: {scene.get(tx_name).orientation}")
 
         # Minimal arithmetic - just identity to register in gradient graph
@@ -1405,23 +1311,32 @@ def optimize_boresight_pathsolver(
         scene.get(tx_name).position = [x_pos_val, y_pos_val, tx_position[2]]
         print(f"Tx position: {scene.get(tx_name).position}")
 
-        # Sample grid points via rejection sampling (global)
-        new_sample_points = sample_grid_points(
-            map_config,
-            scene_xml_path=scene_xml_path,
-            exclude_buildings=True,
-            zone_mask=zone_mask,
-            zone_params=zone_params,
-            qrand=qrand_op,
-            num_points=num_sample_points,
-            cached_building_polygons=cached_building_polygons,  # Use pre-cached polygons
+        # Sample across the full zone, biasing toward dead areas when present
+        new_sample_points, _, __, dead_pts, alive_pts = sample_grid_points(
+            zone_polygon,
+            num_sample_points,
+            qrand,
+            building_polygons=cached_building_polygons,
+            ground_z=map_config["center"][2],
+            dead_polygons=dead_zones if dead_zones else None,
         )
 
-        # Store for visualization outside the loss function
-        sample_points_storage['current'] = new_sample_points
+        fig = visualize_receiver_placement(
+            new_sample_points,
+            map_config,
+            current_tx_position=[dr.detach(x_pos), dr.detach(y_pos), tx_position[2]],
+            box_polygon=box_polygon,
+            dead_polygons=dead_zones if dead_zones else None,
+            scene_xml_path=scene_xml_path,
+            building_id=building_id,
+        )
+        plt.show()
+        plt.close(fig)
 
-        # REPOSITION existing receivers (much faster than remove/add)
-        # Receivers were pre-created before the optimization loop
+        # Store for visualization/debugging
+        sample_points_storage["current"] = new_sample_points
+
+        # Reposition existing receivers using the new spread of receivers
         for idx, position in enumerate(new_sample_points):
             rx_name = f"opt_rx_{idx}"
             rx_objects[rx_name].position = mi.Point3f(
@@ -1440,120 +1355,6 @@ def optimize_boresight_pathsolver(
         # Extract channel coefficients
         h_real, h_imag = paths.a
 
-        # Check if PathSolver found any paths
-        # Use dr.width() to check actual data entries, not just array structure
-        try:
-            h_real_width = dr.width(h_real) if hasattr(h_real, '__len__') else 0
-        except:
-            h_real_width = 0
-
-        if len(h_real) == 0 or h_real_width == 0:
-            # Initialize all counters individually if needed
-            if not hasattr(compute_loss, "_iter_count"):
-                compute_loss._iter_count = 0
-            if not hasattr(compute_loss, "_failed_first_iter"):
-                compute_loss._failed_first_iter = False
-            if not hasattr(compute_loss, "_empty_path_count"):
-                compute_loss._empty_path_count = 0
-            if not hasattr(compute_loss, "_too_many_failures"):
-                compute_loss._too_many_failures = False
-
-            # Increment empty path counter
-            compute_loss._empty_path_count += 1
-
-            print(f"\n  [WARNING] PathSolver found 0 paths! (Empty count: {compute_loss._empty_path_count}/5)")
-            print(f"            Azimuth={float(azimuth_deg.item()):.1f}°, Elevation={float(elevation_deg.item()):.1f}°")
-
-            # Check if we've exceeded the threshold
-            if compute_loss._empty_path_count > 5:
-                compute_loss._too_many_failures = True
-                print(f"            CRITICAL: More than 5 empty PathSolver results detected!")
-                print(f"            Marking optimization for abandonment.\n")
-                penalty = dr.auto.ad.Float(-1e10) - elevation_deg * 0.1 - azimuth_deg * 0.01
-                return penalty
-
-            if compute_loss._iter_count == 0:
-                # Mark first iteration as failed
-                compute_loss._failed_first_iter = True
-                print(f"            First iteration failed - bad zone/TX setup.")
-                print(f"            Signaling caller to skip this configuration.\n")
-                # Return penalty with synthetic gradient
-                # Gradient pushes elevation up (away from ground)
-                penalty = dr.auto.ad.Float(-1e10) - elevation_deg * 0.1
-                return penalty
-
-            # Later iterations - create synthetic gradient to guide optimizer away
-            print(f"            Injecting synthetic gradient to guide optimizer.\n")
-            # Penalty loss with gradient that encourages increasing elevation (pointing up)
-            penalty = dr.auto.ad.Float(-1e10) - elevation_deg * 0.1 - azimuth_deg * 0.01
-            return penalty
-
-        # Increment iteration counter
-        if not hasattr(compute_loss, "_iter_count"):
-            compute_loss._iter_count = 0
-        compute_loss._iter_count += 1
-
-        # DEBUG: Check if any paths were found (only print on first call)
-        # We use a simple flag via a mutable default to track first call
-        if not hasattr(compute_loss, "_first_call_done"):
-            compute_loss._first_call_done = False
-
-        if verbose and not compute_loss._first_call_done:
-            compute_loss._first_call_done = True
-            # Compute total power across all receivers as a quick check
-            total_power = dr.sum(dr.sum(cpx_abs_square((h_real, h_imag))))
-            print(f"  [DEBUG] PathSolver found {len(h_real)} paths for {len(new_sample_points)} receivers")
-            print(f"  [DEBUG] Total path power (linear): {total_power}")
-            if total_power < 1e-25:
-                print(
-                    f"  [WARNING] Very low or zero path power - PathSolver may not be finding paths!"
-                )
-
-        # Additional safety check before tensor reduction
-        # Verify h_real and h_imag have actual data to prevent TensorXf creation with 0 entries
-        try:
-            # Test if we can compute power on a small subset first
-            test_power = cpx_abs_square((h_real, h_imag))
-            if dr.width(test_power) == 0:
-                # Increment empty path counter (initialize if needed)
-                if not hasattr(compute_loss, "_empty_path_count"):
-                    compute_loss._empty_path_count = 0
-                if not hasattr(compute_loss, "_too_many_failures"):
-                    compute_loss._too_many_failures = False
-                compute_loss._empty_path_count += 1
-
-                print(f"\n  [WARNING] cpx_abs_square returned empty tensor! (Empty count: {compute_loss._empty_path_count}/5)")
-                print(f"            h_real width: {dr.width(h_real)}, h_imag width: {dr.width(h_imag)}")
-
-                # Check if we've exceeded the threshold
-                if compute_loss._empty_path_count > 5:
-                    compute_loss._too_many_failures = True
-                    print(f"            CRITICAL: More than 5 empty PathSolver results detected!")
-                    print(f"            Marking optimization for abandonment.\n")
-
-                print(f"            Returning penalty loss.")
-                penalty = dr.auto.ad.Float(-1e10) - elevation_deg * 0.1 - azimuth_deg * 0.01
-                return penalty
-        except Exception as e:
-            # Increment empty path counter
-            if not hasattr(compute_loss, "_empty_path_count"):
-                compute_loss._empty_path_count = 0
-            if not hasattr(compute_loss, "_too_many_failures"):
-                compute_loss._too_many_failures = False
-            compute_loss._empty_path_count += 1
-
-            print(f"\n  [ERROR] Failed to compute cpx_abs_square: {e} (Empty count: {compute_loss._empty_path_count}/5)")
-
-            # Check if we've exceeded the threshold
-            if compute_loss._empty_path_count > 5:
-                compute_loss._too_many_failures = True
-                print(f"           CRITICAL: More than 5 empty PathSolver results detected!")
-                print(f"           Marking optimization for abandonment.\n")
-
-            print(f"         Returning penalty loss.")
-            penalty = dr.auto.ad.Float(-1e10) - elevation_deg * 0.1 - azimuth_deg * 0.01
-            return penalty
-
         # Compute incoherent sum (Raw Channel Gain |h|^2)
         power_relative = dr.sum(
             dr.sum(cpx_abs_square((h_real, h_imag)), axis=-1), axis=-1
@@ -1564,43 +1365,60 @@ def optimize_boresight_pathsolver(
             # LSE (Soft Min)
             dead_zone_threshold = 1e-14
             valid_mask = power_relative > dead_zone_threshold
-            alpha = 5.0 
+            alpha = 5.0
             epsilon = 1e-30
             log_P = dr.log(power_relative + epsilon)
             exponents = -alpha * log_P
             safe_exponents = dr.select(valid_mask, exponents, -1e9)
-            max_exponent = dr.max(safe_exponents) 
+            max_exponent = dr.max(safe_exponents)
             shifted_exponents = safe_exponents - max_exponent
             terms = dr.exp(shifted_exponents)
             masked_terms = dr.select(valid_mask, terms, 0.0)
             sum_terms = dr.sum(masked_terms)
             lse = max_exponent + dr.log(sum_terms + epsilon)
             loss = (1.0 / alpha) * lse
-        
-        elif loss_type == "CVaR":
-            # 1. Convert to dB and Floor Clamp
-            # -120dB floor provides a finite gradient for dead zones
-            val_db = 10.0 * dr.log(power_relative + 1e-35) / dr.log(10.0)
 
-            # 2. Determine the Target via NumPy (The Waterline)
-            # We detach to ensure the goalpost doesn't "cheat" by moving itself
+        elif loss_type == "CVaR":
+            # 1. Convert to Rx Power (dBm) using the pre-extracted float
+            val_db = (10.0 * dr.log(power_relative + 1e-35) / dr.log(10.0)) + tx_power_dbm
+
+            # ==========================================
+            # NEW: CALCULATE IMPORTANCE WEIGHTS
+            # ==========================================
+            # Safely get the count of dead and alive points from your sample_grid_points output
+            num_dead = len(dead_pts) if dead_pts is not None else 0
+            num_alive = len(alive_pts) if alive_pts is not None else len(new_sample_points)
+            
+            weights_np = compute_robust_weights(
+                box_polygon, 
+                dead_zones if dead_zones else None, 
+                num_dead, 
+                num_alive
+            )
+            # ==========================================
+
+            # 2. Determine the Target (The Weighted Waterline)
             val_db_np = np.array(dr.detach(val_db))
-            target_scalar = np.median(val_db_np)
+            target_scalar = calculate_weighted_median(val_db_np, weights_np)
             target = type(val_db)(target_scalar)
 
             # 3. Deficit-Weighted (Quadratic) Hinge Loss
             deficit = target - val_db
             hinge = dr.maximum(deficit, 0.0)
-            loss_contribution = hinge * hinge
-
-            # 4. Normalize by the Tail Count
-            # This is the "Conditional" part of CVaR. 
-            # We only average over the users who are actually failing.
-            tail_mask = deficit > 0.0
-            tail_count = dr.sum(dr.select(tail_mask, 1.0, 0.0))
             
-            # Divide total loss by the number of contributors
-            loss = dr.sum(loss_contribution) / (tail_count + 1e-5)
+            # Convert weights to DrJit Float to inject into AD graph
+            weights_dr = type(val_db)(weights_np)
+            
+            # Multiply by importance weights
+            loss_contribution = (hinge * hinge) * weights_dr
+
+            # 4. Normalize by the Weighted Tail Count
+            tail_mask = deficit > 0.0
+            tail_weights = dr.select(tail_mask, weights_dr, 0.0)
+            weighted_tail_count = dr.sum(tail_weights)
+
+            # Divide total loss by the sum of the weights, not just the raw count
+            loss = dr.sum(loss_contribution) / (weighted_tail_count + 1e-5)
 
         elif loss_type == "threshold":
             # Target: -90 dBm (The goal line we want users to cross)
@@ -1612,17 +1430,17 @@ def optimize_boresight_pathsolver(
             epsilon = 1e-30
             safe_power = dr.select(is_alive, power_relative, 1.0)
             vals_db = 10.0 * dr.log(safe_power + epsilon) / dr.log(10.0)
-            
+
             # Hinge error
             error = target_db - vals_db
-            
+
             # Params: Mask, True Value, False Value
             active_loss = dr.select(is_alive, dr.maximum(error, 0.0), 0.0)
-            
+
             # Normalize
             pushing_mask = is_alive & (error > 0)
             pushing_count = dr.sum(dr.select(pushing_mask, 1.0, 0.0))
-            
+
             # Minimize the total contributing error
             loss = dr.sum(active_loss) / (pushing_count + 1e-5)
 
@@ -1638,30 +1456,12 @@ def optimize_boresight_pathsolver(
             avg_utility = log_utility / (count + 1e-5)
             loss = -avg_utility
 
-        # Use DBSCAN to cluster dead zones by spatial position (x, y columns only)
-        #clusters = HDBSCAN(
-        #    min_cluster_size=5,       
-        #    min_samples=25,           
-        #    cluster_selection_epsilon=1.0,
-        #    allow_single_cluster=False,
-        #    copy=True
-        #).fit(dead_zone[:, :2])
-        clusters = DBSCAN(eps=20, min_samples=10).fit(dead_zone[:,:2])
-
-        labels = clusters.labels_
-        # Save number of clusters and noise points
-        n_clusters_ = len(set(labels)) - (1 if -1 in labels else 0)
-        n_noise_ = list(labels).count(-1)
-
-        print("Estimated number of clusters: %d" % n_clusters_)
-        print("Estimated number of noise points: %d" % n_noise_)
-
-        return loss, clusters
+        return loss
 
     # Calculate the initial azimuth and elevation angles based on the position of the transmitter + center of the zone
     # Add z-coordinate (target_height) to zone center which only has [x, y]
-    target_z = map_config.get('target_height', 1.5)
-    look_at_xyz = list(zone_params['center'])[:2] + [target_z]
+    target_z = map_config.get("target_height", 1.5)
+    look_at_xyz = list(zone_params["center"])[:2] + [target_z]
     initial_azimuth, initial_elevation = compute_initial_angles_from_position(
         [x_start_position, y_start_position, tx_height],
         look_at_xyz,
@@ -1700,34 +1500,19 @@ def optimize_boresight_pathsolver(
     print(f"        Testing if passing through @dr.wrap breaks PathSolver")
     print(f"{'='*70}\n")
 
-    # Optimizer: Adam shows the best performance
-    # STEP 1: Only optimize angles (2 parameters)
-    # TODO STEP 3: Add tx_x, tx_y to optimizer after Step 1 passes
-    optimizer = torch.optim.Adam([azimuth, elevation, x_pos, y_pos], lr=learning_rate, betas=(0.9, 0.999))
+    # Optimizer: Adam shows the best performance out of the gradient descent family
+    optimizer = torch.optim.Adam(
+        [azimuth, elevation, x_pos, y_pos], lr=learning_rate, betas=(0.9, 0.999)
+    )
 
     # Learning rate scheduler: required to jump out of local minima for difficult loss surfaces...
     use_scheduler = num_iterations >= 50
 
     if use_scheduler:
-        # Cosine annealing with warm restarts: periodically resets LR to escape local minima.
-        # T_0 = restart period (iterations), T_mult = multiply period after each restart.
-        # With T_0=25, T_mult=2: restarts at iter 25, 75 (25+50), giving 3 exploration phases.
+        # Using cosine anneling warm restarts to avoid being trapped in local minima
         scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
             optimizer, T_0=25, T_mult=2, eta_min=learning_rate * 0.01
         )
-        if verbose:
-            print(f"Learning rate scheduler enabled (cosine annealing with warm restarts)")
-            print(f"  Initial LR: {learning_rate:.4f}")
-            print(f"  Restart period: T_0=25, T_mult=2 (restarts at iter 25, 75)")
-            print(f"  Min LR: {learning_rate * 0.01:.6f}")
-
-    # Create output directory for frame saving
-    if save_radiomap_frames:
-        import os
-
-        os.makedirs(output_dir, exist_ok=True)
-        if verbose:
-            print(f"Saving frames to: {output_dir}")
 
     # Tracking
     loss_history = []
@@ -1742,144 +1527,54 @@ def optimize_boresight_pathsolver(
     final_az_list = np.array([])
 
     # Creating empty numpy array of dead zone (x, y columns)
-    dead_areas = np.zeros((0, 3))
+    dead_points = np.zeros((0, 3))
+    # List of shapely polygons representing dead zones
+    dead_zones = []
 
     # Start the optimization
     start_time = time.time()
-    for iteration in range(num_iterations):
+    # The number of iterations signifies how many times you want the optimizer to iterate
+    # The range should be extended 10x to accumulate samples for dead zone isolation
+    for iteration in range(10 * num_iterations):
         if verbose and iteration == 0:
             print(f"\n{'='*70}")
             print(f"STARTING OPTIMIZATION - Iteration {iteration+1}/{num_iterations}")
             print(f"{'='*70}")
             print(f"  Starting Azimuth: {azimuth.item():.2f}°")
             print(f"  Starting Elevation: {elevation.item():.2f}°")
-            print(f"  (These should match the naive baseline angles shown above)")
-            print(f"{'='*70}\n")
+            print(f"  Starting Position [x]: {tx_position[0]} m")
+            print(f"  Starting Position [y]: {tx_position[1]} m")
 
-        # DEBUG: Verify tensor setup before compute_loss
-        if iteration == 0:
-            print(f"[TENSOR DEBUG] azimuth requires_grad: {azimuth.requires_grad}")
-            print(f"[TENSOR DEBUG] elevation requires_grad: {elevation.requires_grad}")
-            print(f"[TENSOR DEBUG] x_pos requires_grad: {x_pos.requires_grad}")
-            print(f"[TENSOR DEBUG] x_pos value: {x_pos.item()}")
+        # Accumulate dead zone samples for iterations 1-9
+        dead_points = accumulate_samples(dead_points, qrand)
 
-        # Accumulate dead zone samples every iteration
-        dead_areas = accumulate_samples(dead_areas, qrand)
+        # On the 10th iteration: build dead zone polygons, compute loss, then reset
+        if (iteration + 1) % 5 == 0:
+            # Use DBSCAN to find clusters across accumulated dead points
+            clusters = DBSCAN(eps=20, min_samples=10).fit(dead_points[:, :2])
+            labels = clusters.labels_
+            unique_labels = set(labels) - {-1}
 
-        # Every 5th accumulated batch, compute loss and reset
-        if (iteration + 1) % 10 == 0:
-            dead_zone_pos = dead_areas[:,:2]
-            loss, clusters = compute_loss(azimuth, elevation, x_pos, y_pos, qrand, num_sample_points, dead_areas, sampler)
-            # Reset the dead zone for the next accumulation window
-            dead_areas = np.zeros((0, 3))
+            # Build one buffered hull polygon per cluster
+            for cluster_id in sorted(unique_labels):
+                pts = dead_points[labels == cluster_id, :2]
+                shape = alphashape.alphashape(pts, alpha=0.05)
+                shape = shapely.make_valid(shape)
+                clipped = shapely.buffer(shape, 15.0).intersection(box_polygon)
+                if not clipped.is_empty:
+                    dead_zones.append(clipped)
 
-        loss, clusters = compute_loss(azimuth, elevation, x_pos, y_pos, qrand, num_sample_points, dead_areas, sampler)
-        # Take convex hull of each cluster (2D: x, y only)
-        labels = clusters.labels_
-        unique_labels = set(labels) - {-1}
-        dead_xy = dead_areas[:, :2]
-
-        if len(unique_labels) > 0:
-            fig, ax = plt.subplots()
-            colors = plt.cm.tab10(np.linspace(0, 1, max(len(unique_labels), 1)))
-
-            for i, cluster_id in enumerate(sorted(unique_labels)):
-                mask = labels == cluster_id
-                pts = dead_xy[mask]
-                ax.scatter(pts[:, 0], pts[:, 1], color=colors[i],
-                           label=f'Cluster {cluster_id}', alpha=0.5, s=10)
-
-                if len(pts) >= 3:
-                    try:
-                        import alphashape
-                        shape = alphashape.alphashape(pts, alpha=0.05)
-                        buffered_shape = shapely.buffer(shape, 30.0)
-                        if not buffered_shape.is_empty and buffered_shape.geom_type == 'Polygon':
-                            x, y = buffered_shape.exterior.xy
-                            ax.plot(x, y, color=colors[i], linewidth=1.5)
-                            ax.fill(x, y, color=colors[i], alpha=0.15)
-                    except Exception as e:
-                        print(f"  ConvexHull failed for cluster {cluster_id}: {e}")
-
-            noise_mask = labels == -1
-            if np.any(noise_mask):
-                ax.scatter(dead_xy[noise_mask, 0], dead_xy[noise_mask, 1],
-                           color='gray', label='Noise', alpha=0.3, s=5, marker='x')
-
-            ax.set_xlabel('X')
-            ax.set_ylabel('Y')
-            ax.set_aspect('equal')
-            ax.legend()
-            ax.set_title(f'Dead Zone Clusters (iter {iteration+1})')
-            plt.show()
-
-
-        # Check if first iteration failed (no paths found)
-        if iteration == 0 and hasattr(compute_loss, "_failed_first_iter") and compute_loss._failed_first_iter:
-            print("\n" + "="*70)
-            print("OPTIMIZATION ABORTED: First iteration found 0 paths")
-            print("="*70)
-            print("This zone/TX configuration cannot find any propagation paths.")
-            print("Possible causes:")
-            print("  - TX is too low (pointing into ground)")
-            print("  - Zone is entirely blocked by buildings")
-            print("  - Scene geometry issues")
-            print("\nReturning None to signal failure to caller.")
-            print("="*70 + "\n")
-            initial_pos = [float(tx_position[0]) if hasattr(tx_position[0], 'item') else float(tx_position[0]),
-                           float(tx_position[1]) if hasattr(tx_position[1], 'item') else float(tx_position[1]),
-                           float(tx_position[2]) if hasattr(tx_position[2], 'item') else float(tx_position[2])]
-            return initial_angles, None, None, None, None, initial_angles, initial_pos, initial_pos
-
-        # Check if too many failures occurred during optimization
-        if hasattr(compute_loss, "_too_many_failures") and compute_loss._too_many_failures:
-            print("\n" + "="*70)
-            print("OPTIMIZATION ABORTED: More than 5 empty PathSolver results")
-            print("="*70)
-            print(f"Empty path count: {compute_loss._empty_path_count}")
-            print(f"Current iteration: {iteration+1}/{num_iterations}")
-            print("\nThis configuration is consistently failing to find propagation paths.")
-            print("Possible causes:")
-            print("  - Optimizer is pointing antenna into ground or sky")
-            print("  - Zone geometry is incompatible with TX placement")
-            print("  - Extreme antenna angles causing no valid paths")
-            print("\nReturning None to signal failure to caller.")
-            print("="*70 + "\n")
-            initial_pos = [float(tx_position[0]) if hasattr(tx_position[0], 'item') else float(tx_position[0]),
-                           float(tx_position[1]) if hasattr(tx_position[1], 'item') else float(tx_position[1]),
-                           float(tx_position[2]) if hasattr(tx_position[2], 'item') else float(tx_position[2])]
-            return initial_angles, None, None, None, None, initial_angles, initial_pos, initial_pos
-        
-        loss.backward()
-
-        # DEBUG: Check gradient computation
-        print(f"[GRAD DEBUG] azimuth.grad: {azimuth.grad}")
-        print(f"[GRAD DEBUG] elevation.grad: {elevation.grad}")
-        print(f"[GRAD DEBUG] x_pos.grad: {x_pos.grad}")
-        if x_pos.grad is not None:
-            print(f"[GRAD DEBUG] x_pos.grad value: {x_pos.grad.item()}")
+            loss = compute_loss(
+                azimuth, elevation, x_pos, y_pos
+            )
+            # Reset for the next accumulation window
+            dead_points = np.zeros((0, 3))
+            dead_zones = []
         else:
-            print("[GRAD DEBUG] x_pos.grad is None - gradient not computed!")
+            continue
 
-        # Visualize the Sobol sampling pattern (only save every N iterations to reduce file count)
-        if save_radiomap_frames and (iteration % frame_save_interval == 0):
-            current_points = sample_points_storage.get('current', None)
-            if current_points is not None:
-                fig = visualize_receiver_placement(
-                    current_points,
-                    zone_mask,
-                    map_config,
-                    tx_position=tx_position,
-                    scene_xml_path=scene_xml_path,
-                    title=f"LDS - Iteration {iteration}",
-                    figsize=(14, 10),
-                )
-                plt.savefig(
-                    f"{output_dir}/sampling_iteration_{iteration:04d}.png",
-                    dpi=100,
-                    bbox_inches="tight",
-                )
-                plt.close(fig)
+        # Calculate the gradients in terms of each parameter
+        loss.backward()
 
         # Track gradient norm for diagnostics
         grad_azimuth_val = azimuth.grad.item() if azimuth.grad is not None else 0.0
@@ -1891,29 +1586,11 @@ def optimize_boresight_pathsolver(
         grad_norm = np.sqrt(grad_azimuth_val**2 + grad_elevation_val**2)
         gradient_history.append(grad_norm)
 
-        if verbose:
-            print(
-                f"  Gradients: dAz={grad_azimuth_val:+.3e}°, dEl={grad_elevation_val:+.3e}°"
-            )
-            # Convert loss back to mean power in dBm
-            # Since loss = -mean(dBm), we just negate it to get mean(dBm)
-            mean_power_in_zone_dbm = -loss.item()
-            print(
-                f"  Loss: {loss.item():.4f}, Mean Power in Zone: {mean_power_in_zone_dbm:.2f} dBm"
-            )
-
-        accumulation_steps = 10
-        if (iteration + 1) % accumulation_steps == 0:
-            # Average the accumulated gradients instead of using the sum
-            for param in [azimuth, elevation, x_pos, y_pos]:
-                if param.grad is not None:
-                    param.grad /= accumulation_steps
-            print("Stepping optimizer")
-            optimizer.step()
-            optimizer.zero_grad()
+        optimizer.step()
+        optimizer.zero_grad()
 
         # Update learning rate if scheduler is enabled (only on optimizer step iterations)
-        if use_scheduler and (iteration + 1) % accumulation_steps == 0:
+        if use_scheduler:
             scheduler.step()
 
         # Apply constraints on angles
@@ -1927,19 +1604,12 @@ def optimize_boresight_pathsolver(
         # Apply constraints on Transmitter Position
         # Constrain to the roof polygon (interior is fine, snap to edge if outside)
         with torch.no_grad():
-            proj_x, proj_y = tx_placement.project_to_polygon(
-                x_pos.item(),
-                y_pos.item()
-            )
+            proj_x, proj_y = tx_placement.project_to_polygon(x_pos.item(), y_pos.item())
             x_pos.data.fill_(proj_x)
             y_pos.data.fill_(proj_y)
 
-        # Track
-        #loss_history.append(loss.item())
-        #angle_history.append([float(dr.detach(azimuth)), float(dr.detach(elevation))])
-
         # Modified to reflect robust value over the lowest loss
-        if iteration > (num_iterations - 10):
+        if iteration >= 10 * (num_iterations - 10):
             # Save the values to a list
             final_az_list = np.append(final_az_list, azimuth.item())
             final_el_list = np.append(final_el_list, elevation.item())
@@ -1951,23 +1621,14 @@ def optimize_boresight_pathsolver(
     # Save the elapsed time for metrics
     elapsed_time = time.time() - start_time
 
-    # Cleanup receivers
-    # This is required to make sure the RadioMap calculation doesn't have any extraneous recievers
+    # Cleanup Rx
+    # This is required to make sure the RadioMap calculation doesn't leave any extraneous recievers
     for rx_name in rx_names:
         if rx_name in [obj.name for obj in scene.receivers.values()]:
             scene.remove(rx_name)
 
-    # Set up final scene
+    # Grab the final position
     tx = scene.get(tx_name)
-
-    # Set final antenna orientation using best angles (non-AD) - use pure Python floats
-    # Failing to do this can cause issues with the RadioMap solver...
-    final_yaw_rad, final_pitch_rad = azimuth_elevation_to_yaw_pitch(
-        best_azimuth_final, best_elevation_final
-    )
-    tx.orientation = mi.Point3f(float(final_yaw_rad), float(final_pitch_rad), 0.0)
-
-    # Extract final position from scene after optimization
     final_tx_position = [dr.detach(tx.position[i]) for i in range(3)]
 
     # Compute final coverage statistics
@@ -1978,19 +1639,15 @@ def optimize_boresight_pathsolver(
         "tx_power_dbm": tx_power_dbm,
     }
 
-    if verbose:
-        print(f"\n{'='*70}")
-        print("Optimization Complete!")
-        print(f"{'='*70}")
-        print(
-            f"Best angles: Azimuth={best_azimuth_final:.1f}°, Elevation={best_elevation_final:.1f}°"
-        )
-        #if final_tx_position[0] != initial_tx_position[0]:
-        #    print(f"TX Position change (Δx): {final_tx_position[0] - initial_tx_position[0]:.2f}m")
-        print(f"Total time: {elapsed_time:.1f}s")
-        print(f"Time per iteration: {elapsed_time/num_iterations:.2f}s")
-        print(f"{'='*70}\n")
-
     # Return angles and positions
     best_angles = [best_azimuth_final, best_elevation_final]
-    return best_angles, loss_history, angle_history, gradient_history, coverage_stats, initial_angles, initial_tx_position, final_tx_position
+    return (
+        best_angles,
+        loss_history,
+        angle_history,
+        gradient_history,
+        coverage_stats,
+        initial_angles,
+        initial_tx_position,
+        final_tx_position,
+    )
