@@ -1383,7 +1383,7 @@ def optimize_boresight_pathsolver(
             val_db = (10.0 * dr.log(power_relative + 1e-35) / dr.log(10.0)) + tx_power_dbm
 
             # ==========================================
-            # NEW: CALCULATE IMPORTANCE WEIGHTS
+            # CALCULATE IMPORTANCE WEIGHTS
             # ==========================================
             # Safely get the count of dead and alive points from your sample_grid_points output
             num_dead = len(dead_pts) if dead_pts is not None else 0
@@ -1417,8 +1417,20 @@ def optimize_boresight_pathsolver(
             tail_weights = dr.select(tail_mask, weights_dr, 0.0)
             weighted_tail_count = dr.sum(tail_weights)
 
-            # Divide total loss by the sum of the weights, not just the raw count
-            loss = dr.sum(loss_contribution) / (weighted_tail_count + 1e-5)
+            # Calculate the pure CVaR loss
+            loss_cvar = dr.sum(loss_contribution) / (weighted_tail_count + 1e-5)
+
+            # ==========================================
+            # NEW: HYBRID REGULARIZATION PENALTY
+            # ==========================================
+            # A gentle global penalty pushing ALL receivers to have better signal.
+            # Minimizing (-val_db) means maximizing val_db (the signal strength).
+            global_penalty = dr.mean(-val_db)
+            
+            # Blend them together. 
+            # lambda = 0.01 forces CVaR to steer, but global_penalty prevents sacrificing the alive zone.
+            reg_lambda = 0.01 
+            loss = loss_cvar + (reg_lambda * global_penalty)
 
         elif loss_type == "threshold":
             # Target: -90 dBm (The goal line we want users to cross)
@@ -1560,7 +1572,7 @@ def optimize_boresight_pathsolver(
                 pts = dead_points[labels == cluster_id, :2]
                 shape = alphashape.alphashape(pts, alpha=0.05)
                 shape = shapely.make_valid(shape)
-                clipped = shapely.buffer(shape, 15.0).intersection(box_polygon)
+                clipped = shapely.buffer(shape, 30.0).intersection(box_polygon)
                 if not clipped.is_empty:
                     dead_zones.append(clipped)
 
