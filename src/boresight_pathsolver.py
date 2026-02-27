@@ -1304,6 +1304,10 @@ def optimize_boresight_pathsolver(
         jitter_std_deg = 0.5  # Small jitter in degrees
         jitter_std_rad = jitter_std_deg * (np.pi / 180.0)
 
+        jitter_std_m = 0.1
+        pos_jitter = dr.auto.ad.Float(np.random.normal(-jitter_std_m, jitter_std_m))
+        dr.disable_grad(pos_jitter)
+
         # Generate random jitter using numpy (converted to DrJit Float)
         yaw_jitter = dr.auto.ad.Float(np.random.normal(0.0, jitter_std_rad))
         pitch_jitter = dr.auto.ad.Float(np.random.normal(0.0, jitter_std_rad))
@@ -1311,8 +1315,10 @@ def optimize_boresight_pathsolver(
         dr.disable_grad(pitch_jitter)
 
         # Apply jitter to orientation
-        yaw_rad_jittered = yaw_rad #+ yaw_jitter
-        pitch_rad_jittered = pitch_rad #+ pitch_jitter
+        yaw_rad_jittered = yaw_rad + yaw_jitter
+        pitch_rad_jittered = pitch_rad + pitch_jitter
+        x_pos_jittered =  x_pos + pos_jitter
+        y_pos_jittered =  y_pos + pos_jitter
 
         # Set antenna orientation directly using yaw, pitch, roll
         scene.get(tx_name).orientation = [
@@ -1323,8 +1329,9 @@ def optimize_boresight_pathsolver(
         print(f"TX orientation: {scene.get(tx_name).orientation}")
 
         # Minimal arithmetic - just identity to register in gradient graph
-        x_pos_val = x_pos * dr.auto.ad.Float(1.0)
-        y_pos_val = y_pos * dr.auto.ad.Float(1.0)
+        # Adding in some jitter to avoid getting stuck in corners
+        x_pos_val = x_pos_jittered * dr.auto.ad.Float(1.0)
+        y_pos_val = y_pos_jittered * dr.auto.ad.Float(1.0)
 
         scene.get(tx_name).position = [x_pos_val, y_pos_val, tx_position[2]]
         print(f"Tx position: {scene.get(tx_name).position}")
