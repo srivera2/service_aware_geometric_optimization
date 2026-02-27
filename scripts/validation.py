@@ -24,6 +24,7 @@ import argparse
 import gc
 import time
 import threading
+import traceback
 from datetime import datetime
 
 # Add the src directory to the Python path
@@ -39,6 +40,8 @@ from boresight_pathsolver import create_zone_mask, optimize_boresight_pathsolver
 from angle_utils import azimuth_elevation_to_yaw_pitch
 from zone_validator import find_valid_zone
 
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
@@ -49,9 +52,9 @@ CONFIG = {
     'max_scenes': 49,  # Set to None for all scenes
 
     # Test matrix
-    'samplers': ["Rejection", "CDT"],
-    'frequencies': [1.0e9, 9.0e9],
-    'lds_methods': ["Sobol", "Halton", "Latin"],
+    'samplers': ["Rejection"],
+    'frequencies': [7.0e9],
+    'lds_methods': ["Halton"],
 
     # Map configuration
     'map_config': {
@@ -83,14 +86,14 @@ CONFIG = {
 
     # Optimization settings
     'optimization': {
-        'num_sample_points': 64,
-        'learning_rate': 2.0,
-        'num_iterations': 100,
+        'num_sample_points': 300,
+        'learning_rate': 1.0,
+        'num_iterations': 10,
     },
 
     # RadioMapSolver settings for evaluation
     'rm_solver': {
-        'max_depth': 5,
+        'max_depth': 8,
         'samples_per_tx': int(6e8),
     },
 
@@ -103,6 +106,8 @@ CONFIG = {
     'plot_dir': 'validation_plots',
 }
 
+# Setting visible device (change as needed)
+os.environ["CUDA_VISIBLE_DEVICES"] = "2,3"
 
 # =============================================================================
 # CHECKPOINT AND PROGRESS UTILITIES
@@ -405,24 +410,24 @@ def run_validation(config=None, checkpoint_file='validation_checkpoint.pkl',
                     try:
                         # Run optimization (with heartbeat monitoring)
                         with OperationWatchdog("optimize", scene_name, interval=60):
-                            best_angles, loss_hist, angle_hist, grad_hist, cov_stats, initial_angles = \
+                            best_angles, loss_hist, angle_hist, grad_hist, cov_stats, initial_angles, \
+                                initial_tx_pos, final_tx_pos = \
                                 optimize_boresight_pathsolver(
                                     scene=scene,
                                     tx_name="gnb",
                                     map_config=config['map_config'],
                                     scene_xml_path=scene_xml_path,
-                                    zone_mask=zone_mask,
                                     zone_params=zone_params,
+                                    building_id=selected_building_id,
                                     num_sample_points=config['optimization']['num_sample_points'],
                                     learning_rate=config['optimization']['learning_rate'],
                                     num_iterations=config['optimization']['num_iterations'],
                                     verbose=False,
-                                    lds=lds,
-                                    sampler=sampler
+                                    lds=lds
                                 )
 
-                        print(f"    Initial: Az={initial_angles[0]:.1f}, El={initial_angles[1]:.1f}")
-                        print(f"    Best:    Az={best_angles[0]:.1f}, El={best_angles[1]:.1f}")
+                        print(f"    Initial: Az={float(initial_angles[0]):.1f}, El={float(initial_angles[1]):.1f}")
+                        print(f"    Best:    Az={float(best_angles[0]):.1f}, El={float(best_angles[1]):.1f}")
 
                         # Evaluate initial configuration (with heartbeat monitoring)
                         with OperationWatchdog("evaluate_initial", scene_name, interval=30):
@@ -465,10 +470,13 @@ def run_validation(config=None, checkpoint_file='validation_checkpoint.pkl',
                         }
 
                         improvement = np.median(zone_power_optimized) - np.median(zone_power_initial)
+                        improvement2 = np.percentile(zone_power_optimized, 10) - np.percentile(zone_power_initial, 10)
                         print(f"    Median improvement: {improvement:+.2f} dB")
+                        print(f"    10th Percentile Improvement: {improvement2:+.2f} dB")
 
                     except Exception as e:
                         print(f"    ERROR in {result_key}: {type(e).__name__}: {e}")
+                        traceback.print_exc()
                         results[result_key] = {
                             'status': 'error',
                             'scene_name': scene_name,

@@ -571,6 +571,7 @@ def compare_boresight_performance(
     naive_transmitter_pos=None,
     optimized_transmitter_pos=None,
     title="Boresight Optimization Comparison",
+    fig=False
 ):
     """
     Compare naive baseline vs optimized boresight performance using RadioMapSolver.
@@ -694,255 +695,259 @@ def compare_boresight_performance(
         results["Optimized"]["median"] - results["Naive Baseline"]["median"]
     )
 
-    # Create comparison plots
-    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    if fig is True:
 
-    # Helper function to convert Watts to dBm
-    def watts_to_dbm(watts):
-        return 10.0 * np.log10(watts + 1e-30) + 30.0
+        # Create comparison plots
+        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
 
-    # Convert all power values to dBm for better visualization
-    all_power_watts = np.concatenate(
-        [
-            results["Naive Baseline"]["power_values"],
-            results["Optimized"]["power_values"],
-        ]
-    )
-    all_power_dbm = watts_to_dbm(all_power_watts)
-    naive_power_dbm = watts_to_dbm(results["Naive Baseline"]["power_values"])
-    optimized_power_dbm = watts_to_dbm(results["Optimized"]["power_values"])
-    naive_mean_dbm = watts_to_dbm(results["Naive Baseline"]["mean"])
-    optimized_mean_dbm = watts_to_dbm(results["Optimized"]["mean"])
+        # Helper function to convert Watts to dBm
+        def watts_to_dbm(watts):
+            return 10.0 * np.log10(watts + 1e-30) + 30.0
 
-    data_min_dbm = np.min(all_power_dbm)
-    data_max_dbm = np.max(all_power_dbm)
+        # Convert all power values to dBm for better visualization
+        all_power_watts = np.concatenate(
+            [
+                results["Naive Baseline"]["power_values"],
+                results["Optimized"]["power_values"],
+            ]
+        )
+        all_power_dbm = watts_to_dbm(all_power_watts)
+        naive_power_dbm = watts_to_dbm(results["Naive Baseline"]["power_values"])
+        optimized_power_dbm = watts_to_dbm(results["Optimized"]["power_values"])
+        naive_mean_dbm = watts_to_dbm(results["Naive Baseline"]["mean"])
+        optimized_mean_dbm = watts_to_dbm(results["Optimized"]["mean"])
 
-    # Plot 1: Histograms (PDF)
-    ax = axes[0, 0]
-    # Use linear binning in dBm space (dB is already logarithmic)
-    if data_max_dbm > data_min_dbm:
-        bins = np.linspace(data_min_dbm, data_max_dbm, 150)
-    else:
-        # Handle edge case where all values are the same
-        bins = np.linspace(data_min_dbm - 1, data_max_dbm + 1, 150)
+        data_min_dbm = np.min(all_power_dbm)
+        data_max_dbm = np.max(all_power_dbm)
 
-    ax.hist(
-        naive_power_dbm,
-        bins=bins,
-        alpha=0.6,
-        label="Naive Baseline",
-        color="orange",
-        density=True,
-    )
-    ax.hist(
-        optimized_power_dbm,
-        bins=bins,
-        alpha=0.6,
-        label="Optimized",
-        color="green",
-        density=True,
-    )
-    ax.axvline(
-        naive_mean_dbm,
-        color="orange",
-        linestyle="--",
-        linewidth=2,
-        label=f"Naive Mean: {naive_mean_dbm:.2f} dBm",
-    )
-    ax.axvline(
-        optimized_mean_dbm,
-        color="green",
-        linestyle="--",
-        linewidth=2,
-        label=f"Optimized Mean: {optimized_mean_dbm:.2f} dBm",
-    )
-    ax.set_xlabel("Signal Strength (dBm)")
-    ax.set_ylabel("Probability Density")
-    ax.set_title("Power Distribution in Coverage Zone (PDF)")
-    ax.legend(fontsize=9)
-    ax.grid(True, alpha=0.3)
-    ax.set_xlim(data_min_dbm, data_max_dbm)
+        # Plot 1: Histograms (PDF)
+        ax = axes[0, 0]
+        # Use linear binning in dBm space (dB is already logarithmic)
+        if data_max_dbm > data_min_dbm:
+            bins = np.linspace(data_min_dbm, data_max_dbm, 150)
+        else:
+            # Handle edge case where all values are the same
+            bins = np.linspace(data_min_dbm - 1, data_max_dbm + 1, 150)
 
-    # Plot 2: CDFs
-    ax = axes[0, 1]
-    for config_name in ["Naive Baseline", "Optimized"]:
-        power_watts = results[config_name]["power_values"]
-        power_dbm = watts_to_dbm(power_watts)
-        sorted_power = np.sort(power_dbm)
-        cdf = np.arange(1, len(sorted_power) + 1) / len(sorted_power)
-        color = "orange" if config_name == "Naive Baseline" else "green"
-        ax.plot(sorted_power, cdf, label=config_name, color=color, linewidth=2)
-
-        # Mark median
-        median_watts = results[config_name]["median"]
-        median_dbm = watts_to_dbm(median_watts)
+        ax.hist(
+            naive_power_dbm,
+            bins=bins,
+            alpha=0.6,
+            label="Naive Baseline",
+            color="orange",
+            density=True,
+        )
+        ax.hist(
+            optimized_power_dbm,
+            bins=bins,
+            alpha=0.6,
+            label="Optimized",
+            color="green",
+            density=True,
+        )
         ax.axvline(
-            median_dbm,
-            color=color,
+            naive_mean_dbm,
+            color="orange",
             linestyle="--",
-            alpha=0.5,
-            label=f"{config_name} Median: {median_dbm:.2f} dBm",
+            linewidth=2,
+            label=f"Naive Mean: {naive_mean_dbm:.2f} dBm",
+        )
+        ax.axvline(
+            optimized_mean_dbm,
+            color="green",
+            linestyle="--",
+            linewidth=2,
+            label=f"Optimized Mean: {optimized_mean_dbm:.2f} dBm",
+        )
+        ax.set_xlabel("Signal Strength (dBm)")
+        ax.set_ylabel("Probability Density")
+        ax.set_title("Power Distribution in Coverage Zone (PDF)")
+        ax.legend(fontsize=9)
+        ax.grid(True, alpha=0.3)
+        ax.set_xlim(data_min_dbm, data_max_dbm)
+
+        # Plot 2: CDFs
+        ax = axes[0, 1]
+        for config_name in ["Naive Baseline", "Optimized"]:
+            power_watts = results[config_name]["power_values"]
+            power_dbm = watts_to_dbm(power_watts)
+            sorted_power = np.sort(power_dbm)
+            cdf = np.arange(1, len(sorted_power) + 1) / len(sorted_power)
+            color = "orange" if config_name == "Naive Baseline" else "green"
+            ax.plot(sorted_power, cdf, label=config_name, color=color, linewidth=2)
+
+            # Mark median
+            median_watts = results[config_name]["median"]
+            median_dbm = watts_to_dbm(median_watts)
+            ax.axvline(
+                median_dbm,
+                color=color,
+                linestyle="--",
+                alpha=0.5,
+                label=f"{config_name} Median: {median_dbm:.2f} dBm",
+            )
+
+        ax.set_xlabel("Signal Strength (dBm)")
+        ax.set_ylabel("Cumulative Probability")
+        ax.set_title("Cumulative Distribution Function (CDF)")
+        ax.legend(fontsize=9)
+        ax.grid(True, alpha=0.3)
+        ax.set_xlim(data_min_dbm, data_max_dbm)
+
+        # Plot 3: Box plot comparison
+        ax = axes[1, 0]
+        data_to_plot = [
+            naive_power_dbm,
+            optimized_power_dbm,
+        ]
+        bp = ax.boxplot(
+            data_to_plot,
+            labels=["Naive Baseline", "Optimized"],
+            patch_artist=True,
+            showmeans=True,
+        )
+        bp["boxes"][0].set_facecolor("orange")
+        bp["boxes"][1].set_facecolor("green")
+        ax.set_ylabel("Signal Strength (dBm)")
+        ax.set_title("Power Distribution Comparison (Box Plot)")
+        ax.grid(True, alpha=0.3, axis="y")
+
+        # Add improvement annotation
+        # Calculate improvement in dB
+        improvement_db_mean = optimized_mean_dbm - naive_mean_dbm
+        naive_median_dbm = watts_to_dbm(results["Naive Baseline"]["median"])
+        optimized_median_dbm = watts_to_dbm(results["Optimized"]["median"])
+        improvement_db_median = optimized_median_dbm - naive_median_dbm
+
+        ax.text(
+            1.5,
+            optimized_mean_dbm + 2,  # 2 dB above optimized mean
+            f"Improvement:\nMean: {improvement_db_mean:+.2f} dB\nMedian: {improvement_db_median:+.2f} dB",
+            bbox=dict(
+                boxstyle="round",
+                facecolor="lightgreen" if improvement_db_mean > 0 else "lightcoral",
+                alpha=0.8,
+            ),
+            fontsize=10,
+            ha="center",
         )
 
-    ax.set_xlabel("Signal Strength (dBm)")
-    ax.set_ylabel("Cumulative Probability")
-    ax.set_title("Cumulative Distribution Function (CDF)")
-    ax.legend(fontsize=9)
-    ax.grid(True, alpha=0.3)
-    ax.set_xlim(data_min_dbm, data_max_dbm)
+        # Plot 4: Statistics table
+        ax = axes[1, 1]
+        ax.axis("off")
 
-    # Plot 3: Box plot comparison
-    ax = axes[1, 0]
-    data_to_plot = [
-        naive_power_dbm,
-        optimized_power_dbm,
-    ]
-    bp = ax.boxplot(
-        data_to_plot,
-        labels=["Naive Baseline", "Optimized"],
-        patch_artist=True,
-        showmeans=True,
-    )
-    bp["boxes"][0].set_facecolor("orange")
-    bp["boxes"][1].set_facecolor("green")
-    ax.set_ylabel("Signal Strength (dBm)")
-    ax.set_title("Power Distribution Comparison (Box Plot)")
-    ax.grid(True, alpha=0.3, axis="y")
+        stats_data = [
+            ["Metric", "Naive Baseline", "Optimized", "Improvement"],
+            [
+                "Mean (dBm)",
+                f"{watts_to_dbm(results['Naive Baseline']['mean']):.2f}",
+                f"{watts_to_dbm(results['Optimized']['mean']):.2f}",
+                f"{watts_to_dbm(results['Optimized']['mean']) - watts_to_dbm(results['Naive Baseline']['mean']):+.2f} dB",
+            ],
+            [
+                "Median (dBm)",
+                f"{watts_to_dbm(results['Naive Baseline']['median']):.2f}",
+                f"{watts_to_dbm(results['Optimized']['median']):.2f}",
+                f"{watts_to_dbm(results['Optimized']['median']) - watts_to_dbm(results['Naive Baseline']['median']):+.2f} dB",
+            ],
+            [
+                "Std Dev (dB)",
+                f"{watts_to_dbm(results['Naive Baseline']['std']):.2f}",
+                f"{watts_to_dbm(results['Optimized']['std']):.2f}",
+                f"{watts_to_dbm(results['Optimized']['std']) - watts_to_dbm(results['Naive Baseline']['std']):+.2f} dB",
+            ],
+            [
+                "Min (dBm)",
+                f"{watts_to_dbm(results['Naive Baseline']['min']):.2f}",
+                f"{watts_to_dbm(results['Optimized']['min']):.2f}",
+                f"{watts_to_dbm(results['Optimized']['min']) - watts_to_dbm(results['Naive Baseline']['min']):+.2f} dB",
+            ],
+            [
+                "Max (dBm)",
+                f"{watts_to_dbm(results['Naive Baseline']['max']):.2f}",
+                f"{watts_to_dbm(results['Optimized']['max']):.2f}",
+                f"{watts_to_dbm(results['Optimized']['max']) - watts_to_dbm(results['Naive Baseline']['max']):+.2f} dB",
+            ],
+            [
+                "10th %ile (dBm)",
+                f"{watts_to_dbm(results['Naive Baseline']['p10']):.2f}",
+                f"{watts_to_dbm(results['Optimized']['p10']):.2f}",
+                f"{watts_to_dbm(results['Optimized']['p10']) - watts_to_dbm(results['Naive Baseline']['p10']):+.2f} dB",
+            ],
+            [
+                "90th %ile (dBm)",
+                f"{watts_to_dbm(results['Naive Baseline']['p90']):.2f}",
+                f"{watts_to_dbm(results['Optimized']['p90']):.2f}",
+                f"{watts_to_dbm(results['Optimized']['p90']) - watts_to_dbm(results['Naive Baseline']['p90']):+.2f} dB",
+            ],
+        ]
 
-    # Add improvement annotation
-    # Calculate improvement in dB
-    improvement_db_mean = optimized_mean_dbm - naive_mean_dbm
-    naive_median_dbm = watts_to_dbm(results["Naive Baseline"]["median"])
-    optimized_median_dbm = watts_to_dbm(results["Optimized"]["median"])
-    improvement_db_median = optimized_median_dbm - naive_median_dbm
-
-    ax.text(
-        1.5,
-        optimized_mean_dbm + 2,  # 2 dB above optimized mean
-        f"Improvement:\nMean: {improvement_db_mean:+.2f} dB\nMedian: {improvement_db_median:+.2f} dB",
-        bbox=dict(
-            boxstyle="round",
-            facecolor="lightgreen" if improvement_db_mean > 0 else "lightcoral",
-            alpha=0.8,
-        ),
-        fontsize=10,
-        ha="center",
-    )
-
-    # Plot 4: Statistics table
-    ax = axes[1, 1]
-    ax.axis("off")
-
-    stats_data = [
-        ["Metric", "Naive Baseline", "Optimized", "Improvement"],
-        [
-            "Mean (dBm)",
-            f"{watts_to_dbm(results['Naive Baseline']['mean']):.2f}",
-            f"{watts_to_dbm(results['Optimized']['mean']):.2f}",
-            f"{watts_to_dbm(results['Optimized']['mean']) - watts_to_dbm(results['Naive Baseline']['mean']):+.2f} dB",
-        ],
-        [
-            "Median (dBm)",
-            f"{watts_to_dbm(results['Naive Baseline']['median']):.2f}",
-            f"{watts_to_dbm(results['Optimized']['median']):.2f}",
-            f"{watts_to_dbm(results['Optimized']['median']) - watts_to_dbm(results['Naive Baseline']['median']):+.2f} dB",
-        ],
-        [
-            "Std Dev (dB)",
-            f"{watts_to_dbm(results['Naive Baseline']['std']):.2f}",
-            f"{watts_to_dbm(results['Optimized']['std']):.2f}",
-            f"{watts_to_dbm(results['Optimized']['std']) - watts_to_dbm(results['Naive Baseline']['std']):+.2f} dB",
-        ],
-        [
-            "Min (dBm)",
-            f"{watts_to_dbm(results['Naive Baseline']['min']):.2f}",
-            f"{watts_to_dbm(results['Optimized']['min']):.2f}",
-            f"{watts_to_dbm(results['Optimized']['min']) - watts_to_dbm(results['Naive Baseline']['min']):+.2f} dB",
-        ],
-        [
-            "Max (dBm)",
-            f"{watts_to_dbm(results['Naive Baseline']['max']):.2f}",
-            f"{watts_to_dbm(results['Optimized']['max']):.2f}",
-            f"{watts_to_dbm(results['Optimized']['max']) - watts_to_dbm(results['Naive Baseline']['max']):+.2f} dB",
-        ],
-        [
-            "10th %ile (dBm)",
-            f"{watts_to_dbm(results['Naive Baseline']['p10']):.2f}",
-            f"{watts_to_dbm(results['Optimized']['p10']):.2f}",
-            f"{watts_to_dbm(results['Optimized']['p10']) - watts_to_dbm(results['Naive Baseline']['p10']):+.2f} dB",
-        ],
-        [
-            "90th %ile (dBm)",
-            f"{watts_to_dbm(results['Naive Baseline']['p90']):.2f}",
-            f"{watts_to_dbm(results['Optimized']['p90']):.2f}",
-            f"{watts_to_dbm(results['Optimized']['p90']) - watts_to_dbm(results['Naive Baseline']['p90']):+.2f} dB",
-        ],
-    ]
-
-    table = ax.table(
-        cellText=stats_data,
-        cellLoc="center",
-        loc="center",
-        colWidths=[0.25, 0.25, 0.25, 0.25],
-    )
-    table.auto_set_font_size(False)
-    table.set_fontsize(10)
-    table.scale(1, 2)
-
-    # Color header row
-    for i in range(4):
-        table[(0, i)].set_facecolor("#40466e")
-        table[(0, i)].set_text_props(weight="bold", color="white")
-
-    # Color improvement column green if positive
-    for i in range(1, len(stats_data)):
-        improvement_str = stats_data[i][3]
-        # Parse percentage string (e.g., "+10.5%" or "-5.2%") or dB string (e.g., "+0.88 dB")
-        if improvement_str != "N/A":
-            # Handle both percentage and dB formats
-            if improvement_str.endswith("%"):
-                improvement_val = float(improvement_str.rstrip("%"))
-            elif improvement_str.endswith(" dB"):
-                improvement_val = float(improvement_str.rstrip(" dB"))
-            else:
-                continue  # Skip if format is unexpected
-
-            if improvement_val > 0:
-                table[(i, 3)].set_facecolor("#90EE90")
-            elif improvement_val < 0:
-                table[(i, 3)].set_facecolor("#FFB6C6")
-
-    ax.set_title(
-        "Performance Statistics Comparison", fontsize=12, weight="bold", pad=20
-    )
-
-    plt.suptitle(title, fontsize=14, weight="bold")
-    plt.tight_layout()
-
-    # Prepare stats dictionary for return
-    stats = {
-        "naive": results["Naive Baseline"],
-        "optimized": results["Optimized"],
-        "improvement_mean_watts": improvement_mean,
-        "improvement_median_watts": improvement_median,
-        "improvement_percent": (
-            improvement_mean / abs(results["Naive Baseline"]["mean"])
+        table = ax.table(
+            cellText=stats_data,
+            cellLoc="center",
+            loc="center",
+            colWidths=[0.25, 0.25, 0.25, 0.25],
         )
-        * 100,
-    }
+        table.auto_set_font_size(False)
+        table.set_fontsize(10)
+        table.scale(1, 2)
 
-    print(f"\n{'='*70}")
-    print("COMPARISON SUMMARY")
-    print(f"{'='*70}")
-    print(f"Naive Baseline Mean:  {results['Naive Baseline']['mean']:.2e} W")
-    print(f"Optimized Mean:       {results['Optimized']['mean']:.2e} W")
-    print(
-        f"Improvement:          {improvement_mean:+.2e} W ({stats['improvement_percent']:+.1f}%)"
-    )
-    print(f"{'='*70}\n")
+        # Color header row
+        for i in range(4):
+            table[(0, i)].set_facecolor("#40466e")
+            table[(0, i)].set_text_props(weight="bold", color="white")
 
-    return fig, stats
+        # Color improvement column green if positive
+        for i in range(1, len(stats_data)):
+            improvement_str = stats_data[i][3]
+            # Parse percentage string (e.g., "+10.5%" or "-5.2%") or dB string (e.g., "+0.88 dB")
+            if improvement_str != "N/A":
+                # Handle both percentage and dB formats
+                if improvement_str.endswith("%"):
+                    improvement_val = float(improvement_str.rstrip("%"))
+                elif improvement_str.endswith(" dB"):
+                    improvement_val = float(improvement_str.rstrip(" dB"))
+                else:
+                    continue  # Skip if format is unexpected
 
+                if improvement_val > 0:
+                    table[(i, 3)].set_facecolor("#90EE90")
+                elif improvement_val < 0:
+                    table[(i, 3)].set_facecolor("#FFB6C6")
+
+        ax.set_title(
+            "Performance Statistics Comparison", fontsize=12, weight="bold", pad=20
+        )
+
+        plt.suptitle(title, fontsize=14, weight="bold")
+        plt.tight_layout()
+
+        # Prepare stats dictionary for return
+        stats = {
+            "naive": results["Naive Baseline"],
+            "optimized": results["Optimized"],
+            "improvement_mean_watts": improvement_mean,
+            "improvement_median_watts": improvement_median,
+            "improvement_percent": (
+                improvement_mean / abs(results["Naive Baseline"]["mean"])
+            )
+            * 100,
+        }
+
+        print(f"\n{'='*70}")
+        print("COMPARISON SUMMARY")
+        print(f"{'='*70}")
+        print(f"Naive Baseline Mean:  {results['Naive Baseline']['mean']:.2e} W")
+        print(f"Optimized Mean:       {results['Optimized']['mean']:.2e} W")
+        print(
+            f"Improvement:          {improvement_mean:+.2e} W ({stats['improvement_percent']:+.1f}%)"
+        )
+        print(f"{'='*70}\n")
+
+        return fig, stats
+    
+    else:
+        return None, stats
 
 def optimize_boresight_pathsolver(
     scene,
@@ -986,8 +991,7 @@ def optimize_boresight_pathsolver(
     tx_power_dbm = float(tx.power_dbm[0])
     print(f"Transmit Power in dBm: {tx_power_dbm}")
 
-    # TX height already extracted above (tx_z is already detached)
-    tx_height = tx_z
+    tx_height = float(dr.detach(tx_z)[0])
 
     # Initialize TxPlacement for accessing building info and edge projection
     # We need this regardless of tx_placement_mode for the edge constraint
@@ -1336,19 +1340,19 @@ def optimize_boresight_pathsolver(
             dead_polygons=dead_buffs if dead_buffs else None,
         )
 
-        fig = visualize_receiver_placement(
-           new_sample_points,
-            map_config,
-            current_tx_position=[dr.detach(x_pos), dr.detach(y_pos), tx_position[2]],
-            box_polygon=box_polygon,
-            dead_buffers=dead_buffs if dead_buffs else None,
-            alphashapes=dead_zones,
-            scene_xml_path=scene_xml_path,
-            building_id=building_id,
-        )
-        plt.show()
-        fig.savefig(filepath + f"_{iteration}.png", dpi=350)
-        plt.close(fig)
+        #fig = visualize_receiver_placement(
+        #   new_sample_points,
+        #    map_config,
+        #    current_tx_position=[dr.detach(x_pos), dr.detach(y_pos), tx_position[2]],
+        #    box_polygon=box_polygon,
+        #    dead_buffers=dead_buffs if dead_buffs else None,
+        #    alphashapes=dead_zones,
+        #    scene_xml_path=scene_xml_path,
+        #    building_id=building_id,
+        #)
+        #plt.show()
+        #fig.savefig(filepath + f"_{iteration}.png", dpi=350)
+        #plt.close(fig)
 
         # Store for visualization/debugging
         sample_points_storage["current"] = new_sample_points
@@ -1577,7 +1581,7 @@ def optimize_boresight_pathsolver(
     start_time = time.time()
     # The number of iterations signifies how many times you want the optimizer to iterate
     # The range should be extended 10x to accumulate samples for dead zone isolation
-    for iteration in range(10 * num_iterations):
+    for iteration in range(5 * num_iterations):
         if verbose and iteration == 0:
             print(f"\n{'='*70}")
             print(f"STARTING OPTIMIZATION - Iteration {iteration+1}/{num_iterations}")
@@ -1591,7 +1595,7 @@ def optimize_boresight_pathsolver(
         dead_points = accumulate_samples(dead_points, qrand)
 
         # On the 5th iteration: build dead zone polygons, compute loss, then reset
-        if (iteration + 1) % 10 == 0:
+        if (iteration + 1) % 5 == 0:
             # Use DBSCAN to find clusters across accumulated dead points
             clusters = DBSCAN(eps=20, min_samples=10).fit(dead_points[:, :2])
             labels = clusters.labels_
@@ -1611,34 +1615,34 @@ def optimize_boresight_pathsolver(
                     dead_buffs.append(donut)
 
             # --- Quick cluster / hull / buffer visualization ---
-            _, ax = plt.subplots(figsize=(6, 6))
-            colors = plt.cm.tab10.colors
-            noise_mask = labels == -1
-            ax.scatter(
-                dead_points[noise_mask, 0], dead_points[noise_mask, 1],
-                s=10, c="lightgray", label="Noise", zorder=1,
-            )
-            for cid in sorted(unique_labels):
-                mask = labels == cid
-                c = colors[cid % len(colors)]
-                ax.scatter(
-                    dead_points[mask, 0], dead_points[mask, 1],
-                    s=10, color=c, label=f"Cluster {cid}", zorder=2,
-                )
-            for idx, (zone, buff) in enumerate(zip(dead_zones, dead_buffs)):
-                c = colors[idx % len(colors)]
-                for geom in (zone.geoms if hasattr(zone, "geoms") else [zone]):
-                    x, y = geom.exterior.xy
-                    ax.fill(x, y, alpha=0.35, fc=c, ec=c, linewidth=1.5)
-                for geom in (buff.geoms if hasattr(buff, "geoms") else [buff]):
-                    x, y = geom.exterior.xy
-                    ax.fill(x, y, alpha=0.15, fc=c, ec=c, linewidth=1, linestyle="--")
-            ax.set_title(f"Dead Zone Clusters (iter {iteration + 1})")
-            ax.set_xlabel("X")
-            ax.set_ylabel("Y")
-            ax.legend(markerscale=2, fontsize=8)
-            plt.tight_layout()
-            plt.show()
+            #_, ax = plt.subplots(figsize=(6, 6))
+            #colors = plt.cm.tab10.colors
+            #noise_mask = labels == -1
+            #ax.scatter(
+            #    dead_points[noise_mask, 0], dead_points[noise_mask, 1],
+            #    s=10, c="lightgray", label="Noise", zorder=1,
+            #)
+            #for cid in sorted(unique_labels):
+            #    mask = labels == cid
+            #    c = colors[cid % len(colors)]
+            #    ax.scatter(
+            #        dead_points[mask, 0], dead_points[mask, 1],
+            #        s=10, color=c, label=f"Cluster {cid}", zorder=2,
+            #    )
+            #for idx, (zone, buff) in enumerate(zip(dead_zones, dead_buffs)):
+            #    c = colors[idx % len(colors)]
+            #    for geom in (zone.geoms if hasattr(zone, "geoms") else [zone]):
+            #        x, y = geom.exterior.xy
+            #        ax.fill(x, y, alpha=0.35, fc=c, ec=c, linewidth=1.5)
+            #    for geom in (buff.geoms if hasattr(buff, "geoms") else [buff]):
+            #        x, y = geom.exterior.xy
+            #        ax.fill(x, y, alpha=0.15, fc=c, ec=c, linewidth=1, linestyle="--")
+            #ax.set_title(f"Dead Zone Clusters (iter {iteration + 1})")
+            #ax.set_xlabel("X")
+            #ax.set_ylabel("Y")
+            #ax.legend(markerscale=2, fontsize=8)
+            #plt.tight_layout()
+            #plt.show()
             # ---------------------------------------------------
 
             loss = compute_loss(
@@ -1691,7 +1695,7 @@ def optimize_boresight_pathsolver(
             y_pos.data.fill_(proj_y)
 
         # Modified to reflect robust value over the lowest loss
-        if iteration >= 10 * (num_iterations - 10):
+        if iteration >= 5 * (num_iterations - 10):
             # Save the values to a list
             final_az_list = np.append(final_az_list, azimuth.item())
             final_el_list = np.append(final_el_list, elevation.item())
@@ -1699,6 +1703,17 @@ def optimize_boresight_pathsolver(
     # Save the average of the final 10 values
     best_azimuth_final = np.mean(final_az_list)
     best_elevation_final = np.mean(final_el_list)
+
+    # Reset TX position and orientation to clean (non-AD) mi.Point3f values.
+    # compute_loss sets scene variables to AD-tracked DrJIT tensors; leaving them
+    # in that state causes dr.while_loop() failures in any subsequent RadioMapSolver call.
+    final_x = float(x_pos.item())
+    final_y = float(y_pos.item())
+    scene.get(tx_name).position = mi.Point3f(final_x, final_y, tx_height)
+    reset_yaw, reset_pitch = azimuth_elevation_to_yaw_pitch(
+        float(best_azimuth_final), float(best_elevation_final)
+    )
+    scene.get(tx_name).orientation = mi.Point3f(float(reset_yaw), float(reset_pitch), 0.0)
 
     # Save the elapsed time for metrics
     elapsed_time = time.time() - start_time
