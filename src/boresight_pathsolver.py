@@ -35,6 +35,7 @@ from sklearn.cluster import DBSCAN
 from sklearn.cluster import HDBSCAN
 import math as m
 import alphashape
+import os
 
 
 def create_zone_mask(
@@ -265,6 +266,7 @@ def sample_grid_points(
     polygon,
     num_points,
     qrand,
+    alphashapes=None,
     building_polygons=None,
     ground_z=0.0,
     dead_polygons=None,
@@ -276,17 +278,22 @@ def sample_grid_points(
     if dead_polygons is not None:
         dead_union = unary_union(dead_polygons)
         alive_diff = polygon.difference(dead_union)
+        if alphashapes is not None:
+            alpha_union = unary_union(alphashapes)
+            alive_diff = alive_diff.difference(alpha_union)
         dead_num = int(dead_fraction * num_points)
         alive_num = num_points - dead_num
         alive_pts, _, __, ___, ____ = sample_grid_points(
             alive_diff,
             alive_num,
             qrand,
-            building_polygons,
-            ground_z,
+            building_polygons=building_polygons,
+            ground_z=ground_z,
         )
         dead_pts, _, __, ___, ____ = sample_grid_points(
-            dead_union, dead_num, qrand, building_polygons, ground_z
+            dead_union, dead_num, qrand,
+            building_polygons=building_polygons,
+            ground_z=ground_z,
         )
         return np.vstack([dead_pts, alive_pts]), dead_union, alive_diff, dead_pts, alive_pts
     else:
@@ -360,7 +367,8 @@ def visualize_receiver_placement(
     title="Receiver Sampling Visualization",
     figsize=(14, 10),
     zone_polygon=None,
-    dead_polygons=None,
+    dead_buffers=None,
+    alphashapes=None,
     box_polygon=None,
     building_id=None,
 ):
@@ -450,12 +458,17 @@ def visualize_receiver_placement(
     if draw_box is not None:
         _fill_geom(draw_box, alpha=0.15, fc='green', ec='none', zorder=1, label='Alive Zone')
 
-    # 2. Dead zones: fill red
-    if dead_polygons:
-        for i, dp in enumerate(dead_polygons):
-            _fill_geom(dp, alpha=0.35, fc='red', ec='darkred', linewidth=1.0,
-                       zorder=2, label='Dead Zone' if i == 0 else None)
-
+    # 2. Buffer zones: fill purple
+    if dead_buffers:
+        for i, dp in enumerate(dead_buffers):
+            _fill_geom(dp, alpha=0.35, fc='red', ec='black', linewidth=1.0,
+                       zorder=2, label='Buffer Zone' if i == 0 else None)
+    # Dead zones
+    if alphashapes:
+        for i, dp in enumerate(alphashapes):
+            _fill_geom(dp, alpha=.9, fc='purple', ec='black', linewidth=1.0,
+                       zorder=3, label='Dead Zone' if i == 0 else None)
+    
     # 3. All buildings: gray fill; TX building gets a highlighted edge
     if scene_xml_path is not None:
         try:
@@ -530,8 +543,8 @@ def visualize_receiver_placement(
 
     # Add text box with sampling statistics
     stats_text = f"Total Receivers: {len(sample_points)}"
-    if dead_polygons:
-        stats_text += f"\nDead Zones: {len(dead_polygons)}"
+    if dead_buffers:
+        stats_text += f"\nDead Zones: {len(dead_buffers)}"
 
     ax.text(
         0.02,
@@ -945,6 +958,7 @@ def optimize_boresight_pathsolver(
     lds="Sobol",  # Random seed for reproducible sampling
     tx_placement_mode="skip",  # "center", "fixed", "line", "skip" (skip = don't move TX)
     Tx_start_pos=[0.0, 0.0],
+    filepath=os.getcwd() + "/figures/"
 ):
     """
     Optimize boresight using PathSolver with automatic differentiation
@@ -960,7 +974,7 @@ def optimize_boresight_pathsolver(
 
     # Get TX position (new)
     tx = scene.get(tx_name)
-    tx_x = tx.position[0]
+    tx_x = tx.position[0] 
     tx_y = tx.position[1]
     tx_z = tx.position[2]
     tx_position = [tx_x, tx_y, tx_z]
@@ -1107,7 +1121,7 @@ def optimize_boresight_pathsolver(
     if verbose:
         print(f"  Created {len(rx_objects)} receivers (will reposition each iteration)")
 
-    # Create PathSolver
+    # Create PathSolver w/ Gradients Enabled
     p_solver = PathSolver()
     p_solver.loop_mode = "evaluated"  # Required for gradient computation
 
@@ -1238,7 +1252,7 @@ def optimize_boresight_pathsolver(
         return weights_np
 
     # Define differentiable loss function using @dr.wrap
-    loss_type = "CVaR"
+    loss_type = "else"
 
     @dr.wrap(source="torch", target="drjit")
     def compute_loss(azimuth_deg, elevation_deg, x_pos, y_pos, loss_type=loss_type):
@@ -1293,8 +1307,8 @@ def optimize_boresight_pathsolver(
         dr.disable_grad(pitch_jitter)
 
         # Apply jitter to orientation
-        yaw_rad_jittered = yaw_rad + yaw_jitter
-        pitch_rad_jittered = pitch_rad + pitch_jitter
+        yaw_rad_jittered = yaw_rad #+ yaw_jitter
+        pitch_rad_jittered = pitch_rad #+ pitch_jitter
 
         # Set antenna orientation directly using yaw, pitch, roll
         scene.get(tx_name).orientation = [
@@ -1316,21 +1330,24 @@ def optimize_boresight_pathsolver(
             zone_polygon,
             num_sample_points,
             qrand,
+            alphashapes=dead_zones if dead_zones else None,
             building_polygons=cached_building_polygons,
             ground_z=map_config["center"][2],
-            dead_polygons=dead_zones if dead_zones else None,
+            dead_polygons=dead_buffs if dead_buffs else None,
         )
 
         fig = visualize_receiver_placement(
-            new_sample_points,
+           new_sample_points,
             map_config,
             current_tx_position=[dr.detach(x_pos), dr.detach(y_pos), tx_position[2]],
             box_polygon=box_polygon,
-            dead_polygons=dead_zones if dead_zones else None,
+            dead_buffers=dead_buffs if dead_buffs else None,
+            alphashapes=dead_zones,
             scene_xml_path=scene_xml_path,
             building_id=building_id,
         )
         plt.show()
+        fig.savefig(filepath + f"_{iteration}.png", dpi=350)
         plt.close(fig)
 
         # Store for visualization/debugging
@@ -1347,7 +1364,7 @@ def optimize_boresight_pathsolver(
         paths = p_solver(
             scene,
             los=True,
-            refraction=False,
+            refraction=True,
             specular_reflection=True,
             diffuse_reflection=True,
         )
@@ -1391,7 +1408,7 @@ def optimize_boresight_pathsolver(
             
             weights_np = compute_robust_weights(
                 box_polygon, 
-                dead_zones if dead_zones else None, 
+                dead_buffs if dead_buffs else None, 
                 num_dead, 
                 num_alive
             )
@@ -1433,39 +1450,50 @@ def optimize_boresight_pathsolver(
             loss = loss_cvar + (reg_lambda * global_penalty)
 
         elif loss_type == "threshold":
-            # Target: -90 dBm (The goal line we want users to cross)
-            dead_threshold = 1e-14
-            target_db = -70.0
+            # 1. Convert to True Rx Power (dBm)
+            val_db = (10.0 * dr.log(power_relative + 1e-35) / dr.log(10.0)) + tx_power_dbm
 
-            # Filter to calculate gradient only using alive transmitters
-            is_alive = power_relative > dead_threshold
-            epsilon = 1e-30
-            safe_power = dr.select(is_alive, power_relative, 1.0)
-            vals_db = 10.0 * dr.log(safe_power + epsilon) / dr.log(10.0)
+            # ==========================================
+            # CALCULATE IMPORTANCE WEIGHTS
+            # ==========================================
+            num_dead = len(dead_pts) if dead_pts is not None else 0
+            num_alive = len(alive_pts) if alive_pts is not None else len(new_sample_points)
+            
+            weights_np = compute_robust_weights(
+                box_polygon, 
+                dead_buffs if dead_buffs else None, 
+                num_dead, 
+                num_alive
+            )
+            weights_dr = type(val_db)(weights_np)
+            # ==========================================
 
-            # Hinge error
-            error = target_db - vals_db
+            # 2. Define the Static Physical Target
+            # We want all users to reach at least -80 dBm
+            target_db = -85.0
 
-            # Params: Mask, True Value, False Value
-            active_loss = dr.select(is_alive, dr.maximum(error, 0.0), 0.0)
+            # 3. Calculate the Hinge Error
+            # If a user is at -100 dBm, error is 20. If they are at -50 dBm, error is 0.0.
+            error = target_db - val_db
+            hinge = dr.maximum(error, 0.0)
 
-            # Normalize
-            pushing_mask = is_alive & (error > 0)
-            pushing_count = dr.sum(dr.select(pushing_mask, 1.0, 0.0))
+            # 4. Deficit-Weighted (Quadratic) Penalty
+            # Squaring it makes the optimizer fight exponentially harder for the deepest dead zones
+            loss_contribution = (hinge * hinge) * weights_dr
 
-            # Minimize the total contributing error
-            loss = dr.sum(active_loss) / (pushing_count + 1e-5)
+            # 5. Normalize by Total Weight
+            # Normalizing by the total weight keeps the gradient magnitudes perfectly stable
+            total_weight = dr.sum(weights_dr)
+            loss = dr.sum(loss_contribution) / (total_weight + 1e-5)
 
         else:
-            # Sum Log(Power) -> Penalizes low values
-            dead_zone_threshold = 1e-14
-            valid_mask = power_relative > dead_zone_threshold
+            # Sum Log(Power) -> Automatically heavily penalizes low values
+            # Epsilon prevents log(0) from returning -inf for blocked rays
             epsilon = 1e-30
             log_P = dr.log(power_relative + epsilon)
-            masked_log_P = dr.select(valid_mask, log_P, 0.0)
-            log_utility = dr.sum(masked_log_P)
-            count = dr.sum(dr.select(valid_mask, 1.0, 0.0))
-            avg_utility = log_utility / (count + 1e-5)
+            # dr.mean automatically handles the division by the total static number of receivers
+            avg_utility = dr.mean(log_P)
+
             loss = -avg_utility
 
         return loss
@@ -1516,6 +1544,7 @@ def optimize_boresight_pathsolver(
     optimizer = torch.optim.Adam(
         [azimuth, elevation, x_pos, y_pos], lr=learning_rate, betas=(0.9, 0.999)
     )
+    #optimizer = torch.optim.SGD([azimuth, elevation, x_pos, y_pos], lr=learning_rate)
 
     # Learning rate scheduler: required to jump out of local minima for difficult loss surfaces...
     use_scheduler = num_iterations >= 50
@@ -1541,6 +1570,7 @@ def optimize_boresight_pathsolver(
     # Creating empty numpy array of dead zone (x, y columns)
     dead_points = np.zeros((0, 3))
     # List of shapely polygons representing dead zones
+    dead_buffs = []
     dead_zones = []
 
     # Start the optimization
@@ -1560,8 +1590,8 @@ def optimize_boresight_pathsolver(
         # Accumulate dead zone samples for iterations 1-9
         dead_points = accumulate_samples(dead_points, qrand)
 
-        # On the 10th iteration: build dead zone polygons, compute loss, then reset
-        if (iteration + 1) % 5 == 0:
+        # On the 5th iteration: build dead zone polygons, compute loss, then reset
+        if (iteration + 1) % 10 == 0:
             # Use DBSCAN to find clusters across accumulated dead points
             clusters = DBSCAN(eps=20, min_samples=10).fit(dead_points[:, :2])
             labels = clusters.labels_
@@ -1572,21 +1602,61 @@ def optimize_boresight_pathsolver(
                 pts = dead_points[labels == cluster_id, :2]
                 shape = alphashape.alphashape(pts, alpha=0.05)
                 shape = shapely.make_valid(shape)
-                clipped = shapely.buffer(shape, 30.0).intersection(box_polygon)
-                if not clipped.is_empty:
-                    dead_zones.append(clipped)
+                # Append the dead zone for plotting
+                dead_zones.append(shape)
+                clipped = shapely.buffer(shape, 30.0)
+                donut = shapely.difference(clipped, shape).intersection(zone_polygon)
+                # Chek if the buffer exists and append to the list of buffers
+                if not donut.is_empty:
+                    dead_buffs.append(donut)
+
+            # --- Quick cluster / hull / buffer visualization ---
+            _, ax = plt.subplots(figsize=(6, 6))
+            colors = plt.cm.tab10.colors
+            noise_mask = labels == -1
+            ax.scatter(
+                dead_points[noise_mask, 0], dead_points[noise_mask, 1],
+                s=10, c="lightgray", label="Noise", zorder=1,
+            )
+            for cid in sorted(unique_labels):
+                mask = labels == cid
+                c = colors[cid % len(colors)]
+                ax.scatter(
+                    dead_points[mask, 0], dead_points[mask, 1],
+                    s=10, color=c, label=f"Cluster {cid}", zorder=2,
+                )
+            for idx, (zone, buff) in enumerate(zip(dead_zones, dead_buffs)):
+                c = colors[idx % len(colors)]
+                for geom in (zone.geoms if hasattr(zone, "geoms") else [zone]):
+                    x, y = geom.exterior.xy
+                    ax.fill(x, y, alpha=0.35, fc=c, ec=c, linewidth=1.5)
+                for geom in (buff.geoms if hasattr(buff, "geoms") else [buff]):
+                    x, y = geom.exterior.xy
+                    ax.fill(x, y, alpha=0.15, fc=c, ec=c, linewidth=1, linestyle="--")
+            ax.set_title(f"Dead Zone Clusters (iter {iteration + 1})")
+            ax.set_xlabel("X")
+            ax.set_ylabel("Y")
+            ax.legend(markerscale=2, fontsize=8)
+            plt.tight_layout()
+            plt.show()
+            # ---------------------------------------------------
 
             loss = compute_loss(
                 azimuth, elevation, x_pos, y_pos
             )
             # Reset for the next accumulation window
             dead_points = np.zeros((0, 3))
+            dead_buffs = []
             dead_zones = []
         else:
             continue
 
         # Calculate the gradients in terms of each parameter
         loss.backward()
+
+        # Printing gradients to analyze behavior
+        print(f"X position gradient: {x_pos.grad}")
+        print(f"Y position gradient: {y_pos.grad}")
 
         # Track gradient norm for diagnostics
         grad_azimuth_val = azimuth.grad.item() if azimuth.grad is not None else 0.0
