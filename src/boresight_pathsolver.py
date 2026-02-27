@@ -291,11 +291,19 @@ def sample_grid_points(
             ground_z=ground_z,
         )
         dead_pts, _, __, ___, ____ = sample_grid_points(
-            dead_union, dead_num, qrand,
+            dead_union,
+            dead_num,
+            qrand,
             building_polygons=building_polygons,
             ground_z=ground_z,
         )
-        return np.vstack([dead_pts, alive_pts]), dead_union, alive_diff, dead_pts, alive_pts
+        return (
+            np.vstack([dead_pts, alive_pts]),
+            dead_union,
+            alive_diff,
+            dead_pts,
+            alive_pts,
+        )
     else:
         dead_union = None
         alive_diff = None
@@ -333,7 +341,13 @@ def sample_grid_points(
         )
 
     pts2d = np.array(sampled)
-    return np.hstack([pts2d, np.full((len(pts2d), 1), ground_z)]), dead_union, alive_diff, dead_pts, alive_pts
+    return (
+        np.hstack([pts2d, np.full((len(pts2d), 1), ground_z)]),
+        dead_union,
+        alive_diff,
+        dead_pts,
+        alive_pts,
+    )
 
 
 def filter_and_append(rx_data, dead_zone, tail_percentile=20.0):
@@ -342,14 +356,14 @@ def filter_and_append(rx_data, dead_zone, tail_percentile=20.0):
     """
     # rx_data has columns [x, y, power]
     power_array = rx_data[:, 2]
-    
+
     # Dynamically find the threshold for the bottom 20% of this specific batch
     dynamic_threshold = np.percentile(power_array, tail_percentile)
-    
+
     # Filter rows where power is below the dynamic threshold
     dead_mask = power_array <= dynamic_threshold
-    dead_points = rx_data[dead_mask] 
-    
+    dead_points = rx_data[dead_mask]
+
     if dead_zone.size == 0:
         dead_zone = dead_points
     else:
@@ -446,48 +460,70 @@ def visualize_receiver_placement(
         """Fill a Polygon or MultiPolygon (exterior only — later layers cover holes)."""
         if geom is None or geom.is_empty:
             return
-        if geom.geom_type == 'Polygon':
+        if geom.geom_type == "Polygon":
             ax.fill(*geom.exterior.xy, **kwargs)
-        elif geom.geom_type in ('MultiPolygon', 'GeometryCollection'):
+        elif geom.geom_type in ("MultiPolygon", "GeometryCollection"):
             for part in geom.geoms:
-                if part.geom_type == 'Polygon':
+                if part.geom_type == "Polygon":
                     ax.fill(*part.exterior.xy, **kwargs)
 
     # 1. Alive zone: fill coverage box green
     draw_box = box_polygon if box_polygon is not None else zone_polygon
     if draw_box is not None:
-        _fill_geom(draw_box, alpha=0.15, fc='green', ec='none', zorder=1, label='Alive Zone')
+        _fill_geom(
+            draw_box, alpha=0.15, fc="green", ec="none", zorder=1, label="Alive Zone"
+        )
 
     # 2. Buffer zones: fill purple
     if dead_buffers:
         for i, dp in enumerate(dead_buffers):
-            _fill_geom(dp, alpha=0.35, fc='red', ec='black', linewidth=1.0,
-                       zorder=2, label='Buffer Zone' if i == 0 else None)
+            _fill_geom(
+                dp,
+                alpha=0.35,
+                fc="red",
+                ec="black",
+                linewidth=1.0,
+                zorder=2,
+                label="Buffer Zone" if i == 0 else None,
+            )
     # Dead zones
     if alphashapes:
         for i, dp in enumerate(alphashapes):
-            _fill_geom(dp, alpha=.9, fc='purple', ec='black', linewidth=1.0,
-                       zorder=3, label='Dead Zone' if i == 0 else None)
-    
+            _fill_geom(
+                dp,
+                alpha=0.9,
+                fc="purple",
+                ec="black",
+                linewidth=1.0,
+                zorder=3,
+                label="Dead Zone" if i == 0 else None,
+            )
+
     # 3. All buildings: gray fill; TX building gets a highlighted edge
     if scene_xml_path is not None:
         try:
             from scene_parser import extract_building_info
+
             building_info = extract_building_info(scene_xml_path, verbose=False)
             tx_building_drawn = False
             for bid, info in building_info.items():
                 vertices_2d = [(v[0], v[1]) for v in info["vertices"]]
                 try:
                     bpoly = Polygon(vertices_2d)
-                    is_tx_building = (str(bid) == str(building_id))
-                    ax.fill(*bpoly.exterior.xy,
-                            facecolor='#c0392b' if is_tx_building else 'dimgray',
-                            edgecolor='black',
-                            alpha=0.75 if is_tx_building else 0.55,
-                            linewidth=2.0 if is_tx_building else 0.8,
-                            zorder=3,
-                            label=('TX Building' if is_tx_building and not tx_building_drawn
-                                   else None))
+                    is_tx_building = str(bid) == str(building_id)
+                    ax.fill(
+                        *bpoly.exterior.xy,
+                        facecolor="#c0392b" if is_tx_building else "dimgray",
+                        edgecolor="black",
+                        alpha=0.75 if is_tx_building else 0.55,
+                        linewidth=2.0 if is_tx_building else 0.8,
+                        zorder=3,
+                        label=(
+                            "TX Building"
+                            if is_tx_building and not tx_building_drawn
+                            else None
+                        ),
+                    )
                     if is_tx_building:
                         tx_building_drawn = True
                 except Exception:
@@ -497,13 +533,25 @@ def visualize_receiver_placement(
 
     # 4. Coverage box outline
     if draw_box is not None:
-        if draw_box.geom_type == 'Polygon':
-            ax.plot(*draw_box.exterior.xy, color='blue', linewidth=2,
-                    linestyle='--', label='Coverage Zone', zorder=4)
-        elif draw_box.geom_type == 'MultiPolygon':
+        if draw_box.geom_type == "Polygon":
+            ax.plot(
+                *draw_box.exterior.xy,
+                color="blue",
+                linewidth=2,
+                linestyle="--",
+                label="Coverage Zone",
+                zorder=4,
+            )
+        elif draw_box.geom_type == "MultiPolygon":
             for i, part in enumerate(draw_box.geoms):
-                ax.plot(*part.exterior.xy, color='blue', linewidth=2,
-                        linestyle='--', label='Coverage Zone' if i == 0 else None, zorder=4)
+                ax.plot(
+                    *part.exterior.xy,
+                    color="blue",
+                    linewidth=2,
+                    linestyle="--",
+                    label="Coverage Zone" if i == 0 else None,
+                    zorder=4,
+                )
 
     # Plot all sample points
     ax.scatter(
@@ -571,7 +619,7 @@ def compare_boresight_performance(
     naive_transmitter_pos=None,
     optimized_transmitter_pos=None,
     title="Boresight Optimization Comparison",
-    fig=False
+    fig=False,
 ):
     """
     Compare naive baseline vs optimized boresight performance using RadioMapSolver.
@@ -638,7 +686,7 @@ def compare_boresight_performance(
             scene,
             max_depth=8,
             samples_per_tx=int(10e8),
-            cell_size=[0.5,0.5],
+            cell_size=[0.5, 0.5],
             center=map_config["center"],
             orientation=[0, 0, 0],
             size=map_config["size"],
@@ -945,9 +993,10 @@ def compare_boresight_performance(
         print(f"{'='*70}\n")
 
         return fig, stats
-    
+
     else:
         return None, stats
+
 
 def optimize_boresight_pathsolver(
     scene,
@@ -963,7 +1012,7 @@ def optimize_boresight_pathsolver(
     lds="Sobol",  # Random seed for reproducible sampling
     tx_placement_mode="skip",  # "center", "fixed", "line", "skip" (skip = don't move TX)
     Tx_start_pos=[0.0, 0.0],
-    filepath=os.getcwd() + "/figures/"
+    filepath=os.getcwd() + "/figures/",
 ):
     """
     Optimize boresight using PathSolver with automatic differentiation
@@ -979,7 +1028,7 @@ def optimize_boresight_pathsolver(
 
     # Get TX position (new)
     tx = scene.get(tx_name)
-    tx_x = tx.position[0] 
+    tx_x = tx.position[0]
     tx_y = tx.position[1]
     tx_z = tx.position[2]
     tx_position = [tx_x, tx_y, tx_z]
@@ -1063,15 +1112,18 @@ def optimize_boresight_pathsolver(
 
     # Build a clean outer boundary polygon (no holes) for dead-zone clipping and visualization.
     from shapely.geometry import Polygon as ShapelyPolygon
+
     if zone_type == "box":
         bx, by = zone_params["center"][0], zone_params["center"][1]
         bw, bh = zone_params["width"], zone_params["height"]
-        box_polygon = ShapelyPolygon([
-            (bx - bw / 2, by - bh / 2),
-            (bx + bw / 2, by - bh / 2),
-            (bx + bw / 2, by + bh / 2),
-            (bx - bw / 2, by + bh / 2),
-        ])
+        box_polygon = ShapelyPolygon(
+            [
+                (bx - bw / 2, by - bh / 2),
+                (bx + bw / 2, by - bh / 2),
+                (bx + bw / 2, by + bh / 2),
+                (bx - bw / 2, by + bh / 2),
+            ]
+        )
     else:
         box_polygon = ShapelyPolygon(zone_params["vertices"])
 
@@ -1184,7 +1236,7 @@ def optimize_boresight_pathsolver(
         dead_zone = filter_and_append(rx_data, dead_zone, 20.0)
 
         return dead_zone
-    
+
     def calculate_weighted_median(values, weights):
         """
         Calculates the weighted median of a 1D numpy array.
@@ -1194,65 +1246,68 @@ def optimize_boresight_pathsolver(
         sort_indices = np.argsort(values)
         sorted_values = values[sort_indices]
         sorted_weights = weights[sort_indices]
-        
+
         # 2. Find the cumulative sum of the weights
         cumulative_weights = np.cumsum(sorted_weights)
-        
+
         # 3. Find the 50% cutoff point of the total weight
         cutoff = 0.5 * np.sum(sorted_weights)
-        
+
         # 4. Return the value where the cumulative weight crosses the cutoff
         median_idx = np.searchsorted(cumulative_weights, cutoff)
-        
+
         # Handle edge case where searchsorted goes out of bounds
         median_idx = min(median_idx, len(sorted_values) - 1)
-        
+
         return sorted_values[median_idx]
-    
-    def compute_robust_weights(box_polygon, dead_zones, num_dead_samples, num_alive_samples):
+
+    def compute_robust_weights(
+        box_polygon, dead_zones, num_dead_samples, num_alive_samples
+    ):
         """
         Computes Self-Normalized Importance Weights based on spatial areas.
         """
         total_samples = num_dead_samples + num_alive_samples
-        
+
         # 1. Calculate Physical Areas
         total_area = box_polygon.area
-        
+
         # Calculate union of dead zones to avoid double-counting overlapping areas
         if dead_zones:
             from shapely.ops import unary_union
+
             dead_area = unary_union(dead_zones).area
         else:
             dead_area = 0.0
-            
+
         alive_area = total_area - dead_area
-        
+
         # 2. Calculate Area Fractions (True Probability)
         prob_dead_true = dead_area / total_area
         prob_alive_true = alive_area / total_area
-        
+
         # 3. Calculate Sample Fractions (Sampled Probability)
         # Add epsilon to prevent division by zero if dead zones disappear
         prob_dead_sampled = (num_dead_samples + 1e-9) / total_samples
         prob_alive_sampled = (num_alive_samples + 1e-9) / total_samples
-        
+
         # 4. Compute Base Weights (P / Q)
         w_dead = prob_dead_true / prob_dead_sampled
         w_alive = prob_alive_true / prob_alive_sampled
-        
+
         # 5. Build the Array (Assuming dead samples are first in the array)
         weights_np = np.empty(total_samples)
         weights_np[:num_dead_samples] = w_dead
         weights_np[num_dead_samples:] = w_alive
-        
+
         # 6. Clip extreme weights (Robustness against vanishing dead zones)
         max_weight_limit = 5.0
         weights_np = np.clip(weights_np, a_min=0.01, a_max=max_weight_limit)
-        
+
         # 7. Self-Normalize (CRITICAL for Adam Optimizer)
         # Forces the sum of weights to equal the batch size
         weights_np = weights_np * (total_samples / np.sum(weights_np))
-        
+
         return weights_np
 
     # Define differentiable loss function using @dr.wrap
@@ -1317,8 +1372,8 @@ def optimize_boresight_pathsolver(
         # Apply jitter to orientation
         yaw_rad_jittered = yaw_rad + yaw_jitter
         pitch_rad_jittered = pitch_rad + pitch_jitter
-        x_pos_jittered =  x_pos + pos_jitter
-        y_pos_jittered =  y_pos + pos_jitter
+        x_pos_jittered = x_pos + pos_jitter
+        y_pos_jittered = y_pos + pos_jitter
 
         # Set antenna orientation directly using yaw, pitch, roll
         scene.get(tx_name).orientation = [
@@ -1347,7 +1402,7 @@ def optimize_boresight_pathsolver(
             dead_polygons=dead_buffs if dead_buffs else None,
         )
 
-        #fig = visualize_receiver_placement(
+        # fig = visualize_receiver_placement(
         #   new_sample_points,
         #    map_config,
         #    current_tx_position=[dr.detach(x_pos), dr.detach(y_pos), tx_position[2]],
@@ -1356,10 +1411,10 @@ def optimize_boresight_pathsolver(
         #    alphashapes=dead_zones,
         #    scene_xml_path=scene_xml_path,
         #    building_id=building_id,
-        #)
-        #plt.show()
-        #fig.savefig(filepath + f"_{iteration}.png", dpi=350)
-        #plt.close(fig)
+        # )
+        # plt.show()
+        # fig.savefig(filepath + f"_{iteration}.png", dpi=350)
+        # plt.close(fig)
 
         # Store for visualization/debugging
         sample_points_storage["current"] = new_sample_points
@@ -1408,20 +1463,21 @@ def optimize_boresight_pathsolver(
 
         elif loss_type == "CVaR":
             # 1. Convert to Rx Power (dBm) using the pre-extracted float
-            val_db = (10.0 * dr.log(power_relative + 1e-35) / dr.log(10.0)) + tx_power_dbm
+            val_db = (
+                10.0 * dr.log(power_relative + 1e-35) / dr.log(10.0)
+            ) + tx_power_dbm
 
             # ==========================================
             # CALCULATE IMPORTANCE WEIGHTS
             # ==========================================
             # Safely get the count of dead and alive points from your sample_grid_points output
             num_dead = len(dead_pts) if dead_pts is not None else 0
-            num_alive = len(alive_pts) if alive_pts is not None else len(new_sample_points)
-            
+            num_alive = (
+                len(alive_pts) if alive_pts is not None else len(new_sample_points)
+            )
+
             weights_np = compute_robust_weights(
-                box_polygon, 
-                dead_buffs if dead_buffs else None, 
-                num_dead, 
-                num_alive
+                box_polygon, dead_buffs if dead_buffs else None, num_dead, num_alive
             )
             # ==========================================
 
@@ -1433,10 +1489,10 @@ def optimize_boresight_pathsolver(
             # 3. Deficit-Weighted (Quadratic) Hinge Loss
             deficit = target - val_db
             hinge = dr.maximum(deficit, 0.0)
-            
+
             # Convert weights to DrJit Float to inject into AD graph
             weights_dr = type(val_db)(weights_np)
-            
+
             # Multiply by importance weights
             loss_contribution = (hinge * hinge) * weights_dr
 
@@ -1454,27 +1510,28 @@ def optimize_boresight_pathsolver(
             # A gentle global penalty pushing ALL receivers to have better signal.
             # Minimizing (-val_db) means maximizing val_db (the signal strength).
             global_penalty = dr.mean(-val_db)
-            
-            # Blend them together. 
+
+            # Blend them together.
             # lambda = 0.01 forces CVaR to steer, but global_penalty prevents sacrificing the alive zone.
-            reg_lambda = 0.01 
+            reg_lambda = 0.01
             loss = loss_cvar + (reg_lambda * global_penalty)
 
         elif loss_type == "threshold":
             # 1. Convert to True Rx Power (dBm)
-            val_db = (10.0 * dr.log(power_relative + 1e-35) / dr.log(10.0)) + tx_power_dbm
+            val_db = (
+                10.0 * dr.log(power_relative + 1e-35) / dr.log(10.0)
+            ) + tx_power_dbm
 
             # ==========================================
             # CALCULATE IMPORTANCE WEIGHTS
             # ==========================================
             num_dead = len(dead_pts) if dead_pts is not None else 0
-            num_alive = len(alive_pts) if alive_pts is not None else len(new_sample_points)
-            
+            num_alive = (
+                len(alive_pts) if alive_pts is not None else len(new_sample_points)
+            )
+
             weights_np = compute_robust_weights(
-                box_polygon, 
-                dead_buffs if dead_buffs else None, 
-                num_dead, 
-                num_alive
+                box_polygon, dead_buffs if dead_buffs else None, num_dead, num_alive
             )
             weights_dr = type(val_db)(weights_np)
             # ==========================================
@@ -1555,7 +1612,7 @@ def optimize_boresight_pathsolver(
     optimizer = torch.optim.Adam(
         [azimuth, elevation, x_pos, y_pos], lr=learning_rate, betas=(0.9, 0.999)
     )
-    #optimizer = torch.optim.SGD([azimuth, elevation, x_pos, y_pos], lr=learning_rate)
+    # optimizer = torch.optim.SGD([azimuth, elevation, x_pos, y_pos], lr=learning_rate)
 
     # Learning rate scheduler: required to jump out of local minima for difficult loss surfaces...
     use_scheduler = num_iterations >= 50
@@ -1586,6 +1643,11 @@ def optimize_boresight_pathsolver(
 
     # Start the optimization
     start_time = time.time()
+
+    # Used to check for convergence
+    x_pos_prev = None
+    y_pos_prev = None
+
     # The number of iterations signifies how many times you want the optimizer to iterate
     # The range should be extended 10x to accumulate samples for dead zone isolation
     for iteration in range(5 * num_iterations):
@@ -1622,21 +1684,21 @@ def optimize_boresight_pathsolver(
                     dead_buffs.append(donut)
 
             # --- Quick cluster / hull / buffer visualization ---
-            #_, ax = plt.subplots(figsize=(6, 6))
-            #colors = plt.cm.tab10.colors
-            #noise_mask = labels == -1
-            #ax.scatter(
+            # _, ax = plt.subplots(figsize=(6, 6))
+            # colors = plt.cm.tab10.colors
+            # noise_mask = labels == -1
+            # ax.scatter(
             #    dead_points[noise_mask, 0], dead_points[noise_mask, 1],
             #    s=10, c="lightgray", label="Noise", zorder=1,
-            #)
-            #for cid in sorted(unique_labels):
+            # )
+            # for cid in sorted(unique_labels):
             #    mask = labels == cid
             #    c = colors[cid % len(colors)]
             #    ax.scatter(
             #        dead_points[mask, 0], dead_points[mask, 1],
             #        s=10, color=c, label=f"Cluster {cid}", zorder=2,
             #    )
-            #for idx, (zone, buff) in enumerate(zip(dead_zones, dead_buffs)):
+            # for idx, (zone, buff) in enumerate(zip(dead_zones, dead_buffs)):
             #    c = colors[idx % len(colors)]
             #    for geom in (zone.geoms if hasattr(zone, "geoms") else [zone]):
             #        x, y = geom.exterior.xy
@@ -1644,17 +1706,15 @@ def optimize_boresight_pathsolver(
             #    for geom in (buff.geoms if hasattr(buff, "geoms") else [buff]):
             #        x, y = geom.exterior.xy
             #        ax.fill(x, y, alpha=0.15, fc=c, ec=c, linewidth=1, linestyle="--")
-            #ax.set_title(f"Dead Zone Clusters (iter {iteration + 1})")
-            #ax.set_xlabel("X")
-            #ax.set_ylabel("Y")
-            #ax.legend(markerscale=2, fontsize=8)
-            #plt.tight_layout()
-            #plt.show()
+            # ax.set_title(f"Dead Zone Clusters (iter {iteration + 1})")
+            # ax.set_xlabel("X")
+            # ax.set_ylabel("Y")
+            # ax.legend(markerscale=2, fontsize=8)
+            # plt.tight_layout()
+            # plt.show()
             # ---------------------------------------------------
 
-            loss = compute_loss(
-                azimuth, elevation, x_pos, y_pos
-            )
+            loss = compute_loss(azimuth, elevation, x_pos, y_pos)
             # Reset for the next accumulation window
             dead_points = np.zeros((0, 3))
             dead_buffs = []
@@ -1707,6 +1767,60 @@ def optimize_boresight_pathsolver(
             final_az_list = np.append(final_az_list, azimuth.item())
             final_el_list = np.append(final_el_list, elevation.item())
 
+        # Convergence check
+        if x_pos_prev is not None:
+            if (
+                abs(dr.detach(x_pos.item()) - x_pos_prev) < 0.105
+                and abs(dr.detach(y_pos.item()) - y_pos_prev) < 0.105
+            ):
+                print("Local Minimum Reached")
+
+                # Reset and return the values
+                final_x = float(x_pos.item())
+                final_y = float(y_pos.item())
+                scene.get(tx_name).position = mi.Point3f(final_x, final_y, tx_height)
+                reset_yaw, reset_pitch = azimuth_elevation_to_yaw_pitch(
+                    float(best_azimuth_final), float(best_elevation_final)
+                )
+                scene.get(tx_name).orientation = mi.Point3f(
+                    float(reset_yaw), float(reset_pitch), 0.0
+                )
+
+                # Cleanup Rx
+                # This is required to make sure the RadioMap calculation doesn't leave any extraneous recievers
+                for rx_name in rx_names:
+                    if rx_name in [obj.name for obj in scene.receivers.values()]:
+                        scene.remove(rx_name)
+
+                # Grab the final position
+                tx = scene.get(tx_name)
+                final_tx_position = [dr.detach(tx.position[i]) for i in range(3)]
+
+                # Compute final coverage statistics
+                coverage_stats = {
+                    "loss_type": loss_type,
+                    "best_azimuth_deg": best_azimuth_final,
+                    "best_elevation_deg": best_elevation_final,
+                    "tx_power_dbm": tx_power_dbm,
+                }
+
+                # Return angles and positions
+                best_angles = [best_azimuth_final, best_elevation_final]
+                return (
+                    best_angles,
+                    loss_history,
+                    angle_history,
+                    gradient_history,
+                    coverage_stats,
+                    initial_angles,
+                    initial_tx_position,
+                    final_tx_position,
+                )
+
+        # Saving this run as previous values
+        x_pos_prev = dr.detach(x_pos.item())
+        y_pos_prev = dr.detach(y_pos.item())
+
     # Save the average of the final 10 values
     best_azimuth_final = np.mean(final_az_list)
     best_elevation_final = np.mean(final_el_list)
@@ -1720,7 +1834,9 @@ def optimize_boresight_pathsolver(
     reset_yaw, reset_pitch = azimuth_elevation_to_yaw_pitch(
         float(best_azimuth_final), float(best_elevation_final)
     )
-    scene.get(tx_name).orientation = mi.Point3f(float(reset_yaw), float(reset_pitch), 0.0)
+    scene.get(tx_name).orientation = mi.Point3f(
+        float(reset_yaw), float(reset_pitch), 0.0
+    )
 
     # Save the elapsed time for metrics
     elapsed_time = time.time() - start_time
