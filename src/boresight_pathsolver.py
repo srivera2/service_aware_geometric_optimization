@@ -1402,19 +1402,19 @@ def optimize_boresight_pathsolver(
             dead_polygons=dead_buffs if dead_buffs else None,
         )
 
-        # fig = visualize_receiver_placement(
-        #   new_sample_points,
-        #    map_config,
-        #    current_tx_position=[dr.detach(x_pos), dr.detach(y_pos), tx_position[2]],
-        #    box_polygon=box_polygon,
-        #    dead_buffers=dead_buffs if dead_buffs else None,
-        #    alphashapes=dead_zones,
-        #    scene_xml_path=scene_xml_path,
-        #    building_id=building_id,
-        # )
-        # plt.show()
-        # fig.savefig(filepath + f"_{iteration}.png", dpi=350)
-        # plt.close(fig)
+        fig = visualize_receiver_placement(
+        new_sample_points,
+        map_config,
+        current_tx_position=[dr.detach(x_pos), dr.detach(y_pos), tx_position[2]],
+        box_polygon=box_polygon,
+        dead_buffers=dead_buffs if dead_buffs else None,
+        alphashapes=dead_zones,
+        scene_xml_path=scene_xml_path,
+        building_id=building_id,
+        )
+        plt.show()
+        fig.savefig(filepath + f"_{iteration}.png", dpi=350)
+        plt.close(fig)
 
         # Store for visualization/debugging
         sample_points_storage["current"] = new_sample_points

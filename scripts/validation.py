@@ -60,7 +60,7 @@ CONFIG = {
     'map_config': {
         'center': [0.0, 0.0, 0.0],
         'size': [1000, 1000],
-        'cell_size': (1.0, 1.0),
+        'cell_size': (0.5, 0.5),
         'ground_height': 0.0,
     },
 
@@ -75,13 +75,15 @@ CONFIG = {
         'max_attempts': 200,
     },
 
-    # Validation thresholds
+    # Validation thresholds — select "fixable" zones:
+    # weak spots exist (p10 < -90 dBm), some good coverage present (p90 > -100 dBm),
+    # meaningful dynamic range (>= 15 dB), and median not already excellent (< -75 dBm).
     'validation_thresholds': {
         'p10_min_dbm': -140.0,
         'p10_max_dbm': -90.0,
-        'p90_min_dbm': -80.0,
-        'min_percentile_range_db': 40.0,
-        'median_max_dbm': -60.0
+        'p90_min_dbm': -100.0,
+        'min_percentile_range_db': 15.0,
+        'median_max_dbm': -75.0
     },
 
     # Optimization settings
@@ -94,7 +96,7 @@ CONFIG = {
     # RadioMapSolver settings for evaluation
     'rm_solver': {
         'max_depth': 8,
-        'samples_per_tx': int(6e8),
+        'samples_per_tx': int(10e8),
     },
 
     # TX placement
@@ -232,8 +234,19 @@ def find_central_building(building_info):
     return selected_building_id, min_distance
 
 
-def evaluate_configuration(scene, tx, zone_mask, map_config, rm_solver, angles):
-    """Evaluate a TX configuration and return zone power statistics."""
+def evaluate_configuration(scene, tx, zone_mask, map_config, rm_solver, angles, tx_pos=None):
+    """Evaluate a TX configuration and return zone power statistics (in watts).
+
+    Parameters
+    ----------
+    tx_pos : list or None
+        If provided, the TX is moved to this [x, y, z] position before evaluation.
+        Pass initial_tx_pos for the baseline and final_tx_pos for the optimized config
+        so that each configuration is evaluated at its own position.
+    """
+    if tx_pos is not None:
+        tx.position = mi.Point3f(tx_pos)
+
     yaw, pitch = azimuth_elevation_to_yaw_pitch(angles[0], angles[1])
     tx.orientation = mi.Point3f(float(yaw), float(pitch), 0.0)
 
@@ -248,15 +261,12 @@ def evaluate_configuration(scene, tx, zone_mask, map_config, rm_solver, angles):
         los=True,
         specular_reflection=True,
         diffuse_reflection=True,
-        diffraction=True,
-        edge_diffraction=True,
         refraction=False,
         stop_threshold=None,
     )
 
     rss_watts = rm.rss.numpy()[0, :, :]
-    signal_strength_dBm = 10.0 * np.log10(rss_watts + 1e-30) + 30.0
-    zone_power = signal_strength_dBm[zone_mask == 1.0]
+    zone_power = rss_watts[zone_mask == 1.0]  # watts, consistent with compare_boresight_performance
 
     return zone_power
 
@@ -430,15 +440,19 @@ def run_validation(config=None, checkpoint_file='validation_checkpoint.pkl',
                         print(f"    Best:    Az={float(best_angles[0]):.1f}, El={float(best_angles[1]):.1f}")
 
                         # Evaluate initial configuration (with heartbeat monitoring)
+                        # Pass initial_tx_pos so the TX is at its pre-optimization position.
                         with OperationWatchdog("evaluate_initial", scene_name, interval=30):
                             zone_power_initial = evaluate_configuration(
-                                scene, tx, zone_mask, config['map_config'], rm_solver, initial_angles
+                                scene, tx, zone_mask, config['map_config'], rm_solver,
+                                initial_angles, tx_pos=initial_tx_pos
                             )
 
                         # Evaluate optimized configuration (with heartbeat monitoring)
+                        # Pass final_tx_pos so the TX is at its post-optimization position.
                         with OperationWatchdog("evaluate_optimized", scene_name, interval=30):
                             zone_power_optimized = evaluate_configuration(
-                                scene, tx, zone_mask, config['map_config'], rm_solver, best_angles
+                                scene, tx, zone_mask, config['map_config'], rm_solver,
+                                best_angles, tx_pos=final_tx_pos
                             )
 
                         # Store results
@@ -469,10 +483,15 @@ def run_validation(config=None, checkpoint_file='validation_checkpoint.pkl',
                             'zone_power_optimized': zone_power_optimized,
                         }
 
-                        improvement = np.median(zone_power_optimized) - np.median(zone_power_initial)
-                        improvement2 = np.percentile(zone_power_optimized, 10) - np.percentile(zone_power_initial, 10)
-                        print(f"    Median improvement: {improvement:+.2f} dB")
-                        print(f"    10th Percentile Improvement: {improvement2:+.2f} dB")
+                        # Zone power is in watts; convert ratio to dB for display.
+                        improvement_db = 10.0 * np.log10(
+                            np.median(zone_power_optimized) / (np.median(zone_power_initial) + 1e-30)
+                        )
+                        improvement2_db = 10.0 * np.log10(
+                            np.percentile(zone_power_optimized, 10) / (np.percentile(zone_power_initial, 10) + 1e-30)
+                        )
+                        print(f"    Median improvement: {improvement_db:+.2f} dB")
+                        print(f"    10th Percentile Improvement: {improvement2_db:+.2f} dB")
 
                     except Exception as e:
                         print(f"    ERROR in {result_key}: {type(e).__name__}: {e}")
