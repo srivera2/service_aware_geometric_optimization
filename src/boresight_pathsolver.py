@@ -1233,33 +1233,9 @@ def optimize_boresight_pathsolver(
             ]
         )  # shape: (num_rx, 3)
 
-        dead_zone = filter_and_append(rx_data, dead_zone, 20.0)
+        dead_zone = filter_and_append(rx_data, dead_zone, 40.0)
 
         return dead_zone
-
-    def calculate_weighted_median(values, weights):
-        """
-        Calculates the weighted median of a 1D numpy array.
-        Used to anchor the CVaR target to the true physical distribution.
-        """
-        # 1. Sort values and align weights to the sorted order
-        sort_indices = np.argsort(values)
-        sorted_values = values[sort_indices]
-        sorted_weights = weights[sort_indices]
-
-        # 2. Find the cumulative sum of the weights
-        cumulative_weights = np.cumsum(sorted_weights)
-
-        # 3. Find the 50% cutoff point of the total weight
-        cutoff = 0.5 * np.sum(sorted_weights)
-
-        # 4. Return the value where the cumulative weight crosses the cutoff
-        median_idx = np.searchsorted(cumulative_weights, cutoff)
-
-        # Handle edge case where searchsorted goes out of bounds
-        median_idx = min(median_idx, len(sorted_values) - 1)
-
-        return sorted_values[median_idx]
 
     def compute_robust_weights(
         box_polygon, dead_zones, num_dead_samples, num_alive_samples
@@ -1400,6 +1376,7 @@ def optimize_boresight_pathsolver(
             building_polygons=cached_building_polygons,
             ground_z=map_config["center"][2],
             dead_polygons=dead_buffs if dead_buffs else None,
+            dead_fraction=.9
         )
 
         fig = visualize_receiver_placement(
@@ -1461,99 +1438,6 @@ def optimize_boresight_pathsolver(
             lse = max_exponent + dr.log(sum_terms + epsilon)
             loss = (1.0 / alpha) * lse
 
-        elif loss_type == "CVaR":
-            # 1. Convert to Rx Power (dBm) using the pre-extracted float
-            val_db = (
-                10.0 * dr.log(power_relative + 1e-35) / dr.log(10.0)
-            ) + tx_power_dbm
-
-            # ==========================================
-            # CALCULATE IMPORTANCE WEIGHTS
-            # ==========================================
-            # Safely get the count of dead and alive points from your sample_grid_points output
-            num_dead = len(dead_pts) if dead_pts is not None else 0
-            num_alive = (
-                len(alive_pts) if alive_pts is not None else len(new_sample_points)
-            )
-
-            weights_np = compute_robust_weights(
-                box_polygon, dead_buffs if dead_buffs else None, num_dead, num_alive
-            )
-            # ==========================================
-
-            # 2. Determine the Target (The Weighted Waterline)
-            val_db_np = np.array(dr.detach(val_db))
-            target_scalar = calculate_weighted_median(val_db_np, weights_np)
-            target = type(val_db)(target_scalar)
-
-            # 3. Deficit-Weighted (Quadratic) Hinge Loss
-            deficit = target - val_db
-            hinge = dr.maximum(deficit, 0.0)
-
-            # Convert weights to DrJit Float to inject into AD graph
-            weights_dr = type(val_db)(weights_np)
-
-            # Multiply by importance weights
-            loss_contribution = (hinge * hinge) * weights_dr
-
-            # 4. Normalize by the Weighted Tail Count
-            tail_mask = deficit > 0.0
-            tail_weights = dr.select(tail_mask, weights_dr, 0.0)
-            weighted_tail_count = dr.sum(tail_weights)
-
-            # Calculate the pure CVaR loss
-            loss_cvar = dr.sum(loss_contribution) / (weighted_tail_count + 1e-5)
-
-            # ==========================================
-            # NEW: HYBRID REGULARIZATION PENALTY
-            # ==========================================
-            # A gentle global penalty pushing ALL receivers to have better signal.
-            # Minimizing (-val_db) means maximizing val_db (the signal strength).
-            global_penalty = dr.mean(-val_db)
-
-            # Blend them together.
-            # lambda = 0.01 forces CVaR to steer, but global_penalty prevents sacrificing the alive zone.
-            reg_lambda = 0.01
-            loss = loss_cvar + (reg_lambda * global_penalty)
-
-        elif loss_type == "threshold":
-            # 1. Convert to True Rx Power (dBm)
-            val_db = (
-                10.0 * dr.log(power_relative + 1e-35) / dr.log(10.0)
-            ) + tx_power_dbm
-
-            # ==========================================
-            # CALCULATE IMPORTANCE WEIGHTS
-            # ==========================================
-            num_dead = len(dead_pts) if dead_pts is not None else 0
-            num_alive = (
-                len(alive_pts) if alive_pts is not None else len(new_sample_points)
-            )
-
-            weights_np = compute_robust_weights(
-                box_polygon, dead_buffs if dead_buffs else None, num_dead, num_alive
-            )
-            weights_dr = type(val_db)(weights_np)
-            # ==========================================
-
-            # 2. Define the Static Physical Target
-            # We want all users to reach at least -80 dBm
-            target_db = -85.0
-
-            # 3. Calculate the Hinge Error
-            # If a user is at -100 dBm, error is 20. If they are at -50 dBm, error is 0.0.
-            error = target_db - val_db
-            hinge = dr.maximum(error, 0.0)
-
-            # 4. Deficit-Weighted (Quadratic) Penalty
-            # Squaring it makes the optimizer fight exponentially harder for the deepest dead zones
-            loss_contribution = (hinge * hinge) * weights_dr
-
-            # 5. Normalize by Total Weight
-            # Normalizing by the total weight keeps the gradient magnitudes perfectly stable
-            total_weight = dr.sum(weights_dr)
-            loss = dr.sum(loss_contribution) / (total_weight + 1e-5)
-
         else:
             # Sum Log(Power) -> Automatically heavily penalizes low values
             # Epsilon prevents log(0) from returning -inf for blocked rays
@@ -1564,7 +1448,7 @@ def optimize_boresight_pathsolver(
 
             loss = -avg_utility
 
-        return loss
+        return loss, paths
 
     # Calculate the initial azimuth and elevation angles based on the position of the transmitter + center of the zone
     # Add z-coordinate (target_height) to zone center which only has [x, y]
@@ -1664,9 +1548,10 @@ def optimize_boresight_pathsolver(
         dead_points = accumulate_samples(dead_points, qrand)
 
         # On the 5th iteration: build dead zone polygons, compute loss, then reset
-        if (iteration + 1) % 5 == 0:
+        if (iteration + 1) % 20 == 0:
             # Use DBSCAN to find clusters across accumulated dead points
-            clusters = DBSCAN(eps=20, min_samples=10).fit(dead_points[:, :2])
+            #clusters = DBSCAN(eps=20, min_samples=10).fit(dead_points[:, :2])
+            clusters = HDBSCAN(min_samples=5).fit(dead_points[:, :2])
             labels = clusters.labels_
             unique_labels = set(labels) - {-1}
 
@@ -1677,7 +1562,7 @@ def optimize_boresight_pathsolver(
                 shape = shapely.make_valid(shape)
                 # Append the dead zone for plotting
                 dead_zones.append(shape)
-                clipped = shapely.buffer(shape, 30.0)
+                clipped = shapely.buffer(shape, 20.0)
                 donut = shapely.difference(clipped, shape).intersection(zone_polygon)
                 # Chek if the buffer exists and append to the list of buffers
                 if not donut.is_empty:
@@ -1714,7 +1599,7 @@ def optimize_boresight_pathsolver(
             # plt.show()
             # ---------------------------------------------------
 
-            loss = compute_loss(azimuth, elevation, x_pos, y_pos)
+            loss, path_out = compute_loss(azimuth, elevation, x_pos, y_pos)
             # Reset for the next accumulation window
             dead_points = np.zeros((0, 3))
             dead_buffs = []
@@ -1870,4 +1755,5 @@ def optimize_boresight_pathsolver(
         initial_angles,
         initial_tx_position,
         final_tx_position,
+        path_out
     )
