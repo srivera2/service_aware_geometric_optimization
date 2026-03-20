@@ -1233,7 +1233,7 @@ def optimize_boresight_pathsolver(
             ]
         )  # shape: (num_rx, 3)
 
-        dead_zone = filter_and_append(rx_data, dead_zone, 40.0)
+        dead_zone = filter_and_append(rx_data, dead_zone, 5.0)
 
         return dead_zone
 
@@ -1376,7 +1376,7 @@ def optimize_boresight_pathsolver(
             building_polygons=cached_building_polygons,
             ground_z=map_config["center"][2],
             dead_polygons=dead_buffs if dead_buffs else None,
-            dead_fraction=.9
+            dead_fraction=.99
         )
 
         fig = visualize_receiver_placement(
@@ -1407,9 +1407,9 @@ def optimize_boresight_pathsolver(
         paths = p_solver(
             scene,
             los=True,
-            refraction=True,
+            refraction=False,
             specular_reflection=True,
-            diffuse_reflection=True,
+            diffuse_reflection=False,
         )
 
         # Extract channel coefficients
@@ -1534,7 +1534,7 @@ def optimize_boresight_pathsolver(
 
     # The number of iterations signifies how many times you want the optimizer to iterate
     # The range should be extended 10x to accumulate samples for dead zone isolation
-    for iteration in range(5 * num_iterations):
+    for iteration in range(20 * num_iterations):
         if verbose and iteration == 0:
             print(f"\n{'='*70}")
             print(f"STARTING OPTIMIZATION - Iteration {iteration+1}/{num_iterations}")
@@ -1550,8 +1550,8 @@ def optimize_boresight_pathsolver(
         # On the 5th iteration: build dead zone polygons, compute loss, then reset
         if (iteration + 1) % 20 == 0:
             # Use DBSCAN to find clusters across accumulated dead points
-            #clusters = DBSCAN(eps=20, min_samples=10).fit(dead_points[:, :2])
-            clusters = HDBSCAN(min_samples=5).fit(dead_points[:, :2])
+            clusters = DBSCAN(eps=10, min_samples=5).fit(dead_points[:, :2])
+            #clusters = HDBSCAN(min_samples=5).fit(dead_points[:, :2])
             labels = clusters.labels_
             unique_labels = set(labels) - {-1}
 
@@ -1562,7 +1562,7 @@ def optimize_boresight_pathsolver(
                 shape = shapely.make_valid(shape)
                 # Append the dead zone for plotting
                 dead_zones.append(shape)
-                clipped = shapely.buffer(shape, 20.0)
+                clipped = shapely.buffer(shape, .5)
                 donut = shapely.difference(clipped, shape).intersection(zone_polygon)
                 # Chek if the buffer exists and append to the list of buffers
                 if not donut.is_empty:
@@ -1700,6 +1700,7 @@ def optimize_boresight_pathsolver(
                     initial_angles,
                     initial_tx_position,
                     final_tx_position,
+                    path_out
                 )
 
         # Saving this run as previous values
