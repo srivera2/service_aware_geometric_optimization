@@ -11,7 +11,7 @@ import numpy as np
 import drjit as dr
 from drjit.auto import Float, Array3f, UInt
 import mitsuba as mi
-from sionna.rt import PathSolver, Receiver, cpx_abs_square
+from sionna.rt import PathSolver, RadioMapSolver, Receiver, cpx_abs_square
 from sionna.rt.path_solvers.paths import Paths
 import time
 import shapely
@@ -290,13 +290,42 @@ def sample_grid_points(
             building_polygons=building_polygons,
             ground_z=ground_z,
         )
-        dead_pts, _, __, ___, ____ = sample_grid_points(
-            dead_union,
-            dead_num,
-            qrand,
-            building_polygons=building_polygons,
-            ground_z=ground_z,
-        )
+
+        # Use QMC sampler directly inside each dead polygon, allocating points
+        # proportional to polygon area so the low-discrepancy sequence is mapped
+        # tightly to each polygon's own bounding box rather than a large union bbox.
+        total_area = sum(p.area for p in dead_polygons)
+        all_dead_pts = []
+        for poly in dead_polygons:
+            n_poly = max(1, round(dead_num * poly.area / total_area))
+            minx, miny, maxx, maxy = poly.bounds
+            w, h = maxx - minx, maxy - miny
+            sampled = []
+            for iteration in range(1, 101):
+                needed = n_poly - len(sampled)
+                if needed == 0:
+                    break
+                batch = np.clip(
+                    np.array(qrand.random(min(needed * max(2, iteration), 10000))), 0.0, 1.0
+                )
+                x = minx + batch[:, 0] * w
+                y = miny + batch[:, 1] * h
+                in_poly = contains_xy(poly, x, y)
+                pts = np.column_stack([x[in_poly], y[in_poly]])
+                if building_polygons and len(pts):
+                    mask = np.ones(len(pts), dtype=bool)
+                    for bp in building_polygons:
+                        mask &= ~contains_xy(bp, pts[:, 0], pts[:, 1])
+                    pts = pts[mask]
+                sampled.extend(pts[:needed].tolist())
+            all_dead_pts.extend(sampled[:n_poly])
+
+        if all_dead_pts:
+            dead_pts2d = np.array(all_dead_pts[:dead_num])
+            dead_pts = np.hstack([dead_pts2d, np.full((len(dead_pts2d), 1), ground_z)])
+        else:
+            dead_pts = np.zeros((0, 3))
+
         return (
             np.vstack([dead_pts, alive_pts]),
             dead_union,
@@ -1013,6 +1042,8 @@ def optimize_boresight_pathsolver(
     tx_placement_mode="skip",  # "center", "fixed", "line", "skip" (skip = don't move TX)
     Tx_start_pos=[0.0, 0.0],
     filepath=os.getcwd() + "/figures/",
+    dead_tail_percentile=5.0,   # Bottom X% of rays (by power) treated as dead zone
+    max_dbscan_points=50_000,   # Cap before DBSCAN to keep runtime tractable
 ):
     """
     Optimize boresight using PathSolver with automatic differentiation
@@ -1237,55 +1268,6 @@ def optimize_boresight_pathsolver(
 
         return dead_zone
 
-    def compute_robust_weights(
-        box_polygon, dead_zones, num_dead_samples, num_alive_samples
-    ):
-        """
-        Computes Self-Normalized Importance Weights based on spatial areas.
-        """
-        total_samples = num_dead_samples + num_alive_samples
-
-        # 1. Calculate Physical Areas
-        total_area = box_polygon.area
-
-        # Calculate union of dead zones to avoid double-counting overlapping areas
-        if dead_zones:
-            from shapely.ops import unary_union
-
-            dead_area = unary_union(dead_zones).area
-        else:
-            dead_area = 0.0
-
-        alive_area = total_area - dead_area
-
-        # 2. Calculate Area Fractions (True Probability)
-        prob_dead_true = dead_area / total_area
-        prob_alive_true = alive_area / total_area
-
-        # 3. Calculate Sample Fractions (Sampled Probability)
-        # Add epsilon to prevent division by zero if dead zones disappear
-        prob_dead_sampled = (num_dead_samples + 1e-9) / total_samples
-        prob_alive_sampled = (num_alive_samples + 1e-9) / total_samples
-
-        # 4. Compute Base Weights (P / Q)
-        w_dead = prob_dead_true / prob_dead_sampled
-        w_alive = prob_alive_true / prob_alive_sampled
-
-        # 5. Build the Array (Assuming dead samples are first in the array)
-        weights_np = np.empty(total_samples)
-        weights_np[:num_dead_samples] = w_dead
-        weights_np[num_dead_samples:] = w_alive
-
-        # 6. Clip extreme weights (Robustness against vanishing dead zones)
-        max_weight_limit = 5.0
-        weights_np = np.clip(weights_np, a_min=0.01, a_max=max_weight_limit)
-
-        # 7. Self-Normalize (CRITICAL for Adam Optimizer)
-        # Forces the sum of weights to equal the batch size
-        weights_np = weights_np * (total_samples / np.sum(weights_np))
-
-        return weights_np
-
     # Define differentiable loss function using @dr.wrap
     loss_type = "else"
 
@@ -1376,7 +1358,7 @@ def optimize_boresight_pathsolver(
             building_polygons=cached_building_polygons,
             ground_z=map_config["center"][2],
             dead_polygons=dead_buffs if dead_buffs else None,
-            dead_fraction=.99
+            dead_fraction=.5
         )
 
         fig = visualize_receiver_placement(
@@ -1532,9 +1514,12 @@ def optimize_boresight_pathsolver(
     x_pos_prev = None
     y_pos_prev = None
 
-    # The number of iterations signifies how many times you want the optimizer to iterate
-    # The range should be extended 10x to accumulate samples for dead zone isolation
-    for iteration in range(20 * num_iterations):
+    rm_solver = RadioMapSolver()
+    # Hard coding the number of iterations
+    loop_iterations = num_iterations
+    _use_radio_map = True
+
+    for iteration in range(loop_iterations):
         if verbose and iteration == 0:
             print(f"\n{'='*70}")
             print(f"STARTING OPTIMIZATION - Iteration {iteration+1}/{num_iterations}")
@@ -1544,68 +1529,128 @@ def optimize_boresight_pathsolver(
             print(f"  Starting Position [x]: {tx_position[0]} m")
             print(f"  Starting Position [y]: {tx_position[1]} m")
 
-        # Accumulate dead zone samples for iterations 1-9
-        dead_points = accumulate_samples(dead_points, qrand)
+        # ---- PathSolver accumulation path (original behaviour) ---- #
+        if not _use_radio_map:
+            dead_points = accumulate_samples(dead_points, qrand)
 
-        # On the 5th iteration: build dead zone polygons, compute loss, then reset
-        if (iteration + 1) % 20 == 0:
-            # Use DBSCAN to find clusters across accumulated dead points
+            if (iteration + 1) % 20 != 0:
+                continue
+
+            # Build dead zone polygons from accumulated PathSolver samples
             clusters = DBSCAN(eps=10, min_samples=5).fit(dead_points[:, :2])
-            #clusters = HDBSCAN(min_samples=5).fit(dead_points[:, :2])
             labels = clusters.labels_
             unique_labels = set(labels) - {-1}
 
-            # Build one buffered hull polygon per cluster
             for cluster_id in sorted(unique_labels):
                 pts = dead_points[labels == cluster_id, :2]
                 shape = alphashape.alphashape(pts, alpha=0.05)
                 shape = shapely.make_valid(shape)
-                # Append the dead zone for plotting
                 dead_zones.append(shape)
-                clipped = shapely.buffer(shape, .5)
-                donut = shapely.difference(clipped, shape).intersection(zone_polygon)
-                # Chek if the buffer exists and append to the list of buffers
-                if not donut.is_empty:
-                    dead_buffs.append(donut)
-
-            # --- Quick cluster / hull / buffer visualization ---
-            # _, ax = plt.subplots(figsize=(6, 6))
-            # colors = plt.cm.tab10.colors
-            # noise_mask = labels == -1
-            # ax.scatter(
-            #    dead_points[noise_mask, 0], dead_points[noise_mask, 1],
-            #    s=10, c="lightgray", label="Noise", zorder=1,
-            # )
-            # for cid in sorted(unique_labels):
-            #    mask = labels == cid
-            #    c = colors[cid % len(colors)]
-            #    ax.scatter(
-            #        dead_points[mask, 0], dead_points[mask, 1],
-            #        s=10, color=c, label=f"Cluster {cid}", zorder=2,
-            #    )
-            # for idx, (zone, buff) in enumerate(zip(dead_zones, dead_buffs)):
-            #    c = colors[idx % len(colors)]
-            #    for geom in (zone.geoms if hasattr(zone, "geoms") else [zone]):
-            #        x, y = geom.exterior.xy
-            #        ax.fill(x, y, alpha=0.35, fc=c, ec=c, linewidth=1.5)
-            #    for geom in (buff.geoms if hasattr(buff, "geoms") else [buff]):
-            #        x, y = geom.exterior.xy
-            #        ax.fill(x, y, alpha=0.15, fc=c, ec=c, linewidth=1, linestyle="--")
-            # ax.set_title(f"Dead Zone Clusters (iter {iteration + 1})")
-            # ax.set_xlabel("X")
-            # ax.set_ylabel("Y")
-            # ax.legend(markerscale=2, fontsize=8)
-            # plt.tight_layout()
-            # plt.show()
-            # ---------------------------------------------------
+                #clipped = shapely.buffer(shape, .5)
+                #donut = shapely.difference(clipped, shape).intersection(zone_polygon)
+                #if not donut.is_empty:
+                #    dead_buffs.append(donut)
+                dead_buffs = dead_zones
 
             loss, path_out = compute_loss(azimuth, elevation, x_pos, y_pos)
             # Reset for the next accumulation window
             dead_points = np.zeros((0, 3))
             dead_buffs = []
             dead_zones = []
+
+        # ---- RadioMap path: use in place of the PathSolver method ---- #
         else:
-            continue
+            from shapely import contains_xy as _contains_xy
+            # Reset dead zone state so each iteration uses only the current radio map
+            dead_points = np.zeros((0, 3))
+            dead_buffs = []
+            dead_zones = []
+
+            # Snapshot current parameter values as plain Python floats, completely
+            # detached from the DrJit / PyTorch AD graph, so that rm_solver cannot
+            # corrupt gradient state by touching the scene object.
+            az_val  = float(azimuth.item())
+            el_val  = float(elevation.item())
+            xp_val  = float(x_pos.item())
+            yp_val  = float(y_pos.item())
+
+            az_rad = float(np.deg2rad(az_val))
+            el_rad = float(np.deg2rad(el_val))
+
+            # Write plain-float TX state so rm_solver sees no AD tensors on the scene.
+            scene.get(tx_name).orientation = [az_rad, -el_rad, 0.0]
+            scene.get(tx_name).position = mi.Point3f(xp_val, yp_val, tx_z)
+
+            # Calculate the RadioMap during this iteration
+            rm = rm_solver(
+                scene,
+                max_depth=8,
+                samples_per_tx=int(1e6),
+                cell_size=[0.5, 0.5],
+                center=map_config["center"],
+                orientation=[0, 0, 0],
+                size=map_config["size"],
+                los=True,
+                specular_reflection=True,
+                diffuse_reflection=True,
+                refraction=False,
+                stop_threshold=None,
+                capture_rays=int(1e6)
+            )
+
+            # Save the buffer values
+            rm_pos, rm_ef, _ = rm.captured_rays
+
+            if rm_pos is None:
+                raise ValueError(
+                    "radio_map.captured_rays returned None. "
+                    "Was capture_rays > 0 passed to RadioMapSolver?"
+                )
+
+            # Power = |a_cap|^2  (already Friis-corrected in add_paths)
+            rm_power = (rm_ef[:, 0]**2 + rm_ef[:, 1]**2
+                    + rm_ef[:, 2]**2 + rm_ef[:, 3]**2)
+
+            # Crop to zone polygon
+            in_zone = _contains_xy(zone_polygon, rm_pos[:, 0], rm_pos[:, 1])
+            rm_pos_z  = rm_pos[in_zone]
+            rm_power_z = rm_power[in_zone]
+            print(f"  Rays in zone: {in_zone.sum():,} / {len(rm_pos):,}")
+
+            # Build [x, y, power] and keep only the bottom dead_tail_percentile%
+            rx_data = np.column_stack([rm_pos_z[:, 0], rm_pos_z[:, 1], rm_power_z])
+            dead_points = filter_and_append(rx_data, dead_points, dead_tail_percentile)
+            print(f"  Dead points (bottom {dead_tail_percentile}%): {len(dead_points):,}")
+
+            # Subsample so DBSCAN stays tractable
+            if len(dead_points) > max_dbscan_points:
+                rng = np.random.default_rng(42)
+                dead_points = dead_points[
+                    rng.choice(len(dead_points), max_dbscan_points, replace=False)
+                ]
+                print(f"  Subsampled to {max_dbscan_points:,} for DBSCAN")
+
+            # DBSCAN clustering
+            #clusters = DBSCAN(eps=2.0, min_samples=20).fit(dead_points[:, :2])
+            clusters = HDBSCAN(min_samples=1).fit(dead_points[:, :2])
+            labels = clusters.labels_
+            unique_labels = set(labels) - {-1}
+            print(f"  Clusters found: {len(unique_labels)}")
+
+            for cluster_id in sorted(unique_labels):
+                pts = dead_points[labels == cluster_id, :2]
+                shape = alphashape.alphashape(pts, alpha=0.05)
+                shape = shapely.make_valid(shape)
+                dead_zones.append(shape)
+                #clipped = shapely.buffer(shape, 5)
+                #donut = shapely.difference(clipped, shape).intersection(zone_polygon)
+                #if not donut.is_empty:
+                #    dead_buffs.append(donut)
+                dead_buffs = dead_zones
+
+            print(f"  Dead zones built: {len(dead_zones)}  |  Buffers: {len(dead_buffs)}")
+            print(f"{'='*70}\n")
+            loss, path_out = compute_loss(azimuth, elevation, x_pos, y_pos)
 
         # Calculate the gradients in terms of each parameter
         loss.backward()
@@ -1647,7 +1692,8 @@ def optimize_boresight_pathsolver(
             y_pos.data.fill_(proj_y)
 
         # Modified to reflect robust value over the lowest loss
-        if iteration >= 5 * (num_iterations - 10):
+        window_start = (num_iterations - 10) if _use_radio_map else 5 * (num_iterations - 10)
+        if iteration >= window_start:
             # Save the values to a list
             final_az_list = np.append(final_az_list, azimuth.item())
             final_el_list = np.append(final_el_list, elevation.item())
