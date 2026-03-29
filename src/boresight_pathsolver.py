@@ -29,6 +29,8 @@ import scipy
 from scipy.spatial import ConvexHull
 from triangulate import (
     get_zone_polygon_with_exclusions,
+    triangulate_zone,
+    sample_triangulated_zone,
 )
 import sklearn
 from sklearn.cluster import DBSCAN
@@ -778,8 +780,9 @@ def compare_boresight_performance(
         fig, axes = plt.subplots(2, 2, figsize=(16, 12))
 
         # Helper function to convert Watts to dBm
+        # Setting the noise floor to 150 dB
         def watts_to_dbm(watts):
-            return 10.0 * np.log10(watts + 1e-30) + 30.0
+            return 10.0 * np.log10(watts + 1e-18) + 30.0
 
         # Convert all power values to dBm for better visualization
         all_power_watts = np.concatenate(
@@ -1134,7 +1137,7 @@ def optimize_boresight_pathsolver(
         )
 
     # Solve for polygon zone and remove building exclusions.
-    _, building_exclusions, _ = get_zone_polygon_with_exclusions(
+    target_zone, building_exclusions, _ = get_zone_polygon_with_exclusions(
         zone_type=zone_type,
         zone_params=zone_params,
         scene_xml_path=scene_xml_path,
@@ -1181,6 +1184,11 @@ def optimize_boresight_pathsolver(
         )
     else:
         zone_polygon = box_polygon
+
+    # Pre-triangulate the full zone once for use as fallback when no dead zones exist.
+    # NOTE: qrand is currently d=3 but sample_triangulated_zone only uses dims 0 and 1.
+    # Consider switching to d=2 for marginally better discrepancy.
+    tri_verts_full, _ = triangulate_zone(target_zone, building_exclusions)
 
     # CRITICAL: Remove ALL existing receivers from the scene first
     # This ensures paths.a indexing matches our optimization receivers exactly
@@ -1349,17 +1357,29 @@ def optimize_boresight_pathsolver(
         scene.get(tx_name).position = [x_pos_val, y_pos_val, tx_position[2]]
         print(f"Tx position: {scene.get(tx_name).position}")
 
-        # Sample across the full zone, biasing toward dead areas when present
-        new_sample_points, _, __, dead_pts, alive_pts = sample_grid_points(
-            zone_polygon,
-            num_sample_points,
-            qrand,
-            alphashapes=dead_zones if dead_zones else None,
-            building_polygons=cached_building_polygons,
-            ground_z=map_config["center"][2],
-            dead_polygons=dead_buffs if dead_buffs else None,
-            dead_fraction=.5
-        )
+        # Triangulate all dead zone strata and concatenate into one triangle array.
+        # sample_triangulated_zone allocates num_sample_points proportionally by
+        # triangle area — equivalent to independent per-stratum sampling with
+        # proportional counts, but preserving a continuous QMC sequence across strata.
+        # Falls back to the full zone mesh when no dead zones exist yet.
+        all_tri_verts = []
+        for dz in dead_zones:
+            geoms = list(dz.geoms) if dz.geom_type == 'MultiPolygon' else [dz]
+            for poly in geoms:
+                if poly.is_empty or not poly.is_valid:
+                    continue
+                tv, _ = triangulate_zone(list(poly.exterior.coords)[:-1], [])
+                if len(tv) > 0:
+                    all_tri_verts.append(tv)
+
+        combined_tri_verts = np.vstack(all_tri_verts) if all_tri_verts else tri_verts_full
+        pts_2d = sample_triangulated_zone(combined_tri_verts, num_sample_points, qrand)
+
+        ground_z = map_config["center"][2]
+        new_sample_points = np.column_stack([
+            pts_2d,
+            np.full(num_sample_points, ground_z, dtype=np.float32),
+        ])
 
         fig = visualize_receiver_placement(
         new_sample_points,
@@ -1391,7 +1411,7 @@ def optimize_boresight_pathsolver(
             los=True,
             refraction=False,
             specular_reflection=True,
-            diffuse_reflection=False,
+            diffuse_reflection=True,
         )
 
         # Extract channel coefficients
@@ -1481,7 +1501,7 @@ def optimize_boresight_pathsolver(
     # optimizer = torch.optim.SGD([azimuth, elevation, x_pos, y_pos], lr=learning_rate)
 
     # Learning rate scheduler: required to jump out of local minima for difficult loss surfaces...
-    use_scheduler = num_iterations >= 50
+    use_scheduler = num_iterations >= 200
 
     if use_scheduler:
         # Using cosine anneling warm restarts to avoid being trapped in local minima
@@ -1520,6 +1540,7 @@ def optimize_boresight_pathsolver(
     _use_radio_map = True
 
     for iteration in range(loop_iterations):
+        iter_time = time.time()
         if verbose and iteration == 0:
             print(f"\n{'='*70}")
             print(f"STARTING OPTIMIZATION - Iteration {iteration+1}/{num_iterations}")
@@ -1701,8 +1722,8 @@ def optimize_boresight_pathsolver(
         # Convergence check
         if x_pos_prev is not None:
             if (
-                abs(dr.detach(x_pos.item()) - x_pos_prev) < 0.105
-                and abs(dr.detach(y_pos.item()) - y_pos_prev) < 0.105
+                abs(dr.detach(x_pos.item()) - x_pos_prev) < 0.101
+                and abs(dr.detach(y_pos.item()) - y_pos_prev) < 0.101
             ):
                 print("Local Minimum Reached")
 
@@ -1752,6 +1773,9 @@ def optimize_boresight_pathsolver(
         # Saving this run as previous values
         x_pos_prev = dr.detach(x_pos.item())
         y_pos_prev = dr.detach(y_pos.item())
+        iter_end = time.time()
+        dur = abs(iter_time - iter_end)
+        print(f"Time per Iteration: {dur}")
 
     # Save the average of the final 10 values
     best_azimuth_final = np.mean(final_az_list)
