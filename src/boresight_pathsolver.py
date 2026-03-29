@@ -31,6 +31,7 @@ from triangulate import (
     get_zone_polygon_with_exclusions,
     triangulate_zone,
     sample_triangulated_zone,
+    sample_dead_zones,
 )
 import sklearn
 from sklearn.cluster import DBSCAN
@@ -1357,29 +1358,16 @@ def optimize_boresight_pathsolver(
         scene.get(tx_name).position = [x_pos_val, y_pos_val, tx_position[2]]
         print(f"Tx position: {scene.get(tx_name).position}")
 
-        # Triangulate all dead zone strata and concatenate into one triangle array.
-        # sample_triangulated_zone allocates num_sample_points proportionally by
-        # triangle area — equivalent to independent per-stratum sampling with
-        # proportional counts, but preserving a continuous QMC sequence across strata.
-        # Falls back to the full zone mesh when no dead zones exist yet.
-        all_tri_verts = []
-        for dz in dead_zones:
-            geoms = list(dz.geoms) if dz.geom_type == 'MultiPolygon' else [dz]
-            for poly in geoms:
-                if poly.is_empty or not poly.is_valid:
-                    continue
-                tv, _ = triangulate_zone(list(poly.exterior.coords)[:-1], [])
-                if len(tv) > 0:
-                    all_tri_verts.append(tv)
-
-        combined_tri_verts = np.vstack(all_tri_verts) if all_tri_verts else tri_verts_full
-        pts_2d = sample_triangulated_zone(combined_tri_verts, num_sample_points, qrand)
-
+        # Sample dead zone strata proportionally by area.
+        # Falls back to full zone when no dead zones exist yet.
         ground_z = map_config["center"][2]
-        new_sample_points = np.column_stack([
-            pts_2d,
-            np.full(num_sample_points, ground_z, dtype=np.float32),
-        ])
+        new_sample_points = sample_dead_zones(dead_zones, num_sample_points)
+        if new_sample_points is None:
+            new_sample_points = sample_triangulated_zone(
+                tri_verts_full, num_sample_points, qrand, ground_z=ground_z
+            )
+        else:
+            new_sample_points[:, 2] = ground_z
 
         fig = visualize_receiver_placement(
         new_sample_points,

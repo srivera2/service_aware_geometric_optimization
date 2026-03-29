@@ -287,6 +287,119 @@ def triangulate_zone(target_zone, building_exclusions, buffer_distance=-0.01, ve
     return tri_verts.astype(np.float32), clean_zone
 
 
+def diagnose_polygon_issues(target_zone, building_exclusions, verbose=True):
+    """
+    Diagnose topology issues with a polygon and its holes.
+
+    Parameters:
+    -----------
+    target_zone : list of tuples
+        Vertices of the outer boundary
+    building_exclusions : list of lists
+        Building footprint vertices
+    verbose : bool
+        Print diagnostic information
+
+    Returns:
+    --------
+    dict with diagnostic information
+    """
+    diagnostics = {
+        'zone_valid': False,
+        'zone_area': 0,
+        'num_buildings': len(building_exclusions),
+        'valid_buildings': 0,
+        'invalid_buildings': 0,
+        'touching_boundary': 0,
+        'outside_zone': 0,
+        'overlapping_buildings': 0,
+        'issues': []
+    }
+
+    # Check outer zone
+    zone_poly = Polygon(target_zone)
+    diagnostics['zone_valid'] = zone_poly.is_valid
+    diagnostics['zone_area'] = zone_poly.area
+
+    if not zone_poly.is_valid:
+        diagnostics['issues'].append("Outer zone polygon is invalid")
+        if verbose:
+            print("ERROR: Outer zone polygon is invalid!")
+            print(f"  Reason: {zone_poly.is_valid_reason if hasattr(zone_poly, 'is_valid_reason') else 'Unknown'}")
+
+    # Check each building
+    building_polys = []
+    for i, building_coords in enumerate(building_exclusions):
+        try:
+            building_poly = Polygon(building_coords)
+
+            if not building_poly.is_valid:
+                diagnostics['invalid_buildings'] += 1
+                diagnostics['issues'].append(f"Building {i} is invalid")
+                if verbose:
+                    print(f"WARNING: Building {i} is invalid")
+                continue
+
+            diagnostics['valid_buildings'] += 1
+
+            # Check if building touches boundary
+            if zone_poly.boundary.intersects(building_poly):
+                diagnostics['touching_boundary'] += 1
+                diagnostics['issues'].append(f"Building {i} touches zone boundary")
+                if verbose:
+                    print(f"WARNING: Building {i} touches the zone boundary")
+
+            # Check if building is outside zone
+            if not zone_poly.contains(building_poly) and not zone_poly.intersects(building_poly):
+                diagnostics['outside_zone'] += 1
+                diagnostics['issues'].append(f"Building {i} is outside zone")
+                if verbose:
+                    print(f"WARNING: Building {i} is outside the zone")
+
+            building_polys.append((i, building_poly))
+
+        except Exception as e:
+            diagnostics['invalid_buildings'] += 1
+            diagnostics['issues'].append(f"Building {i} error: {e}")
+            if verbose:
+                print(f"ERROR: Building {i} - {e}")
+
+    # Check for overlapping buildings
+    for i, (idx1, poly1) in enumerate(building_polys):
+        for idx2, poly2 in building_polys[i+1:]:
+            if poly1.intersects(poly2):
+                diagnostics['overlapping_buildings'] += 1
+                diagnostics['issues'].append(f"Buildings {idx1} and {idx2} overlap")
+                if verbose:
+                    print(f"WARNING: Buildings {idx1} and {idx2} overlap")
+
+    # Summary
+    if verbose:
+        print("\n" + "="*70)
+        print("POLYGON DIAGNOSTICS SUMMARY")
+        print("="*70)
+        print(f"Zone valid: {diagnostics['zone_valid']}")
+        print(f"Zone area: {diagnostics['zone_area']:.2f} m²")
+        print(f"Buildings: {diagnostics['num_buildings']} total")
+        print(f"  Valid: {diagnostics['valid_buildings']}")
+        print(f"  Invalid: {diagnostics['invalid_buildings']}")
+        print(f"  Touching boundary: {diagnostics['touching_boundary']}")
+        print(f"  Outside zone: {diagnostics['outside_zone']}")
+        print(f"  Overlapping: {diagnostics['overlapping_buildings']}")
+        print(f"\nTotal issues: {len(diagnostics['issues'])}")
+        if diagnostics['issues']:
+            print("\nRECOMMENDATION:")
+            if diagnostics['touching_boundary'] > 0 or diagnostics['overlapping_buildings'] > 0:
+                print("  Use buffer_distance=-0.1 in triangulate_zone() to shrink buildings")
+            if diagnostics['invalid_buildings'] > 0:
+                print("  Some buildings have invalid geometry - they will be skipped")
+        else:
+            print("\nNo issues detected!")
+        print("="*70)
+
+    return diagnostics
+
+
 def visualize_triangulation(
     triangles,
     target_zone=None,
@@ -437,56 +550,144 @@ def visualize_triangulation(
 
     return fig
 
-import numpy as np
-
-def sample_triangulated_zone(tri_verts, num_samples, lds):
+def sample_triangulated_zone(tri_verts, num_samples, qrand, ground_z=0.0):
     """
-    RQMC sampling over a triangulated alphashape.
+    Snake-Sorted Stratified Sampling:
+    Sorts triangles along a Z-order curve (Morton Code) before allocating samples.
+    This ensures that the 1D LDS sequence maps to spatially adjacent triangles.
+    """
     
+    # --- Step 0: The "Snake" Sort (Spatially Reorder Triangles) ---
+    # Calculate Centroids
+    centroids = np.mean(tri_verts, axis=1) # Shape (N, 2)
+    
+    # Normalize coordinates to [0, 1] for code generation
+    # (We need integers for bitwise operations, so we map 0..1 to 0..2^16)
+    min_b, max_b = np.min(centroids, axis=0), np.max(centroids, axis=0)
+    norm_centroids = (centroids - min_b) / (max_b - min_b + 1e-8)
+    
+    # Convert to 16-bit integers (resolution of 65536x65536 grid is plenty)
+    # This acts as our "grid binning"
+    coords = (norm_centroids * 65535).astype(np.uint32)
+    
+    # Interleave bits to create Morton Code (Z-Order)
+    # This is a fast "bit-shuffling" trick to create the 1D sort key
+    x = coords[:, 0]
+    y = coords[:, 1]
+    
+    # "Spread" the bits (e.g. 1111 -> 01010101) to make room for interleaving
+    def spread_bits(v):
+        v = (v | (v << 8)) & 0x00FF00FF
+        v = (v | (v << 4)) & 0x0F0F0F0F
+        v = (v | (v << 2)) & 0x33333333
+        v = (v | (v << 1)) & 0x55555555
+        return v
+    
+    morton_codes = spread_bits(x) | (spread_bits(y) << 1)
+    
+    # SORT the geometry based on this code
+    sort_order = np.argsort(morton_codes)
+    
+    # Apply sort to input vertices
+    A = tri_verts[sort_order, 0, :]
+    B = tri_verts[sort_order, 1, :]
+    C = tri_verts[sort_order, 2, :]
+    
+    # --- Step 1: Triangle Areas ---
+    areas = 0.5 * np.abs(
+        A[:,0]*(B[:,1] - C[:,1]) + 
+        B[:,0]*(C[:,1] - A[:,1]) + 
+        C[:,0]*(A[:,1] - B[:,1])
+    )
+    total_area = np.sum(areas)
+
+    # --- Step 2: Deterministic Allocation via Largest-Remainder ---
+    # Proportional allocation with exact count guaranteed (eq:trialloc)
+    target_counts = (areas / total_area) * num_samples
+    int_counts = np.floor(target_counts).astype(int)
+    deficit = num_samples - int_counts.sum()
+    if deficit > 0:
+        fracs = target_counts - int_counts
+        int_counts[np.argsort(fracs)[-deficit:]] += 1
+    final_counts = int_counts
+
+    # --- Step 3: Expand Triangle Indices ---
+    # Spatially sorted, so adjacent LDS indices map to adjacent triangles
+    triangle_indices = np.repeat(np.arange(len(areas)), final_counts)
+
+    # --- Step 4: Draw LDS Points ---
+    raw_samples = np.array(qrand.random(num_samples))
+    u_bary_1 = raw_samples[:, 0]
+    u_bary_2 = raw_samples[:, 1]
+
+    # --- Step 5: Square-to-Triangle Map (Shirley & Chiu 1997) ---
+    A_selected = A[triangle_indices]
+    B_selected = B[triangle_indices]
+    C_selected = C[triangle_indices]
+
+    sqrt_r1 = np.sqrt(u_bary_1)
+    w_A = (1 - sqrt_r1)[:, None]
+    w_B = (sqrt_r1 * (1 - u_bary_2))[:, None]
+    w_C = (sqrt_r1 * u_bary_2)[:, None]
+
+    points_2d = w_A * A_selected + w_B * B_selected + w_C * C_selected
+
+    # --- Step 6: Z-Dimension ---
+    z_col = np.full((num_samples, 1), ground_z)
+    sampled_points_3d = np.hstack([points_2d, z_col])
+
+    assert len(sampled_points_3d) == num_samples, \
+        f"Allocation mismatch: got {len(sampled_points_3d)}, expected {num_samples}"
+
+    return sampled_points_3d.astype(np.float32)
+
+
+def sample_dead_zones(dead_zones, num_samples, building_exclusions=None):
+    """
+    Triangulate a list of dead zone strata and sample over them with RQMC.
+
+    Each stratum is triangulated via CDT with building exclusions applied.
+    All triangles are pooled and samples are allocated proportionally by
+    area using largest-remainder, preserving the low-discrepancy guarantee
+    of Proposition 2 across the full dead zone geometry.
+
     Parameters
     ----------
-    tri_verts   : (T, 3, 2) array of triangle vertices (2D)
-    num_samples : total number of samples to draw
-    lds         : a QMC engine with a .random(n) method returning (n, 2) in [0,1]^2
-                  e.g. scipy.stats.qmc.Halton(d=2) or Sobol(d=2)
+    dead_zones          : list of shapely Polygon or MultiPolygon
+                          Dead zone strata from HDBSCAN + alphashape
+    num_samples         : total number of receiver positions to generate
+    building_exclusions : list of lists of (x, y) tuples, one per stratum,
+                          or None to skip building exclusions
 
     Returns
     -------
-    points : (num_samples, 2) array of sampled 2D positions
+    points : (num_samples, 3) float32 array of sampled positions (z=0),
+             or None if no valid triangulations could be built.
     """
-    # Step 1: Compute triangle areas
-    A, B, C = tri_verts[:, 0], tri_verts[:, 1], tri_verts[:, 2]
-    areas = 0.5 * np.abs(
-        A[:, 0] * (B[:, 1] - C[:, 1]) +
-        B[:, 0] * (C[:, 1] - A[:, 1]) +
-        C[:, 0] * (A[:, 1] - B[:, 1])
-    )
-    total_area = areas.sum()
+    if building_exclusions is None:
+        building_exclusions = [[] for _ in dead_zones]
 
-    # Step 2: Proportional allocation across triangles
-    counts = np.floor(areas / total_area * num_samples).astype(int)
-    deficit = num_samples - counts.sum()
-    # Distribute remainder to largest fractional parts
-    fracs = (areas / total_area * num_samples) - counts
-    counts[np.argsort(fracs)[-deficit:]] += 1
+    all_tri_verts = []
 
-    # Step 3: Draw 2D LDS points and map to each triangle
-    u = np.array(lds.random(num_samples))  # (num_samples, 2)
-    tri_idx = np.repeat(np.arange(len(areas)), counts)
+    for dz, exclusions in zip(dead_zones, building_exclusions):
+        geoms = list(dz.geoms) if dz.geom_type == 'MultiPolygon' else [dz]
+        for poly in geoms:
+            if poly.is_empty or not poly.is_valid:
+                continue
+            boundary = list(poly.exterior.coords)[:-1]
+            tv, _ = triangulate_zone(boundary, exclusions)
+            if len(tv) > 0:
+                all_tri_verts.append(tv)
 
-    A_s = A[tri_idx]
-    B_s = B[tri_idx]
-    C_s = C[tri_idx]
+    if not all_tri_verts:
+        return None
 
-    # Step 4: Square-to-triangle map (Shirley & Chiu 1997)
-    sqrt_u0 = np.sqrt(u[:, 0])
-    w_A = (1 - sqrt_u0)[:, None]
-    w_B = (sqrt_u0 * (1 - u[:, 1]))[:, None]
-    w_C = (sqrt_u0 * u[:, 1])[:, None]
+    # Pool all triangles across strata — allocation is proportional by area
+    combined_tri_verts = np.vstack(all_tri_verts)
 
-    points = w_A * A_s + w_B * B_s + w_C * C_s
-
-    return points.astype(np.float32)
+    # Single d=2 LDS engine over the full pooled triangle set
+    lds = qmc.Halton(d=2, scramble=True)
+    return sample_triangulated_zone(combined_tri_verts, num_samples, lds)
 
 
 def calculate_discrepancy_score(points, zone_polygon, num_probes=1000):
@@ -575,7 +776,7 @@ def run_comparison(zone_poly, mesh, num_samples_list=[256, 1024, 4096, 8192]):
         t0 = time.perf_counter()
 
         # Initialize Engine (Cost #1: Setup)
-        eng_B = qmc.LatinHypercube(d=3, scramble=True)
+        eng_B = qmc.Halton(d=2, scramble=True)
 
         # Generate & Map (Cost #2: The Unified Function)
         # This returns a fully computed Numpy array (Eager execution)
