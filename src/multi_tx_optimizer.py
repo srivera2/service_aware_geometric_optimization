@@ -222,7 +222,12 @@ def _sample_zone_points(state: dict, cfg: TxConfig, n: int,
     """Sample n receiver points in this TX's coverage zone.
 
     sampler         : "triangulated" | "rejection"
-    sampling_strata : "dead_only"    | "proportional"
+    sampling_strata : "dead_only"    | "proportional"   | "full"
+
+    In "proportional" and "dead_only" modes the alive zone and each dead zone
+    stratum are always sampled independently.  Each dead zone stratum receives
+    a point budget proportional to its area (largest-remainder allocation).
+    The "full" strata must be chosen explicitly; it never fires as a fallback.
     """
     dead_zones     = state["dead_zones"]
     zone_polygon   = state["zone_polygon"]
@@ -230,7 +235,59 @@ def _sample_zone_points(state: dict, cfg: TxConfig, n: int,
     qrand          = state["qrand"]
     cached_bldgs   = state["cached_building_polygons"]
 
-    if sampling_strata == "proportional" and dead_zones:
+    def _sample_full_zone(n_pts):
+        if sampler == "rejection":
+            pts, *_ = sample_grid_points(
+                zone_polygon, n_pts, qrand,
+                building_polygons=cached_bldgs, ground_z=ground_z,
+            )
+        else:
+            pts = sample_triangulated_zone(tri_verts_full, n_pts, qrand, ground_z=ground_z)
+        return pts
+
+    def _sample_dead_strata(n_pts):
+        """Sample n_pts across dead zone strata, each stratum independently.
+
+        Point budget per stratum is proportional to area (largest-remainder).
+        Returns an (m, 3) array or None if all strata fail.
+        """
+        areas = [dz.area for dz in dead_zones]
+        total = sum(areas) or 1.0
+        exact = [n_pts * a / total for a in areas]
+        floors = [int(e) for e in exact]
+        remainder = n_pts - sum(floors)
+        order = sorted(range(len(dead_zones)), key=lambda i: -(exact[i] - floors[i]))
+        for i in order[:remainder]:
+            floors[i] += 1
+
+        if sampler == "rejection":
+            parts = []
+            for dz, k in zip(dead_zones, floors):
+                if k > 0:
+                    pts, *_ = sample_grid_points(
+                        dz, k, qrand,
+                        building_polygons=cached_bldgs, ground_z=ground_z,
+                    )
+                    parts.append(pts)
+            return np.vstack(parts) if parts else None
+        else:
+            # sample_dead_zones triangulates each stratum and allocates
+            # proportionally by area — pass the pre-computed allocations
+            # by sampling each stratum independently and stacking.
+            parts = []
+            for dz, k in zip(dead_zones, floors):
+                if k > 0:
+                    pts = sample_dead_zones([dz], k)
+                    if pts is not None and len(pts) > 0:
+                        pts[:, 2] = ground_z
+                        parts.append(pts)
+            return np.vstack(parts) if parts else None
+
+    if sampling_strata == "proportional":
+        if not dead_zones:
+            # No dead zones — entire zone is alive
+            return _sample_full_zone(n)[:n]
+
         dead_union = shapely.ops.unary_union(dead_zones)
         alive_zone = zone_polygon.difference(dead_union)
         if alive_zone.is_empty:
@@ -242,7 +299,7 @@ def _sample_zone_points(state: dict, cfg: TxConfig, n: int,
         n_alive = max(1, round(n * alive_area / total_area))
         n_dead  = max(0, n - n_alive)
 
-        # Sample alive zone
+        # Sample alive zone independently
         if sampler == "rejection":
             alive_pts, *_ = sample_grid_points(
                 alive_zone, n_alive, qrand,
@@ -264,31 +321,26 @@ def _sample_zone_points(state: dict, cfg: TxConfig, n: int,
                 state["_alive_tri_verts"], n_alive, qrand, ground_z=ground_z
             )
 
-        # Sample dead zones
+        # Sample each dead zone stratum independently
         if n_dead > 0:
-            dead_pts = sample_dead_zones(dead_zones, n_dead)
+            dead_pts = _sample_dead_strata(n_dead)
             if dead_pts is not None and len(dead_pts) > 0:
-                dead_pts[:, 2] = ground_z
-                combined = np.vstack([alive_pts, dead_pts[:n_dead]])
-                return combined[:n]
+                return np.vstack([alive_pts, dead_pts[:n_dead]])[:n]
 
         return alive_pts[:n]
 
-    elif sampling_strata == "dead_only" and dead_zones:
-        pts = sample_dead_zones(dead_zones, n)
-        if pts is not None and len(pts) > 0:
-            pts[:, 2] = ground_z
-            return pts
+    elif sampling_strata == "dead_only":
+        if dead_zones:
+            pts = _sample_dead_strata(n)
+            if pts is not None and len(pts) > 0:
+                return pts[:n]
+        return np.zeros((0, 3), dtype=np.float32)
 
-    # Fall-through: full zone
-    if sampler == "rejection":
-        pts, *_ = sample_grid_points(
-            zone_polygon, n, qrand,
-            building_polygons=cached_bldgs, ground_z=ground_z,
-        )
+    elif sampling_strata == "full":
+        return _sample_full_zone(n)[:n]
+
     else:
-        pts = sample_triangulated_zone(tri_verts_full, n, qrand, ground_z=ground_z)
-    return pts
+        raise ValueError(f"Unknown sampling_strata: {sampling_strata!r}")
 
 
 def _accumulate_dead_zones(
