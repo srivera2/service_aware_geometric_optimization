@@ -410,7 +410,7 @@ def _accumulate_dead_zones(
         rng      = np.random.default_rng(42)
         dead_pts = dead_pts[rng.choice(len(dead_pts), max_dbscan_points, replace=False)]
 
-    clusters      = HDBSCAN(min_samples=1).fit(dead_pts[:, :2])
+    clusters      = HDBSCAN(min_samples=5).fit(dead_pts[:, :2])
     labels        = clusters.labels_
     unique_labels = set(labels) - {-1}
 
@@ -634,6 +634,7 @@ def optimize_multi_tx(
     sampler: str = "triangulated",
     sampling_strata: str = "proportional",
     verbose: bool = True,
+    on_iteration_callback: Optional[callable] = None,
 ) -> dict:
     """Jointly optimise N transmitters for SIR coverage.
 
@@ -666,6 +667,16 @@ def optimize_multi_tx(
         "proportional" -> sample alive+dead zones proportionally each iteration.
         "dead_only"    -> existing behaviour (sample dead zones, fall back to full).
     verbose : bool
+    on_iteration_callback : callable or None
+        Optional callable invoked at the end of every iteration, after dead
+        zones are accumulated and sample points are placed.  Signature::
+
+            callback(iteration: int, tx_states: list, tx_configs: list)
+
+        Each state dict will have ``current_tx_position`` set to the
+        transmitter's current [x, y, z] coordinates for that iteration.
+        Use ``visualize_multi_tx_strata`` from ``boresight_pathsolver`` as a
+        ready-made callback.
 
     Returns
     -------
@@ -770,6 +781,7 @@ def optimize_multi_tx(
                                        dtype=torch.float32, requires_grad=True))
 
     optimizer = torch.optim.Adam(params, lr=learning_rate, betas=(0.9, 0.999))
+    #optimizer = torch.optim.SGD(params, lr=learning_rate, momentum=0.25)
 
     # ------------------------------------------------------------------
     # 6. Tracking
@@ -850,6 +862,18 @@ def optimize_multi_tx(
                 final_bufs[i]["el"].append(float(params[b + 1].item()))
                 if cfg.optimize_power:
                     final_bufs[i]["pow"].append(float(params[b + 4].item()))
+
+        # Expose current TX positions for visualisation callbacks
+        for i, (cfg, state) in enumerate(zip(tx_configs, tx_states)):
+            b = offsets[i]
+            state["current_tx_position"] = [
+                float(params[b + 2].item()),
+                float(params[b + 3].item()),
+                state["tx_height"],
+            ]
+
+        #if on_iteration_callback is not None:
+        #    on_iteration_callback(iteration, tx_states, tx_configs)
 
         if verbose:
             dur = time.time() - iter_start
