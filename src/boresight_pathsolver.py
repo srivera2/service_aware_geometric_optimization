@@ -641,6 +641,164 @@ def visualize_receiver_placement(
     return fig
 
 
+def visualize_multi_tx_strata(
+    tx_states,
+    tx_configs,
+    map_config,
+    iteration=None,
+    title=None,
+    figsize=None,
+):
+    """
+    Visualize dead-zone strata and sample points for every TX zone.
+
+    One subplot per transmitter.  Each dead-zone stratum is drawn in a
+    distinct colour so you can track how individual clusters evolve across
+    iterations.  Building polygons are taken directly from the cached state
+    (no XML re-parse).
+
+    Parameters
+    ----------
+    tx_states : list[dict]
+        Per-TX state dicts managed by optimize_multi_tx.  Each dict must
+        contain at least: box_polygon, zone_polygon, dead_zones,
+        cached_building_polygons, current_sample_points, tx_placement,
+        and (optionally) current_tx_position.
+    tx_configs : list[TxConfig]
+        Matching list of TxConfig objects.
+    map_config : dict
+        Map config with 'center', 'size', 'cell_size'  (used for extent).
+    iteration : int or None
+        Current iteration index (shown in the figure title).
+    title : str or None
+        Override the suptitle; auto-generated if None.
+    figsize : tuple or None
+        (width, height) for the whole figure; auto-sized if None.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+    """
+    import math
+    import matplotlib.pyplot as plt
+
+    N = len(tx_states)
+    ncols = min(N, 3)
+    nrows = math.ceil(N / ncols)
+    if figsize is None:
+        figsize = (7 * ncols, 7 * nrows)
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=figsize, squeeze=False)
+    ax_flat = [axes[r][c] for r in range(nrows) for c in range(ncols)]
+
+    for k in range(N, len(ax_flat)):
+        ax_flat[k].set_visible(False)
+
+    palette = plt.cm.tab10.colors  # 10 distinct colours; wraps for >10 strata
+
+    def _fill_geom(ax, geom, **kwargs):
+        if geom is None or geom.is_empty:
+            return
+        if geom.geom_type == "Polygon":
+            ax.fill(*geom.exterior.xy, **kwargs)
+        elif geom.geom_type in ("MultiPolygon", "GeometryCollection"):
+            for part in geom.geoms:
+                if part.geom_type == "Polygon":
+                    ax.fill(*part.exterior.xy, **kwargs)
+
+    for k, (state, cfg) in enumerate(zip(tx_states, tx_configs)):
+        ax = ax_flat[k]
+
+        box_polygon  = state.get("box_polygon")
+        zone_polygon = state.get("zone_polygon")
+        dead_zones   = state.get("dead_zones", [])
+        cached_bldgs = state.get("cached_building_polygons", [])
+        sample_pts   = state.get("current_sample_points")
+        tx_pos       = state.get("current_tx_position", state.get("tx_position"))
+
+        draw_box = box_polygon if box_polygon is not None else zone_polygon
+
+        # 1. Alive zone background
+        if draw_box is not None:
+            _fill_geom(ax, draw_box, alpha=0.15, fc="green", ec="none",
+                       zorder=1, label="Alive Zone")
+
+        # 2. Dead-zone strata — each stratum gets its own colour
+        for s_idx, dz in enumerate(dead_zones):
+            _fill_geom(ax, dz, alpha=0.65, fc='purple', ec="black",
+                       linewidth=0.8, zorder=3,
+                       label=f"Stratum {s_idx}")
+
+        # 3. Buildings (cached — no XML re-parse)
+        for bpoly in cached_bldgs:
+            try:
+                ax.fill(*bpoly.exterior.xy,
+                        facecolor="dimgray", edgecolor="black",
+                        alpha=0.55, linewidth=0.8, zorder=4)
+            except Exception:
+                pass
+
+        # TX building highlighted in red (retrieved from tx_placement)
+        tx_placement = state.get("tx_placement")
+        if tx_placement is not None:
+            try:
+                from shapely.geometry import Polygon as _SPolygon
+                verts = tx_placement.building["vertices"]
+                txbpoly = _SPolygon([(v[0], v[1]) for v in verts])
+                ax.fill(*txbpoly.exterior.xy,
+                        facecolor="#c0392b", edgecolor="black",
+                        alpha=0.75, linewidth=2.0, zorder=4,
+                        label="TX Building")
+            except Exception:
+                pass
+
+        # 4. Coverage box outline
+        if draw_box is not None:
+            if draw_box.geom_type == "Polygon":
+                ax.plot(*draw_box.exterior.xy, color="blue", linewidth=2,
+                        linestyle="--", label="Coverage Zone", zorder=5)
+            elif draw_box.geom_type == "MultiPolygon":
+                for j, part in enumerate(draw_box.geoms):
+                    ax.plot(*part.exterior.xy, color="blue", linewidth=2,
+                            linestyle="--",
+                            label="Coverage Zone" if j == 0 else None, zorder=5)
+
+        # 5. Sample points
+        if sample_pts is not None and len(sample_pts) > 0:
+            ax.scatter(sample_pts[:, 0], sample_pts[:, 1],
+                       c="white", s=15, alpha=0.8, marker="o",
+                       edgecolors="black", linewidths=0.4,
+                       zorder=6, label=f"Receivers ({len(sample_pts)})")
+
+        # 6. Transmitter position
+        if tx_pos is not None:
+            ax.plot(tx_pos[0], tx_pos[1], "b*", markersize=16,
+                    label="Transmitter", markeredgecolor="navy",
+                    markeredgewidth=1.5, zorder=7)
+
+        n_strata = len(dead_zones)
+        stats = f"Strata: {n_strata}"
+        if sample_pts is not None:
+            stats += f"\nReceivers: {len(sample_pts)}"
+        ax.text(0.02, 0.98, stats, transform=ax.transAxes, fontsize=9,
+                verticalalignment="top",
+                bbox=dict(boxstyle="round", facecolor="white",
+                          alpha=0.8, edgecolor="gray"))
+
+        ax.set_title(f"{cfg.name}  (bldg {cfg.building_id})",
+                     fontsize=11, fontweight="bold")
+        ax.set_xlabel("X (m)", fontsize=10)
+        ax.set_ylabel("Y (m)", fontsize=10)
+        ax.grid(True, alpha=0.3, linestyle="--", linewidth=0.5)
+        ax.set_aspect("equal")
+
+    iter_str = f"  —  Iteration {iteration}" if iteration is not None else ""
+    suptitle = title if title is not None else f"Dead-Zone Strata per TX{iter_str}"
+    fig.suptitle(suptitle, fontsize=14, fontweight="bold")
+    plt.tight_layout()
+    return fig
+
+
 def compare_boresight_performance(
     scene,
     tx_name,
