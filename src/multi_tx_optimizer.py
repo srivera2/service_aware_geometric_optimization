@@ -410,7 +410,7 @@ def _accumulate_dead_zones(
         rng      = np.random.default_rng(42)
         dead_pts = dead_pts[rng.choice(len(dead_pts), max_dbscan_points, replace=False)]
 
-    clusters      = HDBSCAN(min_samples=1).fit(dead_pts[:, :2])
+    clusters      = HDBSCAN(min_samples=1, copy=False).fit(dead_pts[:, :2])
     labels        = clusters.labels_
     unique_labels = set(labels) - {-1}
 
