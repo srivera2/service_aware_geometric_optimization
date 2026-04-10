@@ -22,7 +22,9 @@ from typing import Optional
 import time
 
 import alphashape
+import matplotlib.pyplot as plt
 import mitsuba as mi
+from IPython.display import display
 import numpy as np
 import scipy.stats.qmc
 import shapely
@@ -31,7 +33,7 @@ import torch
 import drjit as dr
 from drjit.auto import Float
 from shapely.geometry import Polygon as ShapelyPolygon
-from sklearn.cluster import HDBSCAN
+from sklearn.cluster import HDBSCAN, DBSCAN
 from sionna.rt import PathSolver, RadioMapSolver, Receiver, cpx_abs_square
 
 from angle_utils import (
@@ -42,8 +44,11 @@ from boresight_pathsolver import filter_and_append, sample_grid_points
 from triangulate import (
     get_zone_polygon_with_exclusions,
     triangulate_zone,
+    prepare_triangulated_sampler,
+    sample_from_prepared,
     sample_triangulated_zone,
     sample_dead_zones,
+    visualize_triangulation
 )
 from tx_placement import TxPlacement
 
@@ -161,6 +166,7 @@ def _setup_tx_state(scene, cfg: TxConfig, scene_xml_path: str, qrand) -> dict:
     )
 
     tri_verts_full, _ = triangulate_zone(target_zone, building_exclusions)
+    tri_full_prepared = prepare_triangulated_sampler(tri_verts_full)
 
     # Initial angles -------------------------------------------------------
     target_z = 1.5
@@ -191,6 +197,7 @@ def _setup_tx_state(scene, cfg: TxConfig, scene_xml_path: str, qrand) -> dict:
         "building_exclusions":    building_exclusions,
         "cached_building_polygons": cached_building_polygons,
         "tri_verts_full":         tri_verts_full,
+        "tri_full_prepared":      tri_full_prepared,
         "qrand":                  qrand,
         "dead_zones":             [],
         "dead_buffs":             [],
@@ -206,6 +213,7 @@ def _setup_tx_state(scene, cfg: TxConfig, scene_xml_path: str, qrand) -> dict:
         "current_sample_points":  None,
         "_alive_tri_cache_key":   None,
         "_alive_tri_verts":       None,
+        "_alive_tri_prepared":    None,
     }
 
 
@@ -242,7 +250,7 @@ def _sample_zone_points(state: dict, cfg: TxConfig, n: int,
                 building_polygons=cached_bldgs, ground_z=ground_z,
             )
         else:
-            pts = sample_triangulated_zone(tri_verts_full, n_pts, qrand, ground_z=ground_z)
+            pts = sample_from_prepared(state["tri_full_prepared"], n_pts, ground_z=ground_z)
         return pts
 
     def _sample_dead_strata(n_pts):
@@ -277,7 +285,7 @@ def _sample_zone_points(state: dict, cfg: TxConfig, n: int,
             parts = []
             for dz, k in zip(dead_zones, floors):
                 if k > 0:
-                    pts = sample_dead_zones([dz], k)
+                    pts = sample_dead_zones([dz], k, building_exclusions=[state["building_exclusions"]])
                     if pts is not None and len(pts) > 0:
                         pts[:, 2] = ground_z
                         parts.append(pts)
@@ -313,12 +321,17 @@ def _sample_zone_points(state: dict, cfg: TxConfig, n: int,
                         alive_zone, state["building_exclusions"]
                     )
                     state["_alive_tri_verts"]    = alive_tri
+                    state["_alive_tri_prepared"] = prepare_triangulated_sampler(alive_tri)
                     state["_alive_tri_cache_key"] = cache_key
-                except Exception:
+                except Exception as e:
+                    warnings.warn(
+                        f"alive-zone triangulation failed, falling back to full zone: {e}"
+                    )
                     state["_alive_tri_verts"]    = tri_verts_full
+                    state["_alive_tri_prepared"] = state["tri_full_prepared"]
                     state["_alive_tri_cache_key"] = cache_key
-            alive_pts = sample_triangulated_zone(
-                state["_alive_tri_verts"], n_alive, qrand, ground_z=ground_z
+            alive_pts = sample_from_prepared(
+                state["_alive_tri_prepared"], n_alive, ground_z=ground_z
             )
 
         # Sample each dead zone stratum independently
@@ -344,13 +357,14 @@ def _sample_zone_points(state: dict, cfg: TxConfig, n: int,
 
 
 def _accumulate_dead_zones(
-    state, cfg, scene, all_tx_configs, all_tx_states, all_param_vals,
-    map_config, dead_tail_percentile, max_dbscan_points, rm_solver
+    state, cfg, tx_idx, rm,
+    map_config, dead_tail_percentile, max_dbscan_points,
+    debug_viz=False, iteration=0
 ):
-    """Rebuild dead-zone polygons for one TX using a RadioMapSolver pass.
+    """Rebuild dead-zone polygons for one TX using cell-aggregated RSS.
 
-    All TXs are set to their current plain-float parameter values first so
-    the map reflects the current joint scene state.
+    Uses rm.rss[tx_idx] (shape H×W, watts) so multipath fades average out
+    across the cell and only spatially coherent weak areas are identified.
     """
     from shapely import contains_xy as _cxy
 
@@ -358,69 +372,231 @@ def _accumulate_dead_zones(
     state["dead_zones"]  = []
     state["dead_buffs"]  = []
 
-    _, offsets = _param_strides(all_tx_configs)
+    # Per-TX cell-aggregated RSS (watts), shape (H, W)
+    rss_np = rm.rss.numpy()[tx_idx]
+    #print(f"RSS Size from RMS: {rss_np}")
 
-    for k, (cfg_k, state_k) in enumerate(zip(all_tx_configs, all_tx_states)):
-        b = offsets[k]
-        az_k, el_k = all_param_vals[b], all_param_vals[b + 1]
-        xp_k, yp_k = all_param_vals[b + 2], all_param_vals[b + 3]
-        scene.get(cfg_k.name).orientation = [
-            float(np.deg2rad(az_k)), -float(np.deg2rad(el_k)), 0.0
-        ]
-        scene.get(cfg_k.name).position = mi.Point3f(
-            float(xp_k), float(yp_k), float(state_k["tx_height"])
-        )
-        if cfg_k.optimize_power:
-            scene.get(cfg_k.name).power_dbm = [float(all_param_vals[b + 4])]
+    # Compute 1 m cell centres from map_config geometry
+    cx, cy = map_config["center"][0], map_config["center"][1]
+    #print(f"Center Values: {cx}, {cy}")
+    sx, sy = map_config["size"][0],   map_config["size"][1]
+    #print(f"Zone Size Values: {sx}, {sy}")
+    H, W   = rss_np.shape
+    xs = cx - sx / 2.0 + sx / W * (np.arange(W) + 0.5)
+    #print(f"Grid Axis X: {xs}")
+    ys = cy - sy / 2.0 + sy / H * (np.arange(H) + 0.5)
+    #print(f"Grid Axis Y: {ys}")
+    xx, yy = np.meshgrid(xs, ys)
 
-    rm = rm_solver(
-        scene,
-        max_depth=8,
-        samples_per_tx=int(1e6),
-        cell_size=[0.5, 0.5],
-        center=map_config["center"],
-        orientation=[0, 0, 0],
-        size=map_config["size"],
-        los=True,
-        specular_reflection=True,
-        diffuse_reflection=True,
-        refraction=False,
-        stop_threshold=None,
-        capture_rays=int(1e6),
-    )
+    pos_x = xx.ravel()
+    pos_y = yy.ravel()
+    power = rss_np.ravel()
 
-    rm_pos, rm_ef, _ = rm.captured_rays
-    if rm_pos is None:
+    # Zone Check
+    in_zone  = _cxy(state["zone_polygon"], pos_x, pos_y)
+    pos_x_z  = pos_x[in_zone]
+    pos_y_z  = pos_y[in_zone]
+    power_z  = power[in_zone]
+
+    if len(pos_x_z) == 0:
         return
+    
+    # Fill rx_data 
+    rx_data  = np.column_stack([pos_x_z, pos_y_z, power_z])
+    dead_pts = filter_and_append(rx_data, state["dead_points"], dead_tail_percentile)
 
-    rm_power = (rm_ef[:, 0] ** 2 + rm_ef[:, 1] ** 2
-                + rm_ef[:, 2] ** 2 + rm_ef[:, 3] ** 2)
+    if debug_viz:
+        import matplotlib.pyplot as _plt
+        import os
+        os.makedirs("debug_viz", exist_ok=True)
 
-    in_zone    = _cxy(state["zone_polygon"], rm_pos[:, 0], rm_pos[:, 1])
-    rm_pos_z   = rm_pos[in_zone]
-    rm_power_z = rm_power[in_zone]
+        fig, ax = _plt.subplots(figsize=(8, 8))
 
-    if len(rm_pos_z) == 0:
+        log_pwr_z = np.log10(power_z + 1e-30)
+        sc = ax.scatter(pos_x_z, pos_y_z, c=log_pwr_z,
+                        cmap="viridis", s=4.0, alpha=0.8, rasterized=True)
+
+        # Overlay dead-tail boundary
+        if len(dead_pts):
+            thresh_log = np.log10(dead_pts[:, 2].max() + 1e-30)
+            ax.scatter(dead_pts[:, 0], dead_pts[:, 1],
+                       edgecolors="black", facecolors="none",
+                       s=6.0, linewidths=0.3, alpha=0.6, rasterized=True,
+                       label=f"dead tail ({dead_tail_percentile}th %ile)")
+
+        zone_geoms = (list(state["zone_polygon"].geoms)
+                      if state["zone_polygon"].geom_type == "MultiPolygon"
+                      else [state["zone_polygon"]])
+        for gi, geom in enumerate(zone_geoms):
+            ax.plot(*geom.exterior.xy, "w-", linewidth=1.5,
+                    label="zone" if gi == 0 else None)
+
+        _plt.colorbar(sc, ax=ax, label="log₁₀(RSS) — all in-zone cells")
+        ax.set_title(f"{cfg.name} (tx_idx={tx_idx}) — iter {iteration} "
+                     f"— {len(dead_pts)} dead cells / {int(in_zone.sum())} in-zone")
+        ax.set_aspect("equal")
+        out_path = os.path.join("debug_viz", f"{cfg.name}_iter{iteration:03d}.png")
+        fig.savefig(out_path, dpi=120)
+        _plt.show()
+        _plt.close(fig)
+        print(f"[debug_viz] {out_path}")
+
+    if len(dead_pts) == 0:
         return
-
-    rx_data    = np.column_stack([rm_pos_z[:, 0], rm_pos_z[:, 1], rm_power_z])
-    dead_pts   = filter_and_append(rx_data, state["dead_points"], dead_tail_percentile)
 
     if len(dead_pts) > max_dbscan_points:
         rng      = np.random.default_rng(42)
         dead_pts = dead_pts[rng.choice(len(dead_pts), max_dbscan_points, replace=False)]
 
-    clusters      = HDBSCAN(min_samples=1, copy=False).fit(dead_pts[:, :2])
+    #clusters      = HDBSCAN(min_samples=5, copy=False).fit(dead_pts[:, :2])
+    
+    clusters      = DBSCAN(min_samples=5, eps=5.0).fit(dead_pts[:, :2])
     labels        = clusters.labels_
+    
     unique_labels = set(labels) - {-1}
 
     for cid in sorted(unique_labels):
-        pts   = dead_pts[labels == cid, :2]
-        shape = alphashape.alphashape(pts, alpha=0.05)
+        pts = dead_pts[labels == cid, :2]
+        if len(pts) < 3:
+            continue
+        # Delaunay (used by alphashape) lifts 2-D points onto a 3-D paraboloid;
+        # if the points are (nearly) collinear the lifted simplex is flat and
+        # Qhull raises QH6013/QH6154.  Check via the smaller singular value of
+        # the centred point matrix — if it's essentially zero the cluster is
+        # degenerate and contributes nothing useful as a dead-zone polygon.
+        centered = pts - pts.mean(axis=0)
+        _, s, _ = np.linalg.svd(centered, full_matrices=False)
+        if s[-1] < 1e-6:
+            continue
+
+        shape = alphashape.alphashape(pts, alpha=0.01)
         shape = shapely.make_valid(shape)
         state["dead_zones"].append(shape)
+    
     state["dead_buffs"] = state["dead_zones"]
     state["dead_points"] = dead_pts
+
+    if debug_viz and len(state["dead_zones"]) > 0:
+        _visualize_dead_zone_pipeline(
+            dead_pts, labels, state["dead_zones"],
+            state["zone_polygon"], cfg.name, iteration,
+            building_exclusions=state["building_exclusions"],
+        )
+
+
+def _visualize_dead_zone_pipeline(
+    dead_pts, labels, dead_zones, zone_polygon,
+    tx_name, iteration, building_exclusions=None,
+):
+    """Three-panel figure showing the dead-zone processing pipeline:
+    cluster labels → alphashapes → triangulated strata.
+    """
+    from IPython.display import display
+    from matplotlib.collections import PolyCollection
+
+    n_clusters = len(dead_zones)
+    cmap = plt.cm.get_cmap("tab10" if n_clusters <= 10 else "tab20")
+    colors = [cmap(i % cmap.N) for i in range(max(n_clusters, 1))]
+
+    unique_cluster_ids = sorted(set(labels) - {-1})
+    label_to_color = {cid: colors[i % len(colors)] for i, cid in enumerate(unique_cluster_ids)}
+
+    # Pre-build building polygons once for drawing on all panels
+    bldg_polys = []
+    if building_exclusions:
+        for bcoords in building_exclusions:
+            try:
+                p = ShapelyPolygon(bcoords)
+                if p.is_valid and not p.is_empty:
+                    bldg_polys.append(p)
+            except Exception:
+                pass
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+
+    def _draw_zone(ax):
+        geoms = (list(zone_polygon.geoms)
+                 if zone_polygon.geom_type == "MultiPolygon"
+                 else [zone_polygon])
+        for geom in geoms:
+            ax.plot(*geom.exterior.xy, "k-", linewidth=1.5)
+            # Interior rings are buildings fully inside the zone — draw them too
+            for interior in geom.interiors:
+                ix, iy = interior.xy
+                ax.fill(ix, iy, color="#999999", alpha=0.7, zorder=2)
+                ax.plot(ix, iy, "k-", linewidth=0.8, zorder=3)
+        # Buildings touching the boundary become MultiPolygon splits rather than
+        # interior rings, so draw all building footprints directly to catch those.
+        for bp in bldg_polys:
+            bx, by = bp.exterior.xy
+            ax.fill(bx, by, color="#999999", alpha=0.7, zorder=2)
+            ax.plot(bx, by, "k-", linewidth=0.8, zorder=3)
+        ax.set_aspect("equal")
+        ax.grid(True, alpha=0.2)
+
+    # ── Panel 1: DBSCAN cluster labels ────────────────────────────────────
+    ax = axes[0]
+    _draw_zone(ax)
+    noise_mask = labels == -1
+    if noise_mask.any():
+        ax.scatter(dead_pts[noise_mask, 0], dead_pts[noise_mask, 1],
+                   c="lightgray", s=2, alpha=0.4, rasterized=True, label="noise")
+    for cid in unique_cluster_ids:
+        mask = labels == cid
+        ax.scatter(dead_pts[mask, 0], dead_pts[mask, 1],
+                   color=label_to_color[cid], s=3, alpha=0.7,
+                   rasterized=True, label=f"cluster {cid}")
+    ax.set_title("1. DBSCAN Cluster Labels")
+    ax.set_xlabel("X (m)"); ax.set_ylabel("Y (m)")
+    if n_clusters <= 10:
+        ax.legend(markerscale=3, fontsize=7, loc="best")
+
+    # ── Panel 2: alphashapes ──────────────────────────────────────────────
+    ax = axes[1]
+    _draw_zone(ax)
+    for i, shape in enumerate(dead_zones):
+        color = colors[i % len(colors)]
+        geoms = (list(shape.geoms)
+                 if shape.geom_type in ("MultiPolygon", "GeometryCollection")
+                 else [shape])
+        for geom in geoms:
+            if geom.geom_type != "Polygon":
+                continue
+            x, y = geom.exterior.xy
+            ax.fill(x, y, color=color, alpha=0.45)
+            ax.plot(x, y, color=color, linewidth=1.0)
+    ax.set_title("2. Alphashape Strata")
+    ax.set_xlabel("X (m)")
+
+    # ── Panel 3: triangulated strata ─────────────────────────────────────
+    ax = axes[2]
+    _draw_zone(ax)
+    excl = building_exclusions or []
+    for i, shape in enumerate(dead_zones):
+        color = colors[i % len(colors)]
+        geoms = (list(shape.geoms)
+                 if shape.geom_type in ("MultiPolygon", "GeometryCollection")
+                 else [shape])
+        for geom in geoms:
+            if geom.geom_type != "Polygon" or geom.is_empty:
+                continue
+            boundary = list(geom.exterior.coords)[:-1]
+            try:
+                tv, _ = triangulate_zone(boundary, excl)
+            except Exception:
+                continue
+            if len(tv) == 0:
+                continue
+            fc = (*color[:3], 0.4)
+            ec = (*color[:3], 0.9)
+            ax.add_collection(PolyCollection(tv, facecolor=fc, edgecolor=ec, linewidth=0.4))
+    ax.autoscale_view()
+    ax.set_title("3. Triangulated Strata")
+    ax.set_xlabel("X (m)")
+
+    plt.tight_layout()
+    display(fig)
+    plt.close(fig)
 
 
 def _extract_per_rx_power(h_real, h_imag, tx_idx: int):
@@ -635,6 +811,7 @@ def optimize_multi_tx(
     sampling_strata: str = "proportional",
     verbose: bool = True,
     on_iteration_callback: Optional[callable] = None,
+    debug_viz: bool = False,
 ) -> dict:
     """Jointly optimise N transmitters for SIR coverage.
 
@@ -801,13 +978,49 @@ def optimize_multi_tx(
         # Current plain-float parameter values (detached from AD)
         pvals = [float(p.item()) for p in params]
 
-        # Dead zone update (RadioMap path), per TX
-        for i, (cfg, state) in enumerate(zip(tx_configs, tx_states)):
-            _accumulate_dead_zones(
-                state, cfg, scene,
-                tx_configs, tx_states, pvals,
-                map_config, dead_tail_percentile, max_dbscan_points, rm_solver,
+        # Apply current parameter values to scene (once for all TXs)
+        _, offsets = _param_strides(tx_configs)
+        for k, (cfg_k, state_k) in enumerate(zip(tx_configs, tx_states)):
+            b = offsets[k]
+            az_k, el_k = pvals[b], pvals[b + 1]
+            xp_k, yp_k = pvals[b + 2], pvals[b + 3]
+            scene.get(cfg_k.name).orientation = [
+                float(np.deg2rad(az_k)), -float(np.deg2rad(el_k)), 0.0
+            ]
+            scene.get(cfg_k.name).position = mi.Point3f(
+                float(xp_k), float(yp_k), float(state_k["tx_height"])
             )
+            if cfg_k.optimize_power:
+                scene.get(cfg_k.name).power_dbm = [float(pvals[b + 4])]
+
+        # Single RadioMap pass — rm.rss shape (N_tx, H, W) gives per-TX
+        # cell-aggregated power, smoothing out multipath fades.
+        rm = rm_solver(
+            scene,
+            max_depth=12,
+            samples_per_tx=int(100e7),
+            cell_size=[1.0, 1.0],
+            center=map_config["center"],
+            orientation=[0, 0, 0],
+            size=map_config["size"],
+            los=True,
+            specular_reflection=True,
+            diffuse_reflection=True,
+            diffraction=True,
+            edge_diffraction=True,
+            refraction=False,
+            stop_threshold=None,
+        )
+
+        # Per-TX dead zone accumulation — skip entirely in 'full' mode
+        # since dead zones are never used for sampling there.
+        if sampling_strata != "full":
+            for i, (cfg, state) in enumerate(zip(tx_configs, tx_states)):
+                _accumulate_dead_zones(
+                    state, cfg, i, rm,
+                    map_config, dead_tail_percentile, max_dbscan_points,
+                    debug_viz=debug_viz, iteration=iteration,
+                )
 
         # Differentiable forward pass
         loss, path_out = compute_sir_loss(*params)
@@ -872,8 +1085,8 @@ def optimize_multi_tx(
                 state["tx_height"],
             ]
 
-        #if on_iteration_callback is not None:
-        #    on_iteration_callback(iteration, tx_states, tx_configs)
+        if on_iteration_callback is not None:
+            on_iteration_callback(iteration, tx_states, tx_configs)
 
         if verbose:
             dur = time.time() - iter_start

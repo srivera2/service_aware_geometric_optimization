@@ -1,4 +1,5 @@
 import matplotlib.pyplot as plt
+from IPython.display import display
 import numpy as np
 import drjit as dr
 from shapely import contains_xy, constrained_delaunay_triangles
@@ -199,7 +200,12 @@ def triangulate_zone(target_zone, building_exclusions, buffer_distance=-0.01, ve
     """
     
     # --- 1. Geometry Prep (Shapely) ---
-    zone_poly = Polygon(target_zone).buffer(0) # Fix self-intersections
+    # Accept either a coordinate list or an existing Shapely geometry so that
+    # callers can pass the result of difference()/intersection() directly.
+    if isinstance(target_zone, (Polygon, MultiPolygon)):
+        zone_poly = target_zone.buffer(0)
+    else:
+        zone_poly = Polygon(target_zone).buffer(0)
     
     # Prepare buildings (clean and union them to handle overlaps)
     valid_buildings = []
@@ -273,7 +279,9 @@ def triangulate_zone(target_zone, building_exclusions, buffer_distance=-0.01, ve
     # 'p': PSLG
     # 'q30': Quality mesh (min angle 30 deg) - prevents slivers!
     try:
-        result = tr.triangulate(data, 'pq30')
+
+        result = tr.triangulate(data, 'pq30S10000')
+
     except Exception as e:
         if verbose: print(f"Triangulation Error: {e}")
         return np.array([], dtype=np.float32), None
@@ -550,96 +558,336 @@ def visualize_triangulation(
 
     return fig
 
-def sample_triangulated_zone(tri_verts, num_samples, qrand, ground_z=0.0):
+def xy_to_hilbert(x, y, order=16):
     """
-    Snake-Sorted Stratified Sampling:
-    Sorts triangles along a Z-order curve (Morton Code) before allocating samples.
-    This ensures that the 1D LDS sequence maps to spatially adjacent triangles.
+    Convert (x, y) integer coordinates to Hilbert curve index.
+    Uses the standard rotate/flip algorithm (Skilling 2004).
+
+    Parameters
+    ----------
+    x : np.ndarray of uint32
+    y : np.ndarray of uint32
+    order : int
+        Hilbert curve order (16 gives 65536x65536 grid resolution).
+
+    Returns
+    -------
+    np.ndarray of uint64
+        Hilbert curve index for each (x, y) pair.
     """
-    
-    # --- Step 0: The "Snake" Sort (Spatially Reorder Triangles) ---
-    # Calculate Centroids
-    centroids = np.mean(tri_verts, axis=1) # Shape (N, 2)
-    
-    # Normalize coordinates to [0, 1] for code generation
-    # (We need integers for bitwise operations, so we map 0..1 to 0..2^16)
-    min_b, max_b = np.min(centroids, axis=0), np.max(centroids, axis=0)
+    x = x.copy().astype(np.uint64)
+    y = y.copy().astype(np.uint64)
+    d = np.zeros(len(x), dtype=np.uint64)
+    s = np.uint64(2 ** (order - 1))
+
+    while s > 0:
+        rx = ((x & s) > 0).astype(np.uint64)
+        ry = ((y & s) > 0).astype(np.uint64)
+        d += s * s * ((np.uint64(3) * rx) ^ ry)
+
+        # Rotate/reflect: flip y when rx == 1
+        mask_flip = rx == 1
+        y[mask_flip] = (s - np.uint64(1)) - y[mask_flip]
+
+        # Transpose when ry == 0
+        mask_swap = ry == 0
+        x[mask_swap], y[mask_swap] = y[mask_swap].copy(), x[mask_swap].copy()
+
+        s >>= np.uint64(1)
+
+    return d
+
+def prepare_triangulated_sampler(tri_verts):
+    """Compute the Hilbert sort order and area CDF for a triangulation.
+
+    This is the O(N log N) part of the threshold-walk sampler. Call once
+    when the triangulation is built and pass the result to sample_from_prepared
+    each iteration instead of recomputing from the same mesh.
+
+    Parameters
+    ----------
+    tri_verts : np.ndarray, shape (N_tris, 3, 2)
+
+    Returns
+    -------
+    dict with keys: A, B, C, cdf, areas, sort_order
+    """
+    centroids = np.mean(tri_verts, axis=1)
+    min_b = np.min(centroids, axis=0)
+    max_b = np.max(centroids, axis=0)
     norm_centroids = (centroids - min_b) / (max_b - min_b + 1e-8)
-    
-    # Convert to 16-bit integers (resolution of 65536x65536 grid is plenty)
-    # This acts as our "grid binning"
     coords = (norm_centroids * 65535).astype(np.uint32)
-    
-    # Interleave bits to create Morton Code (Z-Order)
-    # This is a fast "bit-shuffling" trick to create the 1D sort key
-    x = coords[:, 0]
-    y = coords[:, 1]
-    
-    # "Spread" the bits (e.g. 1111 -> 01010101) to make room for interleaving
-    def spread_bits(v):
-        v = (v | (v << 8)) & 0x00FF00FF
-        v = (v | (v << 4)) & 0x0F0F0F0F
-        v = (v | (v << 2)) & 0x33333333
-        v = (v | (v << 1)) & 0x55555555
-        return v
-    
-    morton_codes = spread_bits(x) | (spread_bits(y) << 1)
-    
-    # SORT the geometry based on this code
-    sort_order = np.argsort(morton_codes)
-    
-    # Apply sort to input vertices
+
+    hilbert_codes = xy_to_hilbert(coords[:, 0].copy(), coords[:, 1].copy())
+    sort_order = np.argsort(hilbert_codes)
+
     A = tri_verts[sort_order, 0, :]
     B = tri_verts[sort_order, 1, :]
     C = tri_verts[sort_order, 2, :]
-    
-    # --- Step 1: Triangle Areas ---
+
     areas = 0.5 * np.abs(
-        A[:,0]*(B[:,1] - C[:,1]) + 
-        B[:,0]*(C[:,1] - A[:,1]) + 
-        C[:,0]*(A[:,1] - B[:,1])
+        A[:, 0] * (B[:, 1] - C[:, 1]) +
+        B[:, 0] * (C[:, 1] - A[:, 1]) +
+        C[:, 0] * (A[:, 1] - B[:, 1])
     )
-    total_area = np.sum(areas)
+    cdf = np.cumsum(areas) / np.sum(areas)
 
-    # --- Step 2: Deterministic Allocation via Largest-Remainder ---
-    # Proportional allocation with exact count guaranteed (eq:trialloc)
-    target_counts = (areas / total_area) * num_samples
-    int_counts = np.floor(target_counts).astype(int)
-    deficit = num_samples - int_counts.sum()
-    if deficit > 0:
-        fracs = target_counts - int_counts
-        int_counts[np.argsort(fracs)[-deficit:]] += 1
-    final_counts = int_counts
+    return {"A": A, "B": B, "C": C, "cdf": cdf, "areas": areas, "sort_order": sort_order}
 
-    # --- Step 3: Expand Triangle Indices ---
-    # Spatially sorted, so adjacent LDS indices map to adjacent triangles
-    triangle_indices = np.repeat(np.arange(len(areas)), final_counts)
 
-    # --- Step 4: Draw LDS Points ---
-    raw_samples = np.array(qrand.random(num_samples))
-    u_bary_1 = raw_samples[:, 0]
-    u_bary_2 = raw_samples[:, 1]
+def sample_from_prepared(prepared, num_samples, ground_z=0.0, visualize=False):
+    """Draw samples from a pre-prepared triangulation sampler.
 
-    # --- Step 5: Square-to-Triangle Map (Shirley & Chiu 1997) ---
-    A_selected = A[triangle_indices]
-    B_selected = B[triangle_indices]
-    C_selected = C[triangle_indices]
+    Only performs the Sobol draw, CDF walk, and barycentric mapping.
+    The Hilbert sort and CDF are already in `prepared`.
 
-    sqrt_r1 = np.sqrt(u_bary_1)
-    w_A = (1 - sqrt_r1)[:, None]
-    w_B = (sqrt_r1 * (1 - u_bary_2))[:, None]
-    w_C = (sqrt_r1 * u_bary_2)[:, None]
+    Parameters
+    ----------
+    prepared : dict
+        Output of prepare_triangulated_sampler.
+    num_samples : int
+    ground_z : float
 
-    points_2d = w_A * A_selected + w_B * B_selected + w_C * C_selected
+    Returns
+    -------
+    np.ndarray of float32, shape (num_samples, 3)
+    """
+    A   = prepared["A"]
+    B   = prepared["B"]
+    C   = prepared["C"]
+    cdf = prepared["cdf"]
 
-    # --- Step 6: Z-Dimension ---
+    sampler = qmc.Halton(d=3, scramble=True, seed=None)
+    raw = sampler.random(num_samples)
+
+    q_cdf = raw[:, 0]
+    q_u   = raw[:, 1]
+    q_v   = raw[:, 2]
+
+    tri_indices = np.searchsorted(cdf, q_cdf)
+    tri_indices = np.clip(tri_indices, 0, len(cdf) - 1)
+
+    A_s = A[tri_indices]
+    B_s = B[tri_indices]
+    C_s = C[tri_indices]
+
+    sqrt_u = np.sqrt(q_u)
+    w_A = (1.0 - sqrt_u)[:, None]
+    w_B = (sqrt_u * (1.0 - q_v))[:, None]
+    w_C = (sqrt_u * q_v)[:, None]
+
+    points_2d = w_A * A_s + w_B * B_s + w_C * C_s
+
     z_col = np.full((num_samples, 1), ground_z)
     sampled_points_3d = np.hstack([points_2d, z_col])
 
     assert len(sampled_points_3d) == num_samples, \
-        f"Allocation mismatch: got {len(sampled_points_3d)}, expected {num_samples}"
+        f"Sample count mismatch: got {len(sampled_points_3d)}, expected {num_samples}"
+
+    if visualize:
+        _visualize_sampler_pipeline(
+            prepared["A"], prepared["sort_order"],
+            A, B, C,
+            prepared["areas"], cdf, tri_indices, points_2d,
+        )
 
     return sampled_points_3d.astype(np.float32)
+
+
+def sample_triangulated_zone(tri_verts, num_samples, ground_z=0.0, seed=42, visualize=False):
+    """
+    Threshold-Walk Stratified Sampling over a triangulated polygon.
+
+    Replaces integer triangle allocation with a continuous CDF threshold
+    walk over Hilbert-sorted triangles. Discrepancy is preserved end-to-end
+    via a 3D Sobol sequence (Owen scrambled) split across:
+      dim 0 -> CDF walk (triangle selection)
+      dim 1 -> barycentric u
+      dim 2 -> barycentric v
+
+    Slivers near building boundaries are handled naturally: a triangle
+    with a tiny CDF interval will simply receive zero samples without
+    any floor enforcement or sample stealing, preserving the discrepancy
+    guarantee.
+
+    Parameters
+    ----------
+    tri_verts : np.ndarray, shape (N_tris, 3, 2)
+        Vertices of each triangle in the triangulation.
+    num_samples : int
+        Exact number of output samples required.
+    ground_z : float
+        Z coordinate assigned to all output points.
+    seed : int
+        Sobol scramble seed for reproducibility.
+
+    Returns
+    -------
+    np.ndarray of float32, shape (num_samples, 3)
+        Sampled (x, y, z) points over the triangulated zone.
+
+    References
+    ----------
+    - Quinn, J.A. (2009), Chapter 6: threshold walk over cumulative density.
+      Cardiff University PhD dissertation, ORCA/54868.
+    - Shirley & Chiu (1997): square-to-triangle map.
+    - Skilling (2004): Hilbert curve coordinate conversion.
+    - Joe & Kuo (2008): Sobol direction numbers.
+    """
+
+    # --- Step 0: Hilbert Sort ---
+    # Replace Morton Z-order with Hilbert curve to eliminate spatial
+    # discontinuities. The Hilbert curve is strictly continuous, so
+    # adjacent LDS indices always map to spatially adjacent triangles.
+    centroids = np.mean(tri_verts, axis=1)
+    min_b = np.min(centroids, axis=0)
+    max_b = np.max(centroids, axis=0)
+    norm_centroids = (centroids - min_b) / (max_b - min_b + 1e-8)
+    coords = (norm_centroids * 65535).astype(np.uint32)
+
+    hilbert_codes = xy_to_hilbert(coords[:, 0].copy(), coords[:, 1].copy())
+    sort_order = np.argsort(hilbert_codes)
+
+    A = tri_verts[sort_order, 0, :]
+    B = tri_verts[sort_order, 1, :]
+    C = tri_verts[sort_order, 2, :]
+
+    # --- Step 1: Cumulative Area CDF ---
+    # Normalised to [0, 1] over the full triangulation area.
+    # This is the continuous density function Quinn walks with his
+    # 1D threshold sequence (Section 6.1.3).
+    areas = 0.5 * np.abs(
+        A[:, 0] * (B[:, 1] - C[:, 1]) +
+        B[:, 0] * (C[:, 1] - A[:, 1]) +
+        C[:, 0] * (A[:, 1] - B[:, 1])
+    )
+    total_area = np.sum(areas)
+    cdf = np.cumsum(areas) / total_area  # shape (N_tris,), range (0, 1]
+
+    # --- Step 2: 3D Owen-Scrambled Sobol Sequence ---
+    # Dimensions are jointly low-discrepancy: any 2D projection also has
+    # low discrepancy (the (t,m,s)-net property). Owen scrambling improves
+    # the bound to O((log N)^2 / N) vs unscrambled O((log N)^s / N).
+    # All three dimensions must come from the same sequence to preserve
+    # the joint discrepancy guarantee.
+    sampler = qmc.Halton(d=3, scramble=True, seed=None)
+    raw = sampler.random(num_samples)  # shape (num_samples, 3)
+
+    q_cdf = raw[:, 0]   # drives CDF walk -> triangle selection
+    q_u   = raw[:, 1]   # barycentric coordinate u
+    q_v   = raw[:, 2]   # barycentric coordinate v
+
+    # --- Step 3: Threshold Walk (CDF Inversion) ---
+    # For each sample, find the triangle whose cumulative area interval
+    # contains q_cdf[k]. This replaces floor() allocation entirely.
+    # Slivers have CDF intervals so narrow that no q_cdf value lands in
+    # them, so they naturally receive zero samples without any distortion
+    # to the discrepancy guarantee.
+    tri_indices = np.searchsorted(cdf, q_cdf)
+    tri_indices = np.clip(tri_indices, 0, len(areas) - 1)
+
+    # --- Step 4: Shirley-Chiu Square-to-Triangle Map ---
+    # Area-preserving map from [0,1]^2 to barycentric coordinates.
+    # Preserves the uniformity of (q_u, q_v) within each triangle.
+    # Shirley & Chiu (1997).
+    A_s = A[tri_indices]
+    B_s = B[tri_indices]
+    C_s = C[tri_indices]
+
+    sqrt_u = np.sqrt(q_u)
+    w_A = (1.0 - sqrt_u)[:, None]
+    w_B = (sqrt_u * (1.0 - q_v))[:, None]
+    w_C = (sqrt_u * q_v)[:, None]
+
+    points_2d = w_A * A_s + w_B * B_s + w_C * C_s
+
+    # --- Step 5: Z Dimension ---
+    z_col = np.full((num_samples, 1), ground_z)
+    sampled_points_3d = np.hstack([points_2d, z_col])
+
+    assert len(sampled_points_3d) == num_samples, \
+        f"Sample count mismatch: got {len(sampled_points_3d)}, expected {num_samples}"
+
+    #if visualize:
+    #    _visualize_sampler_pipeline(
+    #        tri_verts, sort_order, A, B, C,
+    #        areas, cdf, tri_indices, points_2d,
+    #    )
+
+    return sampled_points_3d.astype(np.float32)
+
+
+def _visualize_sampler_pipeline(
+    tri_verts, sort_order, A, B, C,
+    areas, cdf, tri_indices, points_2d,
+):
+    """Three-panel figure showing the threshold-walk sampler logic:
+    Hilbert sort order → CDF area weights → sampled points.
+    """
+    from IPython.display import display
+    from matplotlib.collections import PolyCollection
+    import matplotlib.pyplot as plt
+
+    N = len(sort_order)
+    hilbert_tris = np.stack([A, B, C], axis=1)        # (N, 3, 2) Hilbert-sorted
+    orig_tris    = tri_verts[sort_order]               # same, for reference
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    fig.suptitle("Threshold-Walk Stratified Sampler Pipeline", fontsize=13)
+
+    # ── Panel 1: Hilbert sort order ───────────────────────────────────────
+    ax = axes[0]
+    hilbert_colors = np.arange(N) / max(N - 1, 1)     # 0→1 along traversal
+    coll = PolyCollection(hilbert_tris, array=hilbert_colors,
+                          cmap="viridis", edgecolor="none", linewidth=0)
+    ax.add_collection(coll)
+    fig.colorbar(coll, ax=ax, label="Hilbert traversal index (normalised)")
+    ax.autoscale_view()
+    ax.set_aspect("equal")
+    ax.set_title("1. Hilbert Sort Order")
+    ax.set_xlabel("X (m)"); ax.set_ylabel("Y (m)")
+    ax.grid(True, alpha=0.2)
+
+    # ── Panel 2: CDF area weights ─────────────────────────────────────────
+    ax = axes[1]
+    norm_areas = areas / (areas.max() + 1e-30)         # normalised triangle area
+    coll2 = PolyCollection(hilbert_tris, array=norm_areas,
+                           cmap="YlOrRd", edgecolor="gray", linewidth=0.2)
+    ax.add_collection(coll2)
+    fig.colorbar(coll2, ax=ax, label="Normalised triangle area (CDF weight)")
+    # Overlay CDF step as a thin line along triangle centroids
+    centroids_x = hilbert_tris[:, :, 0].mean(axis=1)
+    centroids_y = hilbert_tris[:, :, 1].mean(axis=1)
+    ax.plot(centroids_x, centroids_y, "b-", linewidth=0.6, alpha=0.4,
+            label="Hilbert traversal path")
+    ax.autoscale_view()
+    ax.set_aspect("equal")
+    ax.set_title("2. CDF Area Weights")
+    ax.set_xlabel("X (m)")
+    ax.legend(fontsize=7, loc="best")
+    ax.grid(True, alpha=0.2)
+
+    # ── Panel 3: sampled points ───────────────────────────────────────────
+    ax = axes[2]
+    # Mesh backdrop — colour each triangle by how many samples it received
+    sample_counts = np.bincount(tri_indices, minlength=N).astype(float)
+    coll3 = PolyCollection(hilbert_tris, array=sample_counts,
+                           cmap="Blues", edgecolor="gray", linewidth=0.2, alpha=0.6)
+    ax.add_collection(coll3)
+    fig.colorbar(coll3, ax=ax, label="Samples per triangle")
+    # Scatter sampled points, coloured by their triangle index
+    ax.scatter(points_2d[:, 0], points_2d[:, 1],
+               c=tri_indices, cmap="viridis", s=2, alpha=0.6,
+               rasterized=True, zorder=3)
+    ax.autoscale_view()
+    ax.set_aspect("equal")
+    ax.set_title("3. Sampled Points (CDF Walk)")
+    ax.set_xlabel("X (m)")
+    ax.grid(True, alpha=0.2)
+
+    plt.tight_layout()
+    display(fig)
+    plt.close(fig)
 
 
 def sample_dead_zones(dead_zones, num_samples, building_exclusions=None):
@@ -676,6 +924,11 @@ def sample_dead_zones(dead_zones, num_samples, building_exclusions=None):
                 continue
             boundary = list(poly.exterior.coords)[:-1]
             tv, _ = triangulate_zone(boundary, exclusions)
+
+            #fig = visualize_triangulation(tv)
+            #display(fig)
+            #plt.close(fig)
+
             if len(tv) > 0:
                 all_tri_verts.append(tv)
 
@@ -685,9 +938,7 @@ def sample_dead_zones(dead_zones, num_samples, building_exclusions=None):
     # Pool all triangles across strata — allocation is proportional by area
     combined_tri_verts = np.vstack(all_tri_verts)
 
-    # Single d=2 LDS engine over the full pooled triangle set
-    lds = qmc.Halton(d=2, scramble=True)
-    return sample_triangulated_zone(combined_tri_verts, num_samples, lds)
+    return sample_triangulated_zone(combined_tri_verts, num_samples, visualize=True)
 
 
 def calculate_discrepancy_score(points, zone_polygon, num_probes=1000):

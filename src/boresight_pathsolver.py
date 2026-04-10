@@ -387,9 +387,17 @@ def filter_and_append(rx_data, dead_zone, tail_percentile=20.0):
     Dynamically isolates the worst X% of receivers in the current batch.
     """
     # rx_data has columns [x, y, power]
+    # Drop cells with NaN/inf power (e.g. unlit cells in the RadioMap); a NaN
+    # threshold from np.percentile would make every comparison False and return
+    # an empty dead_points even when valid data exists.
+    valid_mask = np.isfinite(rx_data[:, 2])
+    rx_data = rx_data[valid_mask]
+    if len(rx_data) == 0:
+        return dead_zone
+
     power_array = rx_data[:, 2]
 
-    # Dynamically find the threshold for the bottom 20% of this specific batch
+    # Dynamically find the threshold for the bottom tail_percentile% of this batch
     dynamic_threshold = np.percentile(power_array, tail_percentile)
 
     # Filter rows where power is below the dynamic threshold
@@ -725,7 +733,8 @@ def visualize_multi_tx_strata(
 
         # 2. Dead-zone strata — each stratum gets its own colour
         for s_idx, dz in enumerate(dead_zones):
-            _fill_geom(ax, dz, alpha=0.65, fc='purple', ec="black",
+            color = palette[s_idx % len(palette)]
+            _fill_geom(ax, dz, alpha=0.65, fc=color, ec="black",
                        linewidth=0.8, zorder=3,
                        label=f"Stratum {s_idx}")
 
@@ -797,7 +806,6 @@ def visualize_multi_tx_strata(
     fig.suptitle(suptitle, fontsize=14, fontweight="bold")
     plt.tight_layout()
     return fig
-
 
 def compare_boresight_performance(
     scene,
