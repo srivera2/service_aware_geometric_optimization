@@ -102,6 +102,24 @@ class TxPlacement:
         z_pos = self.building["z_height"] + self.offset
         self.tx.position = mi.Point3f(float(x_pos), float(y_pos), float(z_pos))
 
+    def set_rooftop_zone_facing(self, zone_centroid_xy):
+        """
+        Places the transmitter at the point on the building's roof edge closest
+        to the assigned zone centroid, with optional height offset.
+
+        This projects the zone centroid onto the building polygon boundary,
+        so the TX sits on the building edge facing toward its coverage zone.
+
+        Parameters:
+        -----------
+        zone_centroid_xy : array-like of length 2
+            [x, y] centroid of the assigned coverage zone (e.g. zone_stats['centroid_xy']).
+        """
+        zone_x, zone_y = float(zone_centroid_xy[0]), float(zone_centroid_xy[1])
+        edge_x, edge_y = self.project_to_polygon_edge(zone_x, zone_y)
+        z_pos = self.building["z_height"] + self.offset
+        self.tx.position = mi.Point3f(edge_x, edge_y, float(z_pos))
+
     def get_line_manifold(self, p_start, p_end):
         """
         Returns a function that maps a scalar `alpha` to a point on the line segment.
