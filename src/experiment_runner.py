@@ -20,6 +20,7 @@ get_distribution_data()   : extract raw per-cell value arrays for custom plottin
 plot_cdf()                : empirical CDF comparison across baselines
 plot_loss_curves()        : convergence curves for gradient methods
 plot_metric_bars()        : grouped bar chart of summary metrics
+plot_zone_overview()      : scene map with zone masks, TX markers, and building labels
 
 Baseline IDs
 ------------
@@ -35,6 +36,10 @@ Baseline IDs
 
   Empirical:
     "uma_naive"                 3GPP TR 38.901 UMa fixed-pointing baseline
+
+  First-order (RadioMapSolver-driven):
+    "radiomap_gradient"         Adam optimizer with RadioMapSolver as the differentiable engine;
+                                SINR loss averaged over radio-map cells within each TX's zone
 """
 
 from __future__ import annotations
@@ -61,6 +66,8 @@ from baseline_optimizers import (
     pso_multi_tx,
     coordinate_descent_multi_tx,
     uma_naive_baseline_multi_tx,
+    radiomap_gradient_multi_tx,
+    coarse_az_sweep,
 )
 from angle_utils import yaw_pitch_to_azimuth_elevation, azimuth_elevation_to_yaw_pitch
 
@@ -83,6 +90,7 @@ class ExperimentConfig:
         "grad_full_rejection",
         "grad_full_triangulated",
         "grad_proportional",
+        "radiomap_gradient",
         "random_search",
         "pso",
         "coordinate_descent",
@@ -125,6 +133,30 @@ class ExperimentConfig:
     uma_electrical_downtilt_deg: float = 6.0
     uma_lds: str = "Halton"
 
+    # --- RadioMap gradient -----------------------------------------------
+    rmg_samples_per_tx: int = int(1e7)
+    rmg_max_depth: int = 8
+    rmg_lds: str = "Halton"
+
+    # --- Early stopping ---------------------------------------------------
+    early_stop_window: int = 10
+    early_stop_min_improvement: float = 1e-3
+    # Minimum sign-flips in Δloss over the window to declare oscillation
+    # (used by gradient and radiomap_gradient methods only).
+    early_stop_min_flips: int = 4
+
+    # --- Coarse azimuth warm-start ----------------------------------------
+    # When coarse_az_steps > 0, a greedy azimuth sweep is run once before any
+    # baseline.  Each TX's azimuth is swept over ``coarse_az_steps`` uniformly
+    # spaced points using cheap RadioMapSolver evaluations; the best per-TX
+    # azimuth becomes the shared starting point for ALL methods.
+    # Gradient-free methods (PSO, random search) have the warm-start seeded
+    # into their initial populations; all others start from it directly.
+    # Set to 0 to disable (default — preserves old behaviour).
+    # Recommended: 24 (15° spacing, full 360° coverage).
+    coarse_az_steps: int = 0
+    coarse_samples_per_tx: int = int(1e7)   # samples per RadioMapSolver call in sweep
+
     # --- Output / reproducibility -----------------------------------------
     output_path: Optional[str] = None
     # strip_raw_arrays: drop rsrp_values_dbm / sir_values_db before saving to
@@ -153,6 +185,9 @@ def _grad_kwargs(cfg: ExperimentConfig, tx_cfgs, scene, map_cfg, xml,
         sampling_strata=sampling_strata,
         verbose=cfg.verbose,
         debug_viz=cfg.debug_viz,
+        early_stop_window=cfg.early_stop_window,
+        early_stop_min_improvement=cfg.early_stop_min_improvement,
+        early_stop_min_flips=cfg.early_stop_min_flips,
     )
 
 
@@ -204,6 +239,8 @@ _BASELINE_REGISTRY: dict[str, tuple[Callable, Callable]] = {
             lds=c.pso_lds,
             seed=c.pso_seed,
             verbose=c.verbose,
+            early_stop_window=c.early_stop_window,
+            early_stop_min_improvement=c.early_stop_min_improvement,
         ),
     ),
 
@@ -216,6 +253,7 @@ _BASELINE_REGISTRY: dict[str, tuple[Callable, Callable]] = {
             noise_power=c.noise_power,
             lds=c.cd_lds,
             verbose=c.verbose,
+            early_stop_min_improvement=c.early_stop_min_improvement,
         ),
     ),
 
@@ -230,6 +268,23 @@ _BASELINE_REGISTRY: dict[str, tuple[Callable, Callable]] = {
             verbose=c.verbose,
         ),
     ),
+
+    "radiomap_gradient": (
+        radiomap_gradient_multi_tx,
+        lambda c, t, s, m, x: dict(
+            scene=s, tx_configs=t, map_config=m, scene_xml_path=x,
+            learning_rate=c.learning_rate,
+            num_iterations=c.num_iterations,
+            noise_power=c.noise_power,
+            lds=c.rmg_lds,
+            samples_per_tx=c.rmg_samples_per_tx,
+            max_depth=c.rmg_max_depth,
+            verbose=c.verbose,
+            early_stop_window=c.early_stop_window,
+            early_stop_min_improvement=c.early_stop_min_improvement,
+            early_stop_min_flips=c.early_stop_min_flips,
+        ),
+    ),
 }
 
 # Human-readable display names for plots / tables
@@ -237,6 +292,7 @@ _BASELINE_LABELS: dict[str, str] = {
     "grad_full_rejection":    "Grad (Rejection, Full)",
     "grad_full_triangulated": "Grad (Triangulated, Full)",
     "grad_proportional":      "Grad (Triangulated, Prop.)",
+    "radiomap_gradient":      "RadioMap Grad (Adam)",
     "random_search":          "Random Search",
     "pso":                    "PSO",
     "coordinate_descent":     "Coord. Descent",
@@ -248,6 +304,7 @@ _BASELINE_COLORS: dict[str, str] = {
     "grad_full_rejection":    "#1f77b4",
     "grad_full_triangulated": "#ff7f0e",
     "grad_proportional":      "#2ca02c",
+    "radiomap_gradient":      "#e377c2",
     "random_search":          "#d62728",
     "pso":                    "#9467bd",
     "coordinate_descent":     "#8c564b",
@@ -259,6 +316,7 @@ _BASELINE_LINESTYLES: dict[str, str] = {
     "grad_full_rejection":    "-",
     "grad_full_triangulated": "--",
     "grad_proportional":      "-.",
+    "radiomap_gradient":      (0, (4, 2, 1, 2)),
     "random_search":          ":",
     "pso":                    (0, (5, 1)),
     "coordinate_descent":     (0, (3, 1, 1, 1)),
@@ -445,9 +503,40 @@ def run_experiment_suite(
             f"Valid IDs: {valid}"
         )
 
+    # --- Optional coarse azimuth warm-start (runs before capturing angles) --
+    sweep_log = None
+    if exp_config.coarse_az_steps > 0:
+        sweep_result = coarse_az_sweep(
+            scene, tx_configs, map_config, scene_xml_path,
+            n_az_steps=exp_config.coarse_az_steps,
+            samples_per_tx=exp_config.coarse_samples_per_tx,
+            noise_power=exp_config.noise_power,
+            verbose=exp_config.verbose,
+        )
+        # Apply warm-start orientations to scene so _capture_initial_angles
+        # picks them up as the shared starting point for all baselines.
+        for cfg in tx_configs:
+            best_az, best_el = sweep_result[cfg.name]
+            yaw_r, pitch_r = azimuth_elevation_to_yaw_pitch(best_az, best_el)
+            tx = scene.get(cfg.name)
+            tx.orientation = mi.Point3f(float(yaw_r), float(pitch_r), 0.0)
+        sweep_log = sweep_result
+
     # --- Capture initial scene state (once) --------------------------------
     initial_angles    = _capture_initial_angles(scene, tx_configs)
     initial_positions = _capture_initial_positions(scene, tx_configs)
+
+    # Flat seed_params vector for gradient-free methods (PSO, random search)
+    seed_params: Optional[np.ndarray] = None
+    if sweep_log is not None:
+        seed_params = np.array(
+            [v for cfg in tx_configs
+             for v in [initial_angles[cfg.name][0],   # az
+                       initial_angles[cfg.name][1],   # el
+                       initial_positions[cfg.name][0],  # x
+                       initial_positions[cfg.name][1]]],  # y
+            dtype=np.float64,
+        )
 
     if exp_config.verbose:
         print(f"\n{'='*70}")
@@ -455,7 +544,10 @@ def run_experiment_suite(
               f"|  {len(tx_configs)} TX(s)")
         if exp_config.experiment_tag:
             print(f"Tag: {exp_config.experiment_tag}")
-        print(f"Initial angles:")
+        warm_label = (f"  [warm-start from coarse sweep, "
+                      f"{exp_config.coarse_az_steps} steps]"
+                      if sweep_log is not None else "")
+        print(f"Initial angles:{warm_label}")
         for name, (az, el) in initial_angles.items():
             pos = initial_positions[name]
             print(f"  {name}: Az={az:.1f}°  El={el:.1f}°  "
@@ -471,6 +563,7 @@ def run_experiment_suite(
         "initial_angles": {n: list(a) for n, a in initial_angles.items()},
         "initial_positions": initial_positions,
         "exp_config":     asdict(exp_config),
+        "sweep_log":      sweep_log,
     }
 
     # --- Run each baseline ------------------------------------------------
@@ -493,6 +586,10 @@ def run_experiment_suite(
         tx_configs_copy = _inject_initial_angles(tx_configs, initial_angles)
 
         kwargs = kwargs_builder(exp_config, tx_configs_copy, scene, map_config, scene_xml_path)
+
+        # Inject warm-start seed into gradient-free methods that support it
+        if seed_params is not None and baseline_id in ("random_search", "pso"):
+            kwargs["seed_params"] = seed_params
 
         t0 = time.time()
 
@@ -554,6 +651,8 @@ def run_experiment_suite(
 
     # --- Assemble output --------------------------------------------------
     suite_output = {"metadata": metadata, "results": results}
+    if sweep_log is not None:
+        suite_output["sweep_log"] = sweep_log
 
     if exp_config.output_path is not None:
         save_results(suite_output, exp_config.output_path,
@@ -958,5 +1057,149 @@ def plot_metric_bars(
     ax.set_ylabel("Value")
     ax.grid(True, axis="y", alpha=0.3)
     ax.legend(fontsize=7, loc="upper right")
+
+    return fig, ax
+
+
+def plot_zone_overview(
+    building_info: dict,
+    map_config: dict,
+    zone_entries: list,
+    title: str = "",
+    figsize: tuple = (9, 9),
+    xlim: Optional[tuple] = None,
+    ylim: Optional[tuple] = None,
+    show_building_ids: bool = True,
+    building_label_fontsize: int = 6,
+    ax=None,
+) -> tuple:
+    """Scene map showing zone masks, TX positions, and building footprints.
+
+    Reusable across all experiment notebooks — pass one ``zone_entry`` dict per
+    TX/zone pair.  Building IDs are annotated at each building's centroid.
+
+    Parameters
+    ----------
+    building_info : dict
+        Output of ``extract_building_info()``, keyed by integer building ID.
+        Each value must have ``'vertices'`` (Nx3 array) and ``'center'``
+        (x_center, y_center).
+    map_config : dict
+        Standard ``MAP_CONFIG`` dict with ``'center'`` and ``'size'`` keys.
+    zone_entries : list[dict]
+        One dict per TX/zone pair.  Recognised keys:
+
+        * ``mask``        – 2-D numpy array (zone coverage mask)
+        * ``cmap``        – matplotlib colormap name (e.g. ``'Blues'``)
+        * ``color``       – TX marker and centroid color
+        * ``tx_pos``      – [x, y, z] or [x, y] TX position
+        * ``tx_name``     – TX name string (legend)
+        * ``building_id`` – int building ID the TX sits on (legend)
+        * ``centroid_xy`` – [x, y] zone centroid
+        * ``zone_label``  – short string used in the centroid legend entry
+        * ``marker``      – TX marker shape (default ``'^'``)
+        * ``show_arrow``  – draw a dashed arrow TX→centroid (default ``True``)
+
+    title : str
+    figsize : tuple
+    xlim : tuple or None
+        (x_min, x_max) axis limits; derived from ``map_config`` if ``None``.
+    ylim : tuple or None
+        (y_min, y_max) axis limits; derived from ``map_config`` if ``None``.
+    show_building_ids : bool
+        Annotate each building footprint with its integer ID (default ``True``).
+    building_label_fontsize : int
+        Font size for building ID annotations (default ``6``).
+    ax : matplotlib.axes.Axes or None
+
+    Returns
+    -------
+    (fig, ax)
+    """
+    from matplotlib.patches import Polygon as MplPolygon  # local import — avoids hard dep at module level
+
+    cx, cy, _ = map_config["center"]
+    w, h = map_config["size"]
+    extent = [cx - w / 2, cx + w / 2, cy - h / 2, cy + h / 2]
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize)
+    else:
+        fig = ax.get_figure()
+
+    # ── zone masks ────────────────────────────────────────────────────────────
+    for entry in zone_entries:
+        mask = entry["mask"]
+        ax.imshow(
+            np.ma.masked_where(mask == 0, mask),
+            origin="lower", extent=extent,
+            cmap=entry.get("cmap", "Blues"),
+            vmin=0, vmax=1, alpha=0.45,
+        )
+
+    # ── building footprints + optional ID labels ──────────────────────────────
+    _xlim = xlim if xlim is not None else (extent[0], extent[1])
+    _ylim = ylim if ylim is not None else (extent[2], extent[3])
+
+    for bid, bdata in building_info.items():
+        verts = bdata["vertices"][:, :2]
+        ax.add_patch(MplPolygon(
+            verts, closed=True,
+            facecolor="gray", edgecolor="black", linewidth=0.8, alpha=0.4,
+        ))
+        if show_building_ids:
+            bx, by = bdata["center"]
+            if _xlim[0] <= bx <= _xlim[1] and _ylim[0] <= by <= _ylim[1]:
+                ax.text(
+                    bx, by, str(bid),
+                    ha="center", va="center",
+                    fontsize=building_label_fontsize,
+                    color="black", alpha=0.7,
+                    clip_on=True,
+                )
+
+    # ── TX markers and zone centroids ─────────────────────────────────────────
+    for entry in zone_entries:
+        color = entry.get("color", "steelblue")
+        marker = entry.get("marker", "^")
+        tx_pos = entry["tx_pos"]
+        tx_name = entry.get("tx_name", "TX")
+        bid = entry.get("building_id", "?")
+        centroid = entry.get("centroid_xy")
+        zone_label = entry.get("zone_label", "Zone centroid")
+
+        ax.plot(
+            tx_pos[0], tx_pos[1], marker,
+            color=color, markersize=13, markeredgecolor="black",
+            label=f"{tx_name} (bldg {bid})", zorder=5,
+        )
+
+        if centroid is not None:
+            ax.plot(
+                *centroid, "o",
+                color=color, markersize=8, markeredgecolor="k",
+                label=zone_label, zorder=5,
+            )
+            if entry.get("show_arrow", True):
+                ax.annotate(
+                    "", xy=centroid, xytext=tx_pos[:2],
+                    arrowprops=dict(
+                        arrowstyle="->", color=color, lw=1.5, linestyle="dashed",
+                    ),
+                )
+
+    # ── axes cosmetics ────────────────────────────────────────────────────────
+    if xlim is not None:
+        ax.set_xlim(*xlim)
+    if ylim is not None:
+        ax.set_ylim(*ylim)
+    ax.set_xlabel("X (m)")
+    ax.set_ylabel("Y (m)")
+    if title:
+        ax.set_title(title)
+    ax.legend(loc="upper right", fontsize=8)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
 
     return fig, ax

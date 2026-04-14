@@ -94,13 +94,13 @@ class TxPlacement:
 
     def set_rooftop_center(self):
         """
-        Places the transmitter at the center of the building's roof with optional offset.
+        Places the transmitter at the polygon centroid of the building's roof with optional offset.
         The offset is specified in __init__ and stored in self.offset.
         """
-        x_pos = self.building["center"][0]
-        y_pos = self.building["center"][1]
+        vertices_2d = self.building["vertices"][:, :2]
+        centroid = Polygon(vertices_2d).centroid
         z_pos = self.building["z_height"] + self.offset
-        self.tx.position = mi.Point3f(float(x_pos), float(y_pos), float(z_pos))
+        self.tx.position = mi.Point3f(float(centroid.x), float(centroid.y), float(z_pos))
 
     def set_rooftop_zone_facing(self, zone_centroid_xy):
         """

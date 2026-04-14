@@ -617,7 +617,7 @@ def _extract_per_rx_power(h_real, h_imag, tx_idx: int):
 def _sir_loss_body(
     all_params, N, tx_configs, tx_states, scene, p_solver,
     map_config, noise_power, sampler, sampling_strata, rx_objects,
-    ref_powers_dbm, epsilon=1e-30,
+    ref_powers_dbm, epsilon=1,
 ):
     """Core SIR loss (executes inside the @dr.wrap DrJit context).
 
@@ -734,11 +734,11 @@ def _sir_loss_body(
 
         if p_int is None:
             # N == 1: no interference — optimise raw log-power
-            metric = p_sig
+            metric = p_sig / noise_f
         else:
             metric = p_sig / (p_int + noise_f)
 
-        loss_i = -dr.mean(dr.log(metric + eps_f))
+        loss_i = -dr.mean(dr.log2(metric + eps_f))
         total_loss = total_loss + loss_i
 
     return total_loss, paths
@@ -804,7 +804,7 @@ def optimize_multi_tx(
     learning_rate: float = 3.0,
     num_iterations: int = 50,
     noise_power: float = 1e-10,
-    dead_tail_percentile: float = 1.0,
+    dead_tail_percentile: float = 50.0,
     max_dbscan_points: int = 100_000,
     lds: str = "Halton",
     sampler: str = "triangulated",
@@ -812,6 +812,9 @@ def optimize_multi_tx(
     verbose: bool = True,
     on_iteration_callback: Optional[callable] = None,
     debug_viz: bool = False,
+    early_stop_window: int = 10,
+    early_stop_min_improvement: float = 1e-3,
+    early_stop_min_flips: int = 4,
 ) -> dict:
     """Jointly optimise N transmitters for SIR coverage.
 
@@ -963,8 +966,10 @@ def optimize_multi_tx(
     # ------------------------------------------------------------------
     # 6. Tracking
     # ------------------------------------------------------------------
-    loss_history = []
-    rm_solver    = RadioMapSolver()
+    loss_history     = []
+    iter_time_history = []
+    converged_iter   = None
+    rm_solver        = RadioMapSolver()
 
     # Buffers for final averaging (last 10 iterations)
     final_bufs = {i: {"az": [], "el": [], "pow": []} for i in range(N)}
@@ -1088,10 +1093,28 @@ def optimize_multi_tx(
         if on_iteration_callback is not None:
             on_iteration_callback(iteration, tx_states, tx_configs)
 
+        dur = time.time() - iter_start
+        iter_time_history.append(dur)
+
         if verbose:
-            dur = time.time() - iter_start
             print(f"  Iter {iteration+1:3d}/{num_iterations}  loss={loss_val:.4f}  "
                   f"({dur:.1f}s)")
+
+        # --- Oscillation-based early stopping ----------------------------
+        if len(loss_history) >= early_stop_window:
+            recent  = loss_history[-early_stop_window:]
+            deltas  = [recent[k + 1] - recent[k] for k in range(len(recent) - 1)]
+            n_flips = sum(
+                1 for k in range(len(deltas) - 1)
+                if deltas[k] * deltas[k + 1] < 0
+            )
+            net_change = abs(recent[-1] - recent[0])
+            if n_flips >= early_stop_min_flips and net_change < early_stop_min_improvement:
+                converged_iter = iteration + 1
+                if verbose:
+                    print(f"  [early stop] oscillating at iter {converged_iter} "
+                          f"({n_flips} sign flips, net Δloss={net_change:.4f})")
+                break
 
     # ------------------------------------------------------------------
     # 8. Finalise: reset scene to plain-float state; remove temp receivers
@@ -1140,13 +1163,15 @@ def optimize_multi_tx(
         result[cfg.name] = entry
 
     result["joint"] = {
-        "loss_history":    loss_history,
-        "elapsed_time_s":  elapsed,
-        "num_iterations":  num_iterations,
-        "noise_power":     noise_power,
-        "sampler":         sampler,
-        "sampling_strata": sampling_strata,
-        "lds":             lds,
+        "loss_history":      loss_history,
+        "iter_time_history": iter_time_history,
+        "converged_iter":    converged_iter,
+        "elapsed_time_s":    elapsed,
+        "num_iterations":    num_iterations,
+        "noise_power":       noise_power,
+        "sampler":           sampler,
+        "sampling_strata":   sampling_strata,
+        "lds":               lds,
     }
 
     if verbose:
