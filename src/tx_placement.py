@@ -61,64 +61,15 @@ class TxPlacement:
         nearest_point = boundary.interpolate(boundary.project(point))
         return float(nearest_point.x), float(nearest_point.y)
 
-    def project_to_polygon_edge(self, x, y):
-        """
-        Project point (x, y) to the nearest point on the polygon boundary (edge).
-        Unlike project_to_polygon, this ALWAYS projects to the edge, even if the
-        point is inside the polygon.
-
-        Parameters:
-        -----------
-        x : float
-            X coordinate
-        y : float
-            Y coordinate
-
-        Returns:
-        --------
-        proj_x : float
-            Projected X coordinate on the edge
-        proj_y : float
-            Projected Y coordinate on the edge
-        """
-        # Extract 2D coordinates from vertices
-        vertices_2d = self.building['vertices'][:, :2]  # Take only x, y columns
-
-        point = Point(float(x), float(y))
-        poly = Polygon(vertices_2d)
-
-        # Always project to the boundary (edge), regardless of whether inside or outside
-        boundary = poly.boundary
-        nearest_point = boundary.interpolate(boundary.project(point))
-        return float(nearest_point.x), float(nearest_point.y)
-
     def set_rooftop_center(self):
         """
-        Places the transmitter at the polygon centroid of the building's roof with optional offset.
+        Places the transmitter at the center of the building's roof with optional offset.
         The offset is specified in __init__ and stored in self.offset.
         """
-        vertices_2d = self.building["vertices"][:, :2]
-        centroid = Polygon(vertices_2d).centroid
+        x_pos = self.building["center"][0]
+        y_pos = self.building["center"][1]
         z_pos = self.building["z_height"] + self.offset
-        self.tx.position = mi.Point3f(float(centroid.x), float(centroid.y), float(z_pos))
-
-    def set_rooftop_zone_facing(self, zone_centroid_xy):
-        """
-        Places the transmitter at the point on the building's roof edge closest
-        to the assigned zone centroid, with optional height offset.
-
-        This projects the zone centroid onto the building polygon boundary,
-        so the TX sits on the building edge facing toward its coverage zone.
-
-        Parameters:
-        -----------
-        zone_centroid_xy : array-like of length 2
-            [x, y] centroid of the assigned coverage zone (e.g. zone_stats['centroid_xy']).
-        """
-        zone_x, zone_y = float(zone_centroid_xy[0]), float(zone_centroid_xy[1])
-        edge_x, edge_y = self.project_to_polygon_edge(zone_x, zone_y)
-        z_pos = self.building["z_height"] + self.offset
-        self.tx.position = mi.Point3f(edge_x, edge_y, float(z_pos))
+        self.tx.position = mi.Point3f(float(x_pos), float(y_pos), float(z_pos))
 
     def get_line_manifold(self, p_start, p_end):
         """
@@ -143,42 +94,3 @@ class TxPlacement:
             return p_tx
 
         return place_on_line
-
-    def get_start_positions(self, simplify_tolerance=1.0):
-        """
-        Returns diverse starting positions from the roof polygon vertices + centroid.
-        Uses Shapely simplify() to reduce mesh vertices to key polygon corners.
-
-        Parameters:
-        -----------
-        simplify_tolerance : float
-            Tolerance for Shapely polygon simplification (meters).
-            Higher values → fewer vertices. Default 1.0m works well
-            for typical building polygons.
-
-        Returns:
-        --------
-        positions : list of [x, y]
-            Diverse starting positions, all guaranteed inside the polygon.
-        """
-        vertices_2d = self.building['vertices'][:, :2]
-        poly = Polygon(vertices_2d)
-
-        # Simplify to key corners (removes collinear/near-collinear points)
-        simplified = poly.simplify(simplify_tolerance, preserve_topology=True)
-        corner_coords = list(simplified.exterior.coords[:-1])  # Drop duplicate closing vertex
-
-        # Add centroid
-        centroid = poly.centroid
-        positions = [[centroid.x, centroid.y]]
-
-        # Add simplified vertices, projecting to interior if simplification shifted them outside
-        for x, y in corner_coords:
-            pt = Point(x, y)
-            if poly.contains(pt) or poly.touches(pt):
-                positions.append([x, y])
-            else:
-                proj_x, proj_y = self.project_to_polygon(x, y)
-                positions.append([proj_x, proj_y])
-
-        return positions

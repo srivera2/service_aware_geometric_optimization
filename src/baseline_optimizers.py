@@ -15,9 +15,12 @@ coordinate_descent_multi_tx   : axis-aligned coordinate descent with 1-D line se
 Evaluation
 ----------
 All baselines use ``RadioMapSolver`` (no PathSolver / AD needed).  The
-objective mirrors the gradient-based method: negative mean log-SIR summed
-across all TX zones.  A shared ``_evaluate_config`` helper applies a parameter
-vector to the scene and returns the scalar loss value.
+objective mirrors the gradient-based method: area-weighted negative mean
+sigmoid soft-coverage, where soft coverage is a sigmoid indicator of each
+zone cell's SIR (dB) exceeding ``sir_threshold_db`` (default −3 dB), with
+steepness ``sigmoid_k`` (default 0.5) — identical hyperparameters to
+``_sir_loss_body`` in ``multi_tx_optimizer``.  A shared ``_evaluate_config``
+helper applies a parameter vector to the scene and returns the scalar loss.
 
 Parameter vector layout (per TX, concatenated)
 -----------------------------------------------
@@ -44,6 +47,7 @@ from sionna.rt import RadioMapSolver
 
 from angle_utils import (
     azimuth_elevation_to_yaw_pitch,
+    yaw_pitch_to_azimuth_elevation,
     compute_initial_angles_from_position,
 )
 from multi_tx_optimizer import TxConfig, _setup_tx_state, _make_qrand
@@ -115,18 +119,30 @@ def _run_radiomap(scene, map_config: dict,
     return rm
 
 
-def _sir_loss_from_radiomap(rm, tx_configs: list[TxConfig], zone_masks: list[np.ndarray],
-                             noise_power: float) -> float:
+def _sir_loss_from_radiomap(rm, tx_configs: list[TxConfig], tx_states: list[dict],
+                             zone_masks: list[np.ndarray],
+                             noise_power: float,
+                             sir_threshold_db: float = -3.0,
+                             sigmoid_k: float = 0.5,
+                             epsilon: float = 1.0) -> float:
     """Compute the scalar SIR loss from a RadioMapSolver result.
 
-    Mirrors the gradient-based loss: negative mean log-SIR summed over zones.
-    Zone masks are passed as a list aligned to tx_configs order.
+    Mirrors the gradient-based loss in ``_sir_loss_body`` (multi_tx_optimizer):
+    area-weighted negative mean sigmoid soft-coverage over each TX zone, where
+    soft coverage is a sigmoid indicator of SIR (dB) exceeding
+    ``sir_threshold_db``.  ``epsilon`` is added to the linear SIR metric before
+    the dB conversion (matching the ``epsilon=1`` default in the gradient path).
     """
-    import drjit as dr
     rss_np = np.array(dr.detach(rm.rss))   # shape (N_tx, H, W)
     N = len(tx_configs)
-    total_loss = 0.0
-    eps = 1e-30
+
+    # Area weights proportional to zone geographic area (matches gradient optimizer)
+    zone_areas   = [state["zone_polygon"].area for state in tx_states]
+    total_area   = sum(zone_areas) or 1.0
+    area_weights = [a / total_area for a in zone_areas]
+
+    log10_scale = 10.0 / np.log(10.0)   # converts natural log → dB
+    total_loss  = 0.0
 
     for i in range(N):
         mask = zone_masks[i]
@@ -137,8 +153,10 @@ def _sir_loss_from_radiomap(rm, tx_configs: list[TxConfig], zone_masks: list[np.
             if j != i:
                 interf += rss_np[j][mask > 0]
 
-        sir    = sig / (interf + noise_power)
-        loss_i = -float(np.mean(np.log(sir + eps)))
+        metric   = sig / (interf + noise_power)
+        sir_db   = log10_scale * np.log(metric + epsilon)
+        soft_cov = 1.0 / (1.0 + np.exp(-sigmoid_k * (sir_db - sir_threshold_db)))
+        loss_i   = -area_weights[i] * float(np.mean(soft_cov))
         total_loss += loss_i
 
     return total_loss
@@ -147,13 +165,18 @@ def _sir_loss_from_radiomap(rm, tx_configs: list[TxConfig], zone_masks: list[np.
 def _evaluate_config(scene, tx_configs: list[TxConfig], tx_states: list[dict],
                      params: np.ndarray, map_config: dict,
                      zone_masks: list[np.ndarray], noise_power: float,
-                     samples_per_tx: int = int(1e8)) -> float:
+                     samples_per_tx: int = int(1e8),
+                     sir_threshold_db: float = -3.0,
+                     sigmoid_k: float = 0.5) -> float:
     """Apply params to scene, run RadioMapSolver, return scalar SIR loss."""
     _apply_params(scene, tx_configs, tx_states, params)
     rm = _run_radiomap(scene, map_config, samples_per_tx=samples_per_tx)
-    loss = _sir_loss_from_radiomap(rm, tx_configs, zone_masks, noise_power)
+    loss = _sir_loss_from_radiomap(rm, tx_configs, tx_states, zone_masks, noise_power,
+                                   sir_threshold_db=sir_threshold_db,
+                                   sigmoid_k=sigmoid_k)
     del rm
     gc.collect()
+    dr.flush_kernel_cache()
     dr.flush_malloc_cache()
     return loss
 
@@ -230,33 +253,40 @@ def _build_result(tx_configs, tx_states, best_params, loss_history,
 # Warm-start initialisation
 # ---------------------------------------------------------------------------
 
-def coarse_az_sweep(
+def coarse_xy_sweep(
     scene,
     tx_configs: list,
     map_config: dict,
     scene_xml_path: str,
-    n_az_steps: int = 24,
+    n_xy_steps: int = 5,
     samples_per_tx: int = int(1e7),
     noise_power: float = 1e-10,
+    sir_threshold_db: float = -3.0,
+    sigmoid_k: float = 0.5,
     verbose: bool = True,
 ) -> dict:
-    """Coarse azimuth grid search used to warm-start all optimizers.
+    """Coarse XY position grid search used to warm-start TX placement.
 
-    Sweeps azimuth over ``n_az_steps`` uniformly spaced points for each TX,
-    using cheap RadioMapSolver evaluations.  Elevation is fixed at the geometric
-    value (boresight pointing toward the zone centroid at 1.5 m receiver height).
-    TX rooftop position is not changed.
+    Sweeps each TX's position over a coarse grid of interior points on its
+    building rooftop polygon.  At each candidate (x, y) the boresight is
+    aimed geometrically toward the zone centroid (elevation computed from the
+    TX height to a 1.5 m receiver target), so the orientation always faces the
+    coverage zone regardless of any prior azimuth warm-start.
 
     **Algorithm — greedy sequential sweep:**
 
     For TX_i in order:
-      - Previous TXs are held at their already-chosen best azimuth.
-      - Remaining TXs are held at their geometric initialization.
-      - Azimuth is swept over ``[0°, 360°)`` at ``n_az_steps`` evenly spaced points.
-      - The azimuth with the lowest loss (best SINR) is recorded for TX_i.
+      - Previous TXs are held at their already-chosen best (x, y, az, el).
+      - Remaining TXs stay at their current scene position.
+      - XY is swept over a ``n_xy_steps × n_xy_steps`` grid clipped to the
+        building polygon interior (points outside are skipped).
+      - At each candidate position the az/el pointing to the zone centroid is
+        computed and included in the evaluation.
+      - The (x, y) — and its corresponding az/el — with the lowest loss is
+        committed for TX_i.
 
-    Total cost: ``n_az_steps × N_tx`` RadioMapSolver evaluations
-    (e.g. 24 steps × 3 TXs = 72 evaluations).
+    Total cost: up to ``n_xy_steps² × N_tx`` RadioMapSolver evaluations
+    (typically fewer because grid points outside the polygon are filtered out).
 
     Parameters
     ----------
@@ -264,85 +294,139 @@ def coarse_az_sweep(
     tx_configs : list[TxConfig]
     map_config : dict
     scene_xml_path : str
-    n_az_steps : int
-        Number of azimuth sweep points (default 24 → 15° spacing).
+    n_xy_steps : int
+        Grid divisions along each axis (default 5 → up to 25 candidates per TX,
+        filtered to polygon interior).
     samples_per_tx : int
-        RadioMapSolver rays per TX for each sweep evaluation.  1e7 is ~10×
-        faster than the full baseline evaluations and sufficient for coarse
-        orientation selection (default int(1e7)).
+        RadioMapSolver rays per TX per evaluation (default int(1e7)).
     noise_power : float
     verbose : bool
 
     Returns
     -------
     dict
-        ``{tx_name: (best_az_deg, el_deg)}`` — one entry per TX.
+        ``{tx_name: (best_x, best_y)}`` — one entry per TX.
         Also contains a ``"meta"`` key:
-        ``{"az_steps": N, "evaluations": K, "elapsed_s": T,
-           "per_tx": {tx_name: {"best_az": float, "el": float, "best_loss": float}}}``.
+        ``{"xy_steps": N, "evaluations": K, "elapsed_s": T,
+           "per_tx": {tx_name: {"best_x": float, "best_y": float,
+                                "best_az": float, "best_el": float,
+                                "best_loss": float, "n_candidates": int}}}``.
     """
+    from shapely.geometry import Point, Polygon as ShapelyPolygon
+
     if verbose:
         print(f"\n{'='*60}")
-        print(f"COARSE AZ SWEEP  ({n_az_steps} steps × {len(tx_configs)} TX = "
-              f"{n_az_steps * len(tx_configs)} evals, {samples_per_tx:.0e} samples/TX)")
+        print(f"COARSE XY SWEEP  ({n_xy_steps}×{n_xy_steps} grid × {len(tx_configs)} TX, "
+              f"{samples_per_tx:.0e} samples/TX)")
         print(f"{'='*60}")
 
-    t_start = time.time()
-    qrand   = _make_qrand("Halton")
+    t_start   = time.time()
+    qrand     = _make_qrand("Halton")
     tx_states = [_setup_tx_state(scene, cfg, scene_xml_path, qrand)
                  for cfg in tx_configs]
-
     zone_masks = _zone_masks_from_states(tx_states, map_config)
 
-    # Working parameter vector — starts at geometric initialization
-    current_params = _initial_params(tx_configs, tx_states).copy()
-    az_grid        = np.linspace(0.0, 360.0, n_az_steps, endpoint=False)
-    stride         = 4   # az, el, x, y per TX
+    # Initialise current_params from the scene so previously committed TX
+    # positions/angles are held fixed while sweeping TX_i.
+    stride         = 4
+    current_params = np.empty(len(tx_configs) * stride, dtype=np.float64)
+    for i, cfg in enumerate(tx_configs):
+        tx  = scene.get(cfg.name)
+        b   = i * stride
+        yaw_r   = float(dr.detach(tx.orientation[0])[0])
+        pitch_r = float(dr.detach(tx.orientation[1])[0])
+        az, el  = yaw_pitch_to_azimuth_elevation(yaw_r, pitch_r)
+        current_params[b]     = az
+        current_params[b + 1] = el
+        current_params[b + 2] = float(dr.detach(tx.position[0])[0])
+        current_params[b + 3] = float(dr.detach(tx.position[1])[0])
 
     per_tx_log = {}
     n_evals    = 0
 
-    for i, cfg in enumerate(tx_configs):
-        az_idx   = i * stride      # index of azimuth in flat param vector
-        el_fixed = current_params[az_idx + 1]  # geometric elevation; never changed
+    for i, (cfg, state) in enumerate(zip(tx_configs, tx_states)):
+        b     = i * stride
+        x_idx = b + 2
+        y_idx = b + 3
 
-        best_az   = current_params[az_idx]
+        # Zone centroid at receiver height — used to re-aim at each candidate.
+        zone_c    = state["box_polygon"].centroid
+        look_at   = [float(zone_c.x), float(zone_c.y), 1.5]
+        tx_height = state["tx_height"]
+
+        # Build candidate set: regular grid over bounding box, interior only.
+        verts_2d = state["tx_placement"].building["vertices"][:, :2]
+        poly     = ShapelyPolygon(verts_2d)
+        minx, miny, maxx, maxy = poly.bounds
+        xs = np.linspace(minx, maxx, n_xy_steps)
+        ys = np.linspace(miny, maxy, n_xy_steps)
+        candidates = [(float(x), float(y))
+                      for x in xs for y in ys
+                      if poly.contains(Point(x, y))]
+        if not candidates:
+            # Polygon smaller than grid spacing — use centroid only.
+            c = poly.centroid
+            candidates = [(float(c.x), float(c.y))]
+
+        best_x    = current_params[x_idx]
+        best_y    = current_params[y_idx]
+        best_az   = current_params[b]
+        best_el   = current_params[b + 1]
         best_loss = np.inf
 
-        for az_test in az_grid:
-            probe          = current_params.copy()
-            probe[az_idx]  = az_test
+        for cx, cy in candidates:
+            # Re-aim toward zone centroid from this candidate position.
+            az_cand, el_cand = compute_initial_angles_from_position(
+                [cx, cy, tx_height], look_at, verbose=False
+            )
+            probe        = current_params.copy()
+            probe[b]     = az_cand
+            probe[b + 1] = el_cand
+            probe[x_idx] = cx
+            probe[y_idx] = cy
             loss = _evaluate_config(scene, tx_configs, tx_states, probe,
                                     map_config, zone_masks, noise_power,
-                                    samples_per_tx=samples_per_tx)
+                                    samples_per_tx=samples_per_tx,
+                                    sir_threshold_db=sir_threshold_db,
+                                    sigmoid_k=sigmoid_k)
             n_evals += 1
             if loss < best_loss:
                 best_loss = loss
-                best_az   = az_test
+                best_x, best_y = cx, cy
+                best_az, best_el = az_cand, el_cand
 
-        # Commit best azimuth for TX_i so subsequent TXs see it
-        current_params[az_idx] = best_az
-        per_tx_log[cfg.name]   = {"best_az": float(best_az),
-                                   "el":      float(el_fixed),
-                                   "best_loss": float(best_loss)}
+        # Commit best position + corresponding orientation for TX_i.
+        current_params[b]     = best_az
+        current_params[b + 1] = best_el
+        current_params[x_idx] = best_x
+        current_params[y_idx] = best_y
+        per_tx_log[cfg.name]  = {
+            "best_x":       float(best_x),
+            "best_y":       float(best_y),
+            "best_az":      float(best_az),
+            "best_el":      float(best_el),
+            "best_loss":    float(best_loss),
+            "n_candidates": len(candidates),
+        }
 
         if verbose:
-            print(f"  {cfg.name}: best az={best_az:.1f}°  el={el_fixed:.1f}°  "
-                  f"loss={best_loss:.4f}")
+            print(f"  {cfg.name}: best x={best_x:.1f}  y={best_y:.1f}  "
+                  f"az={best_az:.1f}°  el={best_el:.1f}°  "
+                  f"loss={best_loss:.4f}  ({len(candidates)} candidates)")
 
-    # Restore scene to the best joint configuration
+    # Restore scene to the best joint configuration.
     _apply_params(scene, tx_configs, tx_states, current_params)
 
     elapsed = time.time() - t_start
     if verbose:
-        print(f"\nSweep complete: {n_evals} evals in {elapsed:.1f}s")
+        print(f"\nXY sweep complete: {n_evals} evals in {elapsed:.1f}s")
         print(f"{'='*60}\n")
 
-    result = {cfg.name: (per_tx_log[cfg.name]["best_az"],
-                         per_tx_log[cfg.name]["el"])
+    result = {cfg.name: (per_tx_log[cfg.name]["best_x"],
+                          per_tx_log[cfg.name]["best_y"])
               for cfg in tx_configs}
     result["meta"] = {
-        "az_steps":    n_az_steps,
+        "xy_steps":    n_xy_steps,
         "evaluations": n_evals,
         "elapsed_s":   elapsed,
         "per_tx":      per_tx_log,
@@ -365,6 +449,8 @@ def random_search_multi_tx(
     seed: Optional[int] = None,
     verbose: bool = True,
     seed_params: Optional[np.ndarray] = None,
+    sir_threshold_db: float = -3.0,
+    sigmoid_k: float = 0.5,
 ) -> dict:
     """Brute-force random search over the joint angle/position space.
 
@@ -444,7 +530,9 @@ def random_search_multi_tx(
     for k, params in enumerate(candidates):
         t_k  = time.time()
         loss = _evaluate_config(scene, tx_configs, tx_states, params,
-                                map_config, zone_masks, noise_power)
+                                map_config, zone_masks, noise_power,
+                                sir_threshold_db=sir_threshold_db,
+                                sigmoid_k=sigmoid_k)
         iter_time_history.append(time.time() - t_k)
         loss_history.append(float(loss))
 
@@ -496,6 +584,8 @@ def pso_multi_tx(
     early_stop_window: int = 5,
     early_stop_min_improvement: float = 1e-3,
     seed_params: Optional[np.ndarray] = None,
+    sir_threshold_db: float = -3.0,
+    sigmoid_k: float = 0.5,
 ) -> dict:
     """Particle swarm optimisation over the joint angle/position space.
 
@@ -529,6 +619,15 @@ def pso_multi_tx(
         LDS used during tx_state setup ("Halton" | "Sobol" | "Uniform").
     seed : int or None
         RNG seed for reproducibility.
+    early_stop_window : int
+        Stop if global-best has not improved by ``early_stop_min_improvement``
+        over the last ``early_stop_window`` iterations.  PSO tracks a monotone
+        global-best, so a window of 5 is semantically equivalent to coordinate
+        descent's per-cycle no-improvement check (both ask: "did anything
+        improve in one representative unit of work?").  ``num_iterations``
+        should comfortably exceed this value so the criterion has room to fire.
+    early_stop_min_improvement : float
+        Minimum improvement threshold shared across all iterative methods.
     verbose : bool
     seed_params : np.ndarray or None
         Optional warm-start flat parameter vector.  When provided, particle 0
@@ -579,7 +678,9 @@ def pso_multi_tx(
         iter_losses = []
         for k in range(n_particles):
             loss = _evaluate_config(scene, tx_configs, tx_states, positions[k],
-                                    map_config, zone_masks, noise_power)
+                                    map_config, zone_masks, noise_power,
+                                    sir_threshold_db=sir_threshold_db,
+                                    sigmoid_k=sigmoid_k)
             iter_losses.append(loss)
 
             if loss < personal_best_loss[k]:
@@ -673,6 +774,8 @@ def coordinate_descent_multi_tx(
     lds: str = "Halton",
     verbose: bool = True,
     early_stop_min_improvement: float = 1e-3,
+    sir_threshold_db: float = -3.0,
+    sigmoid_k: float = 0.5,
 ) -> dict:
     """Coordinate descent with 1-D line search over the joint angle/position space.
 
@@ -725,7 +828,9 @@ def coordinate_descent_multi_tx(
 
     # Evaluate initial config
     best_loss        = _evaluate_config(scene, tx_configs, tx_states, current,
-                                        map_config, zone_masks, noise_power)
+                                        map_config, zone_masks, noise_power,
+                                        sir_threshold_db=sir_threshold_db,
+                                        sigmoid_k=sigmoid_k)
     loss_history      = [float(best_loss)]
     iter_time_history = []
     converged_iter    = None
@@ -758,7 +863,9 @@ def coordinate_descent_multi_tx(
                     candidate[b + 3] = py
 
                 loss = _evaluate_config(scene, tx_configs, tx_states, candidate,
-                                        map_config, zone_masks, noise_power)
+                                        map_config, zone_masks, noise_power,
+                                        sir_threshold_db=sir_threshold_db,
+                                        sigmoid_k=sigmoid_k)
                 if loss < best_d_loss:
                     best_d_loss = loss
                     best_d_val  = candidate[d]
@@ -828,6 +935,8 @@ def uma_naive_baseline_multi_tx(
     noise_power: float = 1e-10,
     lds: str = "Halton",
     verbose: bool = True,
+    sir_threshold_db: float = -3.0,
+    sigmoid_k: float = 0.5,
 ) -> dict:
     """3GPP TR 38.901 UMa naive empirical baseline.
 
@@ -937,7 +1046,9 @@ def uma_naive_baseline_multi_tx(
 
     # Single evaluation — no iteration
     loss = _evaluate_config(scene, tx_configs, tx_states, params,
-                            map_config, zone_masks, noise_power)
+                            map_config, zone_masks, noise_power,
+                            sir_threshold_db=sir_threshold_db,
+                            sigmoid_k=sigmoid_k)
     loss_history = [float(loss)]
 
     elapsed = time.time() - start_time
@@ -975,13 +1086,15 @@ def _radiomap_sir_loss_body(
     deg2rad = Float(float(np.pi / 180.0))
     dr.disable_grad(deg2rad)
 
-    # Set TX orientations and positions with grad enabled
+    # Set TX orientations and positions with grad enabled.
+    # dr.wrap converts 0-dim torch scalars to TensorXf, not Float. Use .array
+    # to extract the underlying Float view so mi.Point3f accepts it.
     for i, cfg in enumerate(tx_configs):
         b    = i * 4
-        az_i = all_params[b];     dr.enable_grad(az_i.array)
-        el_i = all_params[b + 1]; dr.enable_grad(el_i.array)
-        x_i  = all_params[b + 2]; dr.enable_grad(x_i.array)
-        y_i  = all_params[b + 3]; dr.enable_grad(y_i.array)
+        az_i = all_params[b].array;     dr.enable_grad(az_i)
+        el_i = all_params[b + 1].array; dr.enable_grad(el_i)
+        x_i  = all_params[b + 2].array; dr.enable_grad(x_i)
+        y_i  = all_params[b + 3].array; dr.enable_grad(y_i)
 
         yaw   = az_i * deg2rad
         pitch = -(el_i * deg2rad)
@@ -1178,7 +1291,8 @@ def radiomap_gradient_multi_tx(
     # ------------------------------------------------------------------
     # 4. Build @dr.wrap loss closure
     # ------------------------------------------------------------------
-    rm_solver    = RadioMapSolver()
+    rm_solver             = RadioMapSolver()
+    rm_solver.loop_mode   = "evaluated"   # required for AD through dr.while_loop
     compute_loss = _make_radiomap_sir_loss(
         N, tx_configs, tx_states, scene, rm_solver,
         map_config, noise_power, zone_masks_np, n_zone_cells, rm_kwargs,
@@ -1216,6 +1330,9 @@ def radiomap_gradient_multi_tx(
 
         optimizer.step()
         optimizer.zero_grad()
+
+        dr.flush_kernel_cache()
+        dr.flush_malloc_cache()
 
         # Per-TX post-step constraints (no-grad)
         with torch.no_grad():

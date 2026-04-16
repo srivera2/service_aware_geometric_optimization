@@ -17,9 +17,11 @@ compare_all_results()     : builds a pandas DataFrame suitable for LaTeX export
 save_results()            : JSON serialization (strips large arrays by default)
 load_results()            : JSON deserialization
 get_distribution_data()   : extract raw per-cell value arrays for custom plotting
-plot_cdf()                : empirical CDF comparison across baselines
-plot_loss_curves()        : convergence curves for gradient methods
+plot_cdf()                : empirical CDF comparison across baselines (requires in-memory run; raw arrays stripped from saved JSON)
+plot_loss_curves()        : convergence curves for gradient methods (x_axis="iteration"|"wall_time")
 plot_metric_bars()        : grouped bar chart of summary metrics
+plot_per_metric_panels()  : comprehensive grid — rows=metrics, cols=TX+All — horizontal bars, legend outside axes
+plot_efficiency_frontier(): quality-vs-time scatter showing the efficiency frontier across baselines
 plot_zone_overview()      : scene map with zone masks, TX markers, and building labels
 
 Baseline IDs
@@ -67,7 +69,7 @@ from baseline_optimizers import (
     coordinate_descent_multi_tx,
     uma_naive_baseline_multi_tx,
     radiomap_gradient_multi_tx,
-    coarse_az_sweep,
+    coarse_xy_sweep,
 )
 from angle_utils import yaw_pitch_to_azimuth_elevation, azimuth_elevation_to_yaw_pitch
 
@@ -102,7 +104,7 @@ class ExperimentConfig:
     verbose: bool = True
 
     # --- Gradient optimizer (shared across all three grad baselines) ------
-    learning_rate: float = 3.0
+    learning_rate: float = 3.5
     num_iterations: int = 50
     dead_tail_percentile: float = 1.0
     max_dbscan_points: int = 100_000
@@ -110,13 +112,14 @@ class ExperimentConfig:
     debug_viz: bool = False
 
     # --- Random search ----------------------------------------------------
-    rs_n_candidates: int = 200
+    rs_n_candidates: int = 400
     rs_lds: str = "Halton"
     rs_seed: Optional[int] = None
 
     # --- PSO --------------------------------------------------------------
     pso_n_particles: int = 20
-    pso_num_iterations: int = 30
+    pso_num_iterations: int = 30   # raised from 15: must exceed pso_early_stop_window
+                                   # by a comfortable margin so PSO can plateau naturally
     pso_w: float = 0.7
     pso_c1: float = 1.5
     pso_c2: float = 1.5
@@ -138,23 +141,47 @@ class ExperimentConfig:
     rmg_max_depth: int = 8
     rmg_lds: str = "Halton"
 
-    # --- Early stopping ---------------------------------------------------
-    early_stop_window: int = 10
-    early_stop_min_improvement: float = 1e-3
-    # Minimum sign-flips in Δloss over the window to declare oscillation
-    # (used by gradient and radiomap_gradient methods only).
-    early_stop_min_flips: int = 4
+    # --- Loss hyperparameters (shared across gradient + zeroth-order) -----
+    # SIR threshold (dB) at the sigmoid centre.  Cells above this are considered
+    # "covered"; cells below are pushed up.  Set near the expected operating
+    # sir_median so ~50 % of cells lie in the active gradient zone.
+    sir_threshold_db: float = 5.0
+    # Sigmoid steepness (dB⁻¹).  Lower values widen the active gradient band,
+    # making the loss behave more like log-SIR.  Higher values sharpen the
+    # threshold but shrink the zone of informative gradient.
+    sigmoid_k: float = 0.2
 
-    # --- Coarse azimuth warm-start ----------------------------------------
-    # When coarse_az_steps > 0, a greedy azimuth sweep is run once before any
-    # baseline.  Each TX's azimuth is swept over ``coarse_az_steps`` uniformly
-    # spaced points using cheap RadioMapSolver evaluations; the best per-TX
-    # azimuth becomes the shared starting point for ALL methods.
+    # --- Early stopping ---------------------------------------------------
+    # Shared threshold — all iterative methods stop when improvement < this.
+    # With the sigmoid loss bounded in [-1, 0], 1e-2 represents a 1 % change
+    # across the full loss range — a defensible stopping point.  Also used as
+    # the ReduceLROnPlateau threshold, so the LR schedule tightens consistently.
+    early_stop_min_improvement: float = 1e-3
+
+    # Gradient / RadioMap: oscillation window.  These methods can oscillate
+    # around a local minimum, so a wider window (10) is needed before declaring
+    # convergence.  Additionally requires >= early_stop_min_flips sign-flips in
+    # the delta sequence to distinguish oscillation from slow monotone descent.
+    early_stop_window: int = 10
+    early_stop_min_flips: int = 5
+
+    # PSO: stagnation window.  PSO tracks a monotone global-best, so a shorter
+    # window (5) is sufficient and semantically equivalent to coordinate
+    # descent's per-cycle no-improvement check — both ask "has anything improved
+    # in one representative unit of work?"
+    pso_early_stop_window: int = 5
+
+    # --- Coarse warm-start ------------------------------------------------
+    # When coarse_xy_steps > 0, a greedy XY sweep is run before any baseline.
+    # Each TX's position is swept over a ``coarse_xy_steps × coarse_xy_steps``
+    # grid of interior points on its building rooftop polygon; at each
+    # candidate the boresight is aimed geometrically toward the zone centroid.
+    # The best position becomes the shared starting point for ALL methods.
     # Gradient-free methods (PSO, random search) have the warm-start seeded
     # into their initial populations; all others start from it directly.
-    # Set to 0 to disable (default — preserves old behaviour).
-    # Recommended: 24 (15° spacing, full 360° coverage).
-    coarse_az_steps: int = 0
+    # Set to 0 to disable (default).
+    # Recommended: 5 (up to 25 candidates per TX, filtered to polygon interior).
+    coarse_xy_steps: int = 0
     coarse_samples_per_tx: int = int(1e7)   # samples per RadioMapSolver call in sweep
 
     # --- Output / reproducibility -----------------------------------------
@@ -188,6 +215,8 @@ def _grad_kwargs(cfg: ExperimentConfig, tx_cfgs, scene, map_cfg, xml,
         early_stop_window=cfg.early_stop_window,
         early_stop_min_improvement=cfg.early_stop_min_improvement,
         early_stop_min_flips=cfg.early_stop_min_flips,
+        sir_threshold_db=cfg.sir_threshold_db,
+        sigmoid_k=cfg.sigmoid_k,
     )
 
 
@@ -225,6 +254,8 @@ _BASELINE_REGISTRY: dict[str, tuple[Callable, Callable]] = {
             lds=c.rs_lds,
             seed=c.rs_seed,
             verbose=c.verbose,
+            sir_threshold_db=c.sir_threshold_db,
+            sigmoid_k=c.sigmoid_k,
         ),
     ),
 
@@ -239,8 +270,10 @@ _BASELINE_REGISTRY: dict[str, tuple[Callable, Callable]] = {
             lds=c.pso_lds,
             seed=c.pso_seed,
             verbose=c.verbose,
-            early_stop_window=c.early_stop_window,
+            early_stop_window=c.pso_early_stop_window,
             early_stop_min_improvement=c.early_stop_min_improvement,
+            sir_threshold_db=c.sir_threshold_db,
+            sigmoid_k=c.sigmoid_k,
         ),
     ),
 
@@ -254,6 +287,8 @@ _BASELINE_REGISTRY: dict[str, tuple[Callable, Callable]] = {
             lds=c.cd_lds,
             verbose=c.verbose,
             early_stop_min_improvement=c.early_stop_min_improvement,
+            sir_threshold_db=c.sir_threshold_db,
+            sigmoid_k=c.sigmoid_k,
         ),
     ),
 
@@ -266,6 +301,8 @@ _BASELINE_REGISTRY: dict[str, tuple[Callable, Callable]] = {
             noise_power=c.noise_power,
             lds=c.uma_lds,
             verbose=c.verbose,
+            sir_threshold_db=c.sir_threshold_db,
+            sigmoid_k=c.sigmoid_k,
         ),
     ),
 
@@ -299,16 +336,16 @@ _BASELINE_LABELS: dict[str, str] = {
     "uma_naive":              "UMa Naive (3GPP)",
 }
 
-# Fixed color palette (color-blind friendly, print-safe)
+# Color palette — Option 1a vibrant scheme
 _BASELINE_COLORS: dict[str, str] = {
-    "grad_full_rejection":    "#1f77b4",
-    "grad_full_triangulated": "#ff7f0e",
-    "grad_proportional":      "#2ca02c",
-    "radiomap_gradient":      "#e377c2",
-    "random_search":          "#d62728",
-    "pso":                    "#9467bd",
-    "coordinate_descent":     "#8c564b",
-    "uma_naive":              "#7f7f7f",
+    "grad_full_rejection":    "#84BCE1",   # steel blue
+    "grad_full_triangulated": "#80C080",   # medium green
+    "grad_proportional":      "#E68A88",   # warm salmon  ← hero method
+    "radiomap_gradient":      "#F6BE80",   # amber orange
+    "random_search":          "#FAD7A8",   # light peach
+    "pso":                    "#AF93C3",   # soft purple
+    "coordinate_descent":     "#CFE5B9",   # sage green
+    "uma_naive":              "#C5DBE9",   # pale sky blue
 }
 
 # Fixed line-style cycle for greyscale legibility
@@ -503,24 +540,32 @@ def run_experiment_suite(
             f"Valid IDs: {valid}"
         )
 
-    # --- Optional coarse azimuth warm-start (runs before capturing angles) --
-    sweep_log = None
-    if exp_config.coarse_az_steps > 0:
-        sweep_result = coarse_az_sweep(
+    # --- Optional coarse XY warm-start (runs before capturing angles) --------
+    xy_sweep_log = None
+
+    if exp_config.coarse_xy_steps > 0:
+        xy_result = coarse_xy_sweep(
             scene, tx_configs, map_config, scene_xml_path,
-            n_az_steps=exp_config.coarse_az_steps,
+            n_xy_steps=exp_config.coarse_xy_steps,
             samples_per_tx=exp_config.coarse_samples_per_tx,
             noise_power=exp_config.noise_power,
+            sir_threshold_db=exp_config.sir_threshold_db,
+            sigmoid_k=exp_config.sigmoid_k,
             verbose=exp_config.verbose,
         )
-        # Apply warm-start orientations to scene so _capture_initial_angles
-        # picks them up as the shared starting point for all baselines.
+        # Apply warm-start positions and zone-centroid orientations so
+        # _capture_initial_angles / _capture_initial_positions pick them up
+        # as the shared starting point for all baselines.
         for cfg in tx_configs:
-            best_az, best_el = sweep_result[cfg.name]
+            per_tx = xy_result["meta"]["per_tx"][cfg.name]
+            best_x, best_y = per_tx["best_x"], per_tx["best_y"]
+            best_az, best_el = per_tx["best_az"], per_tx["best_el"]
             yaw_r, pitch_r = azimuth_elevation_to_yaw_pitch(best_az, best_el)
             tx = scene.get(cfg.name)
+            z  = float(dr.detach(tx.position[2])[0])
+            tx.position    = mi.Point3f(float(best_x), float(best_y), z)
             tx.orientation = mi.Point3f(float(yaw_r), float(pitch_r), 0.0)
-        sweep_log = sweep_result
+        xy_sweep_log = xy_result
 
     # --- Capture initial scene state (once) --------------------------------
     initial_angles    = _capture_initial_angles(scene, tx_configs)
@@ -528,7 +573,7 @@ def run_experiment_suite(
 
     # Flat seed_params vector for gradient-free methods (PSO, random search)
     seed_params: Optional[np.ndarray] = None
-    if sweep_log is not None:
+    if xy_sweep_log is not None:
         seed_params = np.array(
             [v for cfg in tx_configs
              for v in [initial_angles[cfg.name][0],   # az
@@ -544,9 +589,12 @@ def run_experiment_suite(
               f"|  {len(tx_configs)} TX(s)")
         if exp_config.experiment_tag:
             print(f"Tag: {exp_config.experiment_tag}")
-        warm_label = (f"  [warm-start from coarse sweep, "
-                      f"{exp_config.coarse_az_steps} steps]"
-                      if sweep_log is not None else "")
+        _warm_parts = []
+        if xy_sweep_log is not None:
+            _warm_parts.append(
+                f"xy sweep {exp_config.coarse_xy_steps}×{exp_config.coarse_xy_steps} grid")
+        warm_label = (f"  [warm-start: {', '.join(_warm_parts)}]"
+                      if _warm_parts else "")
         print(f"Initial angles:{warm_label}")
         for name, (az, el) in initial_angles.items():
             pos = initial_positions[name]
@@ -563,7 +611,7 @@ def run_experiment_suite(
         "initial_angles": {n: list(a) for n, a in initial_angles.items()},
         "initial_positions": initial_positions,
         "exp_config":     asdict(exp_config),
-        "sweep_log":      sweep_log,
+        "xy_sweep_log":   xy_sweep_log,
     }
 
     # --- Run each baseline ------------------------------------------------
@@ -651,9 +699,6 @@ def run_experiment_suite(
 
     # --- Assemble output --------------------------------------------------
     suite_output = {"metadata": metadata, "results": results}
-    if sweep_log is not None:
-        suite_output["sweep_log"] = sweep_log
-
     if exp_config.output_path is not None:
         save_results(suite_output, exp_config.output_path,
                      strip_raw_arrays=exp_config.strip_raw_arrays)
@@ -936,6 +981,8 @@ def plot_loss_curves(
     suite_output: dict,
     ax=None,
     baselines: Optional[list] = None,
+    x_axis: str = "iteration",
+    normalize: bool = False,
 ) -> tuple:
     """Plot optimizer loss history (convergence curves) for gradient baselines.
 
@@ -948,6 +995,15 @@ def plot_loss_curves(
     ax : matplotlib.axes.Axes or None
     baselines : list[str] or None
         Subset to plot; all if ``None``.
+    x_axis : {"iteration", "wall_time"}
+        ``"iteration"`` (default) plots loss vs iteration index.
+        ``"wall_time"`` plots loss vs cumulative wall-clock seconds, using
+        ``joint.iter_time_history`` from each optimizer result.  Baselines
+        without timing data fall back to iteration index.
+    normalize : bool
+        If ``True``, each curve is min-max normalized to [0, 1] across its own
+        history before plotting, so baselines with very different loss scales
+        can be compared on the same axes.  The y-axis label updates accordingly.
 
     Returns
     -------
@@ -966,11 +1022,34 @@ def plot_loss_curves(
         opt_result = entry.get("optimizer_result")
         if not isinstance(opt_result, dict):
             continue
-        history = opt_result.get("joint", {}).get("loss_history", [])
+        joint = opt_result.get("joint", {})
+        history = joint.get("loss_history", [])
         if len(history) <= 1:
             continue
+
+        ys = np.array(history, dtype=float)
+        if normalize:
+            lo, hi = ys.min(), ys.max()
+            if hi > lo:
+                ys = (ys - lo) / (hi - lo)
+            else:
+                ys = np.zeros_like(ys)
+
+        if x_axis == "wall_time":
+            iter_times = joint.get("iter_time_history", [])
+            if len(iter_times) == len(history):
+                xs = list(np.cumsum(iter_times))
+            elif len(iter_times) == len(history) - 1:
+                # loss_history has a pre-seeded initial entry (t=0); iter_times
+                # only covers subsequent iterations — prepend 0 before cumsum.
+                xs = list(np.cumsum([0.0] + list(iter_times)))
+            else:
+                xs = list(range(1, len(history) + 1))
+        else:
+            xs = list(range(1, len(history) + 1))
+
         ax.plot(
-            range(1, len(history) + 1), history,
+            xs, ys,
             label=_BASELINE_LABELS.get(bid, bid),
             color=_BASELINE_COLORS.get(bid, None),
             linestyle=_BASELINE_LINESTYLES.get(bid, "-"),
@@ -983,8 +1062,8 @@ def plot_loss_curves(
                 ha="center", va="center", transform=ax.transAxes, fontsize=9,
                 color="grey")
 
-    ax.set_xlabel("Iteration")
-    ax.set_ylabel("SIR Loss")
+    ax.set_xlabel("Wall time (s)" if x_axis == "wall_time" else "Iteration")
+    ax.set_ylabel("Normalized SIR Loss" if normalize else "SIR Loss")
     ax.grid(True, alpha=0.3)
     if plotted > 0:
         ax.legend(fontsize=7)
@@ -1059,6 +1138,486 @@ def plot_metric_bars(
     ax.legend(fontsize=7, loc="upper right")
 
     return fig, ax
+
+
+# ---------------------------------------------------------------------------
+# Metric labels shared across new plot helpers
+# ---------------------------------------------------------------------------
+
+_METRIC_DISPLAY: dict[str, str] = {
+    "rsrp_mean_dbm":     "RSRP Mean (dBm)",
+    "rsrp_p10_dbm":      "RSRP P10 (dBm)",
+    "rsrp_p90_dbm":      "RSRP P90 (dBm)",
+    "rsrp_median_dbm":   "RSRP Median (dBm)",
+    "sir_mean_db":       "SIR Mean (dB)",
+    "sir_median_db":     "SIR Median (dB)",
+    "sir_p10_db":        "SIR P10 (dB)",
+    "sir_p90_db":        "SIR P90 (dB)",
+    "coverage_fraction": "Coverage Fraction",
+}
+
+_BASELINE_SHORT: dict[str, str] = {
+    "grad_full_rejection":    "Grad-Rejection",
+    "grad_full_triangulated": "Grad-Triangulated",
+    "grad_proportional":      "Grad-Proportional",
+    "radiomap_gradient":      "RadioMap-Grad",
+    "random_search":          "Random Search",
+    "pso":                    "PSO",
+    "coordinate_descent":     "Coord. Descent",
+    "uma_naive":              "UMa Naive",
+}
+
+
+def plot_per_metric_panels(
+    suite_output: dict,
+    metrics: tuple = (
+        "rsrp_mean_dbm", "rsrp_p10_dbm",
+        "sir_median_db", "sir_p10_db",
+    ),
+    config_type: str = "optimized",
+    show_initial_marker: bool = True,
+) -> tuple:
+    """Comprehensive per-metric comparison across all TX zones.
+
+    Layout: rows = metrics, cols = individual TX zones + "All TXs" aggregate.
+    Each cell is a horizontal bar chart — one bar per baseline — so baselines
+    are visually separated from each other and from the metric axis labels.
+    The legend is placed outside the grid (right of the figure) rather than
+    inside any axes panel, preventing overlap with data.
+
+    Parameters
+    ----------
+    suite_output : dict
+        Return value of ``run_experiment_suite``.
+    metrics : tuple[str]
+        Metrics to plot (rows).  Defaults to four key RF metrics.
+    config_type : str
+        ``"optimized"`` (default) or ``"initial"``.
+    show_initial_marker : bool
+        If ``True``, overlays a thin vertical line for the initial (pre-opt)
+        value of each metric so the improvement magnitude is visible.
+
+    Returns
+    -------
+    (fig, axes)  — axes shape is (n_metrics, n_cols).
+    """
+    tx_names = suite_output["metadata"]["tx_names"]
+    col_names = list(tx_names) + ["All TXs"]
+    n_metrics      = len(metrics)
+    n_data_cols    = len(col_names)          # TX cols + "All TXs"
+    n_display_cols = n_data_cols + 1         # +1 for the Wins tally column
+
+    baselines_present = list(suite_output["results"].keys())
+    n_baselines       = len(baselines_present)
+    bar_h             = 0.65
+
+    # Wins column is narrower than data columns
+    width_ratios = [1.0] * n_data_cols + [0.55]
+    fig, axes = plt.subplots(
+        n_metrics, n_display_cols,
+        figsize=(3.8 * n_data_cols + 2.2, 2.2 * n_metrics),
+        gridspec_kw={"width_ratios": width_ratios},
+        squeeze=False,
+    )
+
+    def _get_scalar(baseline_id, tx, ctype, metric):
+        try:
+            cstats = suite_output["results"][baseline_id]["comparison_stats"]
+            if tx == "All TXs":
+                vals = [float(cstats[t][ctype][metric]) for t in tx_names
+                        if t in cstats and ctype in cstats[t]
+                        and metric in cstats[t][ctype]]
+                return float(np.mean(vals)) if vals else float("nan")
+            return float(cstats[tx][ctype][metric])
+        except (KeyError, TypeError, ValueError):
+            return float("nan")
+
+    # wins_per_metric[metric][bid] = # columns where bid was best for that metric
+    wins_per_metric = {m: {bid: 0 for bid in baselines_present} for m in metrics}
+
+    for row_i, metric in enumerate(metrics):
+        for col_i, tx_label in enumerate(col_names):
+            ax = axes[row_i][col_i]
+
+            values   = []
+            colors   = []
+            labels   = []
+            initials = []
+
+            for bid in baselines_present:
+                val = _get_scalar(bid, tx_label, config_type, metric)
+                values.append(val)
+                colors.append(_BASELINE_COLORS.get(bid, "#999999"))
+                labels.append(_BASELINE_SHORT.get(bid, bid))
+
+                if show_initial_marker:
+                    initials.append(_get_scalar(bid, tx_label, "initial", metric))
+
+            # Identify winner for this panel (highest = best for all dB metrics)
+            valid_pairs = [(i, v) for i, v in enumerate(values) if not np.isnan(v)]
+            best_idx = max(valid_pairs, key=lambda p: p[1])[0] if valid_pairs else None
+            if best_idx is not None:
+                wins_per_metric[metric][baselines_present[best_idx]] += 1
+
+            y_pos = np.arange(n_baselines)
+            bars = ax.barh(
+                y_pos, values,
+                height=bar_h,
+                color=colors,
+                edgecolor="white",
+                linewidth=0.6,
+            )
+
+            # Highlight best bar: gold outline + star annotation
+            if best_idx is not None:
+                bars[best_idx].set_edgecolor("#FFD700")
+                bars[best_idx].set_linewidth(2.2)
+                best_val = values[best_idx]
+                ax.annotate(
+                    "★",
+                    xy=(best_val, best_idx),
+                    xytext=(4, 0),
+                    textcoords="offset points",
+                    fontsize=8, color="#B8860B",
+                    va="center", ha="left",
+                    fontweight="bold",
+                    annotation_clip=False,
+                )
+
+            if show_initial_marker and any(not np.isnan(v) for v in initials):
+                for yi, iv in zip(y_pos, initials):
+                    if not np.isnan(iv):
+                        ax.vlines(iv, yi - bar_h / 2, yi + bar_h / 2,
+                                  colors="#333333", linewidth=1.2,
+                                  linestyles="--", alpha=0.6)
+
+            ax.set_yticks(y_pos)
+            if col_i == 0:
+                ax.set_yticklabels(labels, fontsize=7.5)
+            else:
+                ax.set_yticklabels([""] * n_baselines)
+
+            ax.invert_yaxis()
+            ax.grid(True, axis="x", alpha=0.25, linewidth=0.6)
+            ax.spines[["top", "right"]].set_visible(False)
+
+            if row_i == 0:
+                ax.set_title(tx_label, fontsize=9, fontweight="bold", pad=6)
+
+            if col_i == n_data_cols - 1:
+                ax.set_xlabel(
+                    _METRIC_DISPLAY.get(metric, metric),
+                    fontsize=8, labelpad=4,
+                )
+            else:
+                ax.tick_params(axis="x", labelsize=7)
+
+        # ── Wins tally column (rightmost) ────────────────────────────────────
+        ax_w = axes[row_i][n_data_cols]
+        win_vals   = [wins_per_metric[metric][bid] for bid in baselines_present]
+        win_colors = [_BASELINE_COLORS.get(bid, "#999999") for bid in baselines_present]
+        y_pos      = np.arange(n_baselines)
+
+        win_bars = ax_w.barh(
+            y_pos, win_vals,
+            height=bar_h,
+            color=win_colors,
+            edgecolor="white",
+            linewidth=0.6,
+        )
+        # Gold outline on the overall winner in this metric
+        if win_vals:
+            top_win_idx = int(np.argmax(win_vals))
+            if win_vals[top_win_idx] > 0:
+                win_bars[top_win_idx].set_edgecolor("#FFD700")
+                win_bars[top_win_idx].set_linewidth(2.2)
+
+        ax_w.set_yticks(y_pos)
+        ax_w.set_yticklabels([""] * n_baselines)
+        ax_w.set_xlim(0, n_data_cols + 0.5)
+        ax_w.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
+        ax_w.invert_yaxis()
+        ax_w.grid(True, axis="x", alpha=0.25, linewidth=0.6)
+        ax_w.spines[["top", "right"]].set_visible(False)
+        ax_w.tick_params(axis="x", labelsize=7)
+
+        if row_i == 0:
+            ax_w.set_title("Wins", fontsize=9, fontweight="bold", pad=6)
+        ax_w.set_xlabel(f"/ {n_data_cols}", fontsize=7, labelpad=4)
+
+    # ── shared figure-level legend ───────────────────────────────────────────
+    import matplotlib.lines as mlines
+    import matplotlib.patches as mpatches
+
+    legend_handles = []
+    if show_initial_marker:
+        legend_handles.append(
+            mlines.Line2D([], [], color="#333333", linestyle="--", linewidth=1.2,
+                          label="Initial (pre-opt)")
+        )
+    legend_handles.append(
+        mpatches.Patch(facecolor="none", edgecolor="#FFD700", linewidth=2.0,
+                       label="★ Best in column")
+    )
+
+    fig.legend(
+        handles=legend_handles,
+        loc="lower center",
+        ncol=len(legend_handles),
+        fontsize=8,
+        framealpha=0.9,
+        bbox_to_anchor=(0.5, -0.03),
+    )
+
+    fig.tight_layout(rect=[0, 0.04, 1, 1])
+    return fig, axes
+
+
+def plot_final_configurations(suite_output: dict) -> tuple:
+    """Scatter plots of final TX position and boresight for each baseline.
+
+    Layout: 2 rows × n_tx columns.
+
+    - Row 0: Top-down XY position (metres).  Each baseline is a coloured dot;
+             the initial config is a gray diamond.
+    - Row 1: Boresight angle space — Azimuth (x) vs Elevation (y) in degrees.
+             Same marker convention.
+
+    Each dot carries a short inline tag so the reader can identify solvers
+    without hunting through the legend.
+
+    Returns
+    -------
+    (fig, axes) — axes shape is (2, n_tx).
+    """
+    tx_names          = suite_output["metadata"]["tx_names"]
+    baselines_present = list(suite_output["results"].keys())
+    n_tx              = len(tx_names)
+
+    # Short tags used as inline dot labels
+    _TAGS: dict[str, str] = {
+        "grad_full_rejection":    "GRej",
+        "grad_full_triangulated": "GTri",
+        "grad_proportional":      "GProp",
+        "random_search":          "RS",
+        "pso":                    "PSO",
+        "coordinate_descent":     "CD",
+        "uma_naive":              "UMa",
+    }
+
+    fig, axes = plt.subplots(
+        2, n_tx,
+        figsize=(4.2 * n_tx, 7.0),
+        squeeze=False,
+    )
+
+    def _td(bid, tx):
+        return (suite_output["results"]
+                .get(bid, {})
+                .get("optimizer_result", {})
+                .get(tx, {}))
+
+    for col_i, tx in enumerate(tx_names):
+        ax_pos = axes[0][col_i]
+        ax_ang = axes[1][col_i]
+
+        # Initial config (shared across baselines — read from first entry)
+        init   = _td(baselines_present[0], tx)
+        i_pos  = init.get("initial_position", [None, None, None])
+        i_az, i_el = (init.get("initial_angles") or [None, None])
+
+        # ── per-baseline dots ────────────────────────────────────────────
+        for bid in baselines_present:
+            td     = _td(bid, tx)
+            pos    = td.get("final_position",  [None, None, None])
+            angles = td.get("best_angles") or  [None, None]
+            az, el = angles[0], angles[1]
+            color  = _BASELINE_COLORS.get(bid, "#999999")
+            tag    = _TAGS.get(bid, bid[:5])
+
+            if None not in (pos[0], pos[1]):
+                ax_pos.scatter(pos[0], pos[1], color=color, s=90, zorder=5,
+                               edgecolors="white", linewidths=0.8)
+                ax_pos.annotate(tag, xy=(pos[0], pos[1]),
+                                xytext=(5, 4), textcoords="offset points",
+                                fontsize=6.5, color=color, zorder=6,
+                                annotation_clip=False)
+
+            if None not in (az, el):
+                ax_ang.scatter(az, el, color=color, s=90, zorder=5,
+                               edgecolors="white", linewidths=0.8)
+                ax_ang.annotate(tag, xy=(az, el),
+                                xytext=(5, 4), textcoords="offset points",
+                                fontsize=6.5, color=color, zorder=6,
+                                annotation_clip=False)
+
+        # ── initial config marker ────────────────────────────────────────
+        if None not in (i_pos[0], i_pos[1]):
+            ax_pos.scatter(i_pos[0], i_pos[1], color="#555555", marker="D",
+                           s=65, zorder=4, edgecolors="white", linewidths=0.8)
+            ax_pos.annotate("Init", xy=(i_pos[0], i_pos[1]),
+                            xytext=(5, 4), textcoords="offset points",
+                            fontsize=6.5, color="#555555", zorder=6,
+                            annotation_clip=False)
+
+        if None not in (i_az, i_el):
+            ax_ang.scatter(i_az, i_el, color="#555555", marker="D",
+                           s=65, zorder=4, edgecolors="white", linewidths=0.8)
+            ax_ang.annotate("Init", xy=(i_az, i_el),
+                            xytext=(5, 4), textcoords="offset points",
+                            fontsize=6.5, color="#555555", zorder=6,
+                            annotation_clip=False)
+
+        # ── formatting ───────────────────────────────────────────────────
+        ax_pos.set_aspect("equal", adjustable="datalim")
+        ax_pos.margins(0.28)
+        ax_pos.set_title(tx, fontsize=10, fontweight="bold", pad=6)
+        ax_pos.set_xlabel("X (m)", fontsize=8)
+        ax_pos.set_ylabel("Y (m)" if col_i == 0 else "", fontsize=8)
+
+        ax_ang.margins(0.28)
+        ax_ang.set_xlabel("Azimuth (°)", fontsize=8)
+        ax_ang.set_ylabel("Elevation (°)" if col_i == 0 else "", fontsize=8)
+
+        for ax in (ax_pos, ax_ang):
+            ax.grid(True, alpha=0.2, linewidth=0.6)
+            ax.spines[["top", "right"]].set_visible(False)
+            ax.tick_params(labelsize=7.5)
+
+    # ── figure-level legend ───────────────────────────────────────────────
+    handles = [
+        plt.scatter([], [], color=_BASELINE_COLORS.get(bid, "#999999"), s=65,
+                    edgecolors="white", linewidths=0.8,
+                    label=_BASELINE_SHORT.get(bid, bid))
+        for bid in baselines_present
+    ]
+    handles.append(
+        plt.scatter([], [], color="#555555", marker="D", s=55,
+                    edgecolors="white", linewidths=0.8, label="Initial")
+    )
+    fig.legend(handles=handles, loc="lower center",
+               ncol=len(handles), fontsize=8, framealpha=0.9,
+               bbox_to_anchor=(0.5, -0.02))
+
+    fig.suptitle("Final TX Configurations — Position & Boresight",
+                 fontsize=11, fontweight="bold")
+    fig.tight_layout(rect=[0, 0.06, 1, 0.97])
+    return fig, axes
+
+
+def plot_efficiency_frontier(
+    suite_output: dict,
+    metrics: tuple = ("sir_median_db", "rsrp_median_dbm"),
+    config_type: str = "optimized",
+    log_time: bool = True,
+) -> tuple:
+    """Quality-vs-time scatter plot — the efficiency frontier.
+
+    Plots final optimized metric value (y) against total elapsed wall time (x)
+    for every baseline, making it easy to see which methods achieve the best
+    result for the time they consume.
+
+    Each point is annotated with a short baseline label.  A horizontal dashed
+    line marks the best achieved value so the gap to the frontier is visible.
+
+    Parameters
+    ----------
+    suite_output : dict
+        Return value of ``run_experiment_suite``.
+    metrics : tuple[str]
+        One subplot per metric.  Defaults to SIR median and RSRP mean.
+    config_type : str
+        ``"optimized"`` (default) or ``"initial"``.
+    log_time : bool
+        Use a log scale on the time axis (recommended when methods span orders
+        of magnitude in elapsed time, e.g. 4 s UMa vs 600 s coord-descent).
+
+    Returns
+    -------
+    (fig, axes)  — axes shape is (1, n_metrics).
+    """
+    tx_names          = suite_output["metadata"]["tx_names"]
+    baselines_present = list(suite_output["results"].keys())
+
+    n_metrics = len(metrics)
+    fig, axes = plt.subplots(
+        1, n_metrics,
+        figsize=(5.5 * n_metrics, 4.5),
+        squeeze=False,
+    )
+
+    for col_i, metric in enumerate(metrics):
+        ax = axes[0][col_i]
+
+        xs, ys, colors, short_labels = [], [], [], []
+
+        for bid in baselines_present:
+            entry = suite_output["results"].get(bid, {})
+            elapsed = entry.get("elapsed_s", float("nan"))
+            if np.isnan(elapsed):
+                continue
+
+            # Average metric across all TX zones
+            try:
+                cstats = entry["comparison_stats"]
+                vals   = [float(cstats[t][config_type][metric])
+                          for t in tx_names
+                          if t in cstats
+                          and config_type in cstats[t]
+                          and metric in cstats[t][config_type]]
+                metric_val = float(np.mean(vals)) if vals else float("nan")
+            except (KeyError, TypeError):
+                metric_val = float("nan")
+
+            if np.isnan(metric_val):
+                continue
+
+            xs.append(elapsed)
+            ys.append(metric_val)
+            colors.append(_BASELINE_COLORS.get(bid, "#999999"))
+            short_labels.append(_BASELINE_SHORT.get(bid, bid))
+
+        xs = np.array(xs)
+        ys = np.array(ys)
+
+        ax.scatter(xs, ys, c=colors, s=90, zorder=3,
+                   edgecolors="#444444", linewidths=0.7)
+
+        # Annotate each point with short baseline name
+        for xi, yi, lbl, c in zip(xs, ys, short_labels, colors):
+            ax.annotate(
+                lbl, xy=(xi, yi),
+                xytext=(0, 9), textcoords="offset points",
+                ha="center", va="bottom", fontsize=7.5,
+                color="#222222",
+            )
+
+        # Best-value dashed reference line
+        if len(ys):
+            best_y = np.nanmax(ys)
+            ax.axhline(best_y, color="#888888", linewidth=0.9,
+                       linestyle="--", alpha=0.7, zorder=1)
+            ax.annotate(
+                f"best: {best_y:.2f}",
+                xy=(ax.get_xlim()[0] if not log_time else xs.min() * 0.8, best_y),
+                xytext=(4, 4), textcoords="offset points",
+                fontsize=7, color="#666666", va="bottom",
+            )
+
+        if log_time:
+            ax.set_xscale("log")
+
+        ax.set_xlabel("Elapsed time (s)", fontsize=9)
+        ax.set_ylabel(_METRIC_DISPLAY.get(metric, metric), fontsize=9)
+        ax.set_title(
+            f"Efficiency Frontier — {_METRIC_DISPLAY.get(metric, metric)}",
+            fontsize=10, fontweight="bold",
+        )
+        ax.grid(True, alpha=0.25, linewidth=0.6)
+        ax.spines[["top", "right"]].set_visible(False)
+
+    fig.tight_layout()
+    return fig, axes
 
 
 def plot_zone_overview(

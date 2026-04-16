@@ -40,14 +40,13 @@ from angle_utils import (
     azimuth_elevation_to_yaw_pitch,
     compute_initial_angles_from_position,
 )
-from boresight_pathsolver import filter_and_append, sample_grid_points
+from boresight_pathsolver import sample_grid_points
 from triangulate import (
     get_zone_polygon_with_exclusions,
     triangulate_zone,
+    sample_triangulated_zone,
     prepare_triangulated_sampler,
     sample_from_prepared,
-    sample_triangulated_zone,
-    sample_dead_zones,
     visualize_triangulation
 )
 from tx_placement import TxPlacement
@@ -356,6 +355,17 @@ def _sample_zone_points(state: dict, cfg: TxConfig, n: int,
         raise ValueError(f"Unknown sampling_strata: {sampling_strata!r}")
 
 
+def _filter_and_append(rx_data, dead_zone, tail_percentile=20.0):
+    """Isolate the worst tail_percentile% of in-zone cells into dead_zone."""
+    valid = np.isfinite(rx_data[:, 2])
+    rx_data = rx_data[valid]
+    if len(rx_data) == 0:
+        return dead_zone
+    threshold   = np.percentile(rx_data[:, 2], tail_percentile)
+    dead_points = rx_data[rx_data[:, 2] <= threshold]
+    return dead_points if dead_zone.size == 0 else np.append(dead_zone, dead_points, axis=0)
+
+
 def _accumulate_dead_zones(
     state, cfg, tx_idx, rm,
     map_config, dead_tail_percentile, max_dbscan_points,
@@ -403,7 +413,7 @@ def _accumulate_dead_zones(
     
     # Fill rx_data 
     rx_data  = np.column_stack([pos_x_z, pos_y_z, power_z])
-    dead_pts = filter_and_append(rx_data, state["dead_points"], dead_tail_percentile)
+    dead_pts = _filter_and_append(rx_data, state["dead_points"], dead_tail_percentile)
 
     if debug_viz:
         import matplotlib.pyplot as _plt
@@ -618,6 +628,8 @@ def _sir_loss_body(
     all_params, N, tx_configs, tx_states, scene, p_solver,
     map_config, noise_power, sampler, sampling_strata, rx_objects,
     ref_powers_dbm, epsilon=1,
+    sir_threshold_db=-3.0,
+    sigmoid_k=0.5,
 ):
     """Core SIR loss (executes inside the @dr.wrap DrJit context).
 
@@ -697,7 +709,7 @@ def _sir_loss_body(
         los=True,
         refraction=False,
         specular_reflection=True,
-        diffuse_reflection=True,
+        diffuse_reflection=False,
     )
     h_real, h_imag = paths.a
     # h_real shape: (total_rx, N, max_paths, rx_ant, tx_ant) - DrJit TensorXf
@@ -718,6 +730,18 @@ def _sir_loss_body(
     noise_f = Float(float(noise_power)); dr.disable_grad(noise_f)
     total_loss = Float(0.0);  dr.disable_grad(total_loss)
 
+    # Zone-area weights — proportional to geographic area so that large zones
+    # are not drowned out by small ones when sample counts are equal per zone.
+    zone_areas   = [state_i["zone_polygon"].area for state_i in tx_states]
+    total_area   = sum(zone_areas) or 1.0
+    area_weights = [a / total_area for a in zone_areas]  # plain Python floats
+
+    # Pre-compute sigmoid constants outside the loop (no grad)
+    log10_scale = Float(float(10.0 / np.log(10.0)))  # converts ln → dB
+    dr.disable_grad(log10_scale)
+    thresh_f = Float(float(sir_threshold_db)); dr.disable_grad(thresh_f)
+    k_f      = Float(float(sigmoid_k));        dr.disable_grad(k_f)
+
     for i, (cfg, state_i) in enumerate(zip(tx_configs, tx_states)):
         sl    = state_i["rx_slice"]
 
@@ -733,12 +757,19 @@ def _sir_loss_body(
             p_int = p_int_j if p_int is None else (p_int + p_int_j)
 
         if p_int is None:
-            # N == 1: no interference — optimise raw log-power
             metric = p_sig / noise_f
         else:
             metric = p_sig / (p_int + noise_f)
 
-        loss_i = -dr.mean(dr.log2(metric + eps_f))
+        # Soft coverage indicator: sigmoid centred at the SIR threshold (dB).
+        # Saturates near 1 for well-covered points, near 0 for uncovered ones,
+        # producing gradients that push uncovered points past the threshold.
+        sir_db   = log10_scale * dr.log(metric + eps_f)
+        soft_cov = Float(1.0) / (Float(1.0) + dr.exp(-k_f * (sir_db - thresh_f)))
+
+        # Area-weighted mean — weight is a plain Python float, no AD entanglement
+        w_i    = Float(float(area_weights[i])); dr.disable_grad(w_i)
+        loss_i = -w_i * dr.mean(soft_cov)
         total_loss = total_loss + loss_i
 
     return total_loss, paths
@@ -748,6 +779,7 @@ def _make_compute_sir_loss(
     N, tx_configs, tx_states, scene, p_solver,
     map_config, noise_power, sampler, sampling_strata,
     rx_objects, ref_powers_dbm,
+    sir_threshold_db=-3.0, sigmoid_k=0.5,
 ):
     """Build and return the @dr.wrap-decorated SIR loss function.
 
@@ -770,22 +802,25 @@ def _make_compute_sir_loss(
     func_code = (
         f"def _inner({arg_str}):\n"
         f"    return _body({list_str}, _N, _cfgs, _states, _scene, _psolver,\n"
-        f"                 _mcfg, _noise, _sampler, _strata, _rxobj, _refpow)\n"
+        f"                 _mcfg, _noise, _sampler, _strata, _rxobj, _refpow,\n"
+        f"                 sir_threshold_db=_thresh_db, sigmoid_k=_sigmoid_k)\n"
     )
 
     globs = {
-        "_body":    _sir_loss_body,
-        "_N":       N,
-        "_cfgs":    tx_configs,
-        "_states":  tx_states,
-        "_scene":   scene,
-        "_psolver": p_solver,
-        "_mcfg":    map_config,
-        "_noise":   noise_power,
-        "_sampler": sampler,
-        "_strata":  sampling_strata,
-        "_rxobj":   rx_objects,
-        "_refpow":  ref_powers_dbm,
+        "_body":       _sir_loss_body,
+        "_N":          N,
+        "_cfgs":       tx_configs,
+        "_states":     tx_states,
+        "_scene":      scene,
+        "_psolver":    p_solver,
+        "_mcfg":       map_config,
+        "_noise":      noise_power,
+        "_sampler":    sampler,
+        "_strata":     sampling_strata,
+        "_rxobj":      rx_objects,
+        "_refpow":     ref_powers_dbm,
+        "_thresh_db":  sir_threshold_db,
+        "_sigmoid_k":  sigmoid_k,
     }
     exec(func_code, globs)
     inner_fn = globs["_inner"]
@@ -815,6 +850,8 @@ def optimize_multi_tx(
     early_stop_window: int = 10,
     early_stop_min_improvement: float = 1e-3,
     early_stop_min_flips: int = 4,
+    sir_threshold_db: float = -3.0,
+    sigmoid_k: float = 0.5,
 ) -> dict:
     """Jointly optimise N transmitters for SIR coverage.
 
@@ -830,9 +867,13 @@ def optimize_multi_tx(
     scene_xml_path : str
         Path to scene.xml (for building extraction).
     learning_rate : float
-        Adam learning rate.
+        Adam initial learning rate.  ``ReduceLROnPlateau`` will automatically
+        halve it whenever the loss plateaus for ``patience`` consecutive
+        iterations, so this value only needs to be "big enough to make initial
+        progress" rather than precisely tuned for convergence.
     num_iterations : int
-        Optimisation iterations.
+        Optimisation budget (upper bound).  The LR scheduler and early-stop
+        criteria terminate the run before this limit when the loss converges.
     noise_power : float
         Thermal noise floor (Watts) added to interference in SIR denominator.
     dead_tail_percentile : float
@@ -940,6 +981,8 @@ def optimize_multi_tx(
         N, tx_configs, tx_states, scene, p_solver,
         map_config, noise_power, sampler, sampling_strata,
         rx_objects, ref_powers_dbm,
+        sir_threshold_db=sir_threshold_db,
+        sigmoid_k=sigmoid_k,
     )
 
     # ------------------------------------------------------------------
@@ -961,18 +1004,38 @@ def optimize_multi_tx(
                                        dtype=torch.float32, requires_grad=True))
 
     optimizer = torch.optim.Adam(params, lr=learning_rate, betas=(0.9, 0.999))
-    #optimizer = torch.optim.SGD(params, lr=learning_rate, momentum=0.25)
+
+    # ReduceLROnPlateau — halves the LR whenever loss hasn't improved by more
+    # than early_stop_min_improvement (abs) for 3 consecutive iterations.
+    # This removes the need to tune learning_rate per scene: the starting value
+    # just needs to be "big enough"; the scheduler does the rest automatically.
+    # threshold_mode='abs' keeps the plateau check in loss units regardless of
+    # the current loss magnitude (avoids the relative-mode scaling issue near 0).
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode='min',
+        factor=0.5,
+        patience=3,
+        min_lr=learning_rate * 0.01,
+        threshold=early_stop_min_improvement,
+        threshold_mode='abs',
+    )
 
     # ------------------------------------------------------------------
     # 6. Tracking
     # ------------------------------------------------------------------
     loss_history     = []
+    lr_history       = []
     iter_time_history = []
     converged_iter   = None
     rm_solver        = RadioMapSolver()
 
-    # Buffers for final averaging (last 10 iterations)
-    final_bufs = {i: {"az": [], "el": [], "pow": []} for i in range(N)}
+    # Best-seen (incumbent) tracking — report the parameter snapshot that
+    # achieved the lowest loss, not the final iterate.  Averaging or using
+    # the final iterate is sensitive to early-stop timing and post-convergence
+    # oscillation; incumbent tracking is robust to both.
+    best_loss_seen   = float("inf")
+    best_params_seen = [float(p.item()) for p in params]   # snapshot at t=0
 
     # ------------------------------------------------------------------
     # 7. Optimisation loop
@@ -1071,15 +1134,15 @@ def optimize_multi_tx(
                 pw_val = float(params[b + 4].item())
                 tx_states[i]["power_history"].append(pw_val)
 
-        # Accumulate final-window values (last 10 iters)
-        window_start = max(0, num_iterations - 10)
-        if iteration >= window_start:
-            for i, cfg in enumerate(tx_configs):
-                b = offsets[i]
-                final_bufs[i]["az"].append(float(params[b].item()))
-                final_bufs[i]["el"].append(float(params[b + 1].item()))
-                if cfg.optimize_power:
-                    final_bufs[i]["pow"].append(float(params[b + 4].item()))
+        # Update incumbent: snapshot full parameter vector at lowest loss seen
+        if loss_val < best_loss_seen:
+            best_loss_seen   = loss_val
+            best_params_seen = [float(p.item()) for p in params]
+
+        # Step LR scheduler — reduces LR by factor=0.5 when loss has not
+        # improved by more than threshold for patience=3 consecutive iterations
+        scheduler.step(loss_val)
+        lr_history.append(optimizer.param_groups[0]['lr'])
 
         # Expose current TX positions for visualisation callbacks
         for i, (cfg, state) in enumerate(zip(tx_configs, tx_states)):
@@ -1097,45 +1160,59 @@ def optimize_multi_tx(
         iter_time_history.append(dur)
 
         if verbose:
+            current_lr = optimizer.param_groups[0]['lr']
             print(f"  Iter {iteration+1:3d}/{num_iterations}  loss={loss_val:.4f}  "
-                  f"({dur:.1f}s)")
+                  f"lr={current_lr:.2e}  ({dur:.1f}s)")
 
-        # --- Oscillation-based early stopping ----------------------------
+        # --- Convergence check (two arms, either triggers early stop) ----
         if len(loss_history) >= early_stop_window:
-            recent  = loss_history[-early_stop_window:]
-            deltas  = [recent[k + 1] - recent[k] for k in range(len(recent) - 1)]
-            n_flips = sum(
+            recent     = loss_history[-early_stop_window:]
+            net_change = abs(recent[-1] - recent[0])
+            deltas     = [recent[k + 1] - recent[k] for k in range(len(recent) - 1)]
+            n_flips    = sum(
                 1 for k in range(len(deltas) - 1)
                 if deltas[k] * deltas[k + 1] < 0
             )
-            net_change = abs(recent[-1] - recent[0])
-            if n_flips >= early_stop_min_flips and net_change < early_stop_min_improvement:
+
+            # Arm 1: oscillation — Adam circling a local minimum
+            oscillating = (n_flips >= early_stop_min_flips
+                           and net_change < early_stop_min_improvement)
+            # Arm 2: monotone stagnation — cosine-annealed LR has flattened
+            # descent to the point of no meaningful progress (no sign-flip
+            # requirement, so this catches slow plateau as well as oscillation)
+            stagnating  = net_change < early_stop_min_improvement
+
+            if oscillating or stagnating:
+                reason = "oscillating" if oscillating else "stagnating"
                 converged_iter = iteration + 1
                 if verbose:
-                    print(f"  [early stop] oscillating at iter {converged_iter} "
+                    print(f"  [early stop] {reason} at iter {converged_iter} "
                           f"({n_flips} sign flips, net Δloss={net_change:.4f})")
                 break
 
     # ------------------------------------------------------------------
-    # 8. Finalise: reset scene to plain-float state; remove temp receivers
+    # 8. Finalise: reset scene to best-seen (incumbent) configuration.
+    #    We report the parameter snapshot that achieved the lowest loss,
+    #    not the final iterate.  This is robust to early-stop timing and
+    #    post-convergence oscillation, and matches what would be deployed.
     # ------------------------------------------------------------------
     for i, (cfg, state) in enumerate(zip(tx_configs, tx_states)):
-        b      = offsets[i]
-        best_az = float(np.mean(final_bufs[i]["az"])) if final_bufs[i]["az"] else float(params[b].item())
-        best_el = float(np.mean(final_bufs[i]["el"])) if final_bufs[i]["el"] else float(params[b + 1].item())
-        final_x = float(params[b + 2].item())
-        final_y = float(params[b + 3].item())
+        b       = offsets[i]
+        best_az = best_params_seen[b]
+        best_el = best_params_seen[b + 1]
+        best_x  = best_params_seen[b + 2]
+        best_y  = best_params_seen[b + 3]
 
         yaw_r, pitch_r = azimuth_elevation_to_yaw_pitch(best_az, best_el)
         scene.get(cfg.name).orientation = mi.Point3f(float(yaw_r), float(pitch_r), 0.0)
-        scene.get(cfg.name).position    = mi.Point3f(float(final_x), float(final_y),
+        scene.get(cfg.name).position    = mi.Point3f(float(best_x), float(best_y),
                                                        float(state["tx_height"]))
         if cfg.optimize_power:
-            best_pow = float(np.mean(final_bufs[i]["pow"])) if final_bufs[i]["pow"] else float(params[b + 4].item())
+            best_pow = best_params_seen[b + 4]
             scene.get(cfg.name).power_dbm = [best_pow]
             state["best_power_dbm"] = best_pow
         state["best_angles"]    = [best_az, best_el]
-        state["final_position"] = [final_x, final_y, state["tx_height"]]
+        state["final_position"] = [best_x, best_y, state["tx_height"]]
 
     # Remove optimization receivers
     for rx_name in list(rx_objects.keys()):
@@ -1164,10 +1241,12 @@ def optimize_multi_tx(
 
     result["joint"] = {
         "loss_history":      loss_history,
+        "lr_history":        lr_history,
         "iter_time_history": iter_time_history,
         "converged_iter":    converged_iter,
         "elapsed_time_s":    elapsed,
         "num_iterations":    num_iterations,
+        "initial_lr":        learning_rate,
         "noise_power":       noise_power,
         "sampler":           sampler,
         "sampling_strata":   sampling_strata,

@@ -15,7 +15,7 @@ def validate_zone_coverage(
     scene,
     tx_name,
     zone_mask,
-    zone_params,
+    zone_stats,
     map_config,
     p10_min_dbm=-140.0,
     p10_max_dbm=-80.0,
@@ -40,8 +40,8 @@ def validate_zone_coverage(
         Name of the transmitter
     zone_mask : np.ndarray
         Binary mask defining the target zone
-    zone_params : dict
-        Zone parameters (must contain 'center', 'width', 'height')
+    zone_stats : dict
+        Zone statistics from create_zone_mask()
     map_config : dict
         Map configuration with 'center', 'size', 'cell_size'
     p10_min_dbm : float
@@ -88,8 +88,7 @@ def validate_zone_coverage(
     tx_position = tx.position.numpy().flatten().tolist()
 
     # Compute initial angles pointing at zone center
-    target_z = map_config.get('target_height', 1.5)
-    look_at_xyz = list(zone_params['center'])[:2] + [target_z]
+    look_at_xyz = zone_stats["look_at_xyz"]
     initial_azimuth, initial_elevation = compute_initial_angles_from_position(
         tx_position,
         look_at_xyz,
@@ -269,12 +268,12 @@ def find_valid_zone(
     --------
     zone_mask : np.ndarray or None
         Valid zone mask, or None if no valid zone found
-    zone_params : dict or None
-        Zone parameters (containing 'center', 'width', 'height'), or None if no valid zone found
+    zone_stats : dict or None
+        Zone statistics, or None if no valid zone found
     zone_center : list or None
         [x, y] coordinates of zone center, or None if no valid zone found
     validation_stats : dict or None
-        Validation statistics for the found zone, or None if no valid zone found
+        Validation statistics for the found zone
     attempt_count : int
         Number of attempts taken
     """
@@ -311,12 +310,12 @@ def find_valid_zone(
 
         # Create zone mask
         try:
-            zone_mask, naive_look_at, centriod = create_zone_mask(
+            zone_mask, naive_look_at, zone_stats = create_zone_mask(
                 map_config=map_config,
                 zone_type='box',
                 origin_point=tx_position,
                 zone_params=zone_params,
-                target_height=map_config.get('target_height', 1.5),
+                target_height=1.5,
                 scene_xml_path=scene_xml_path,
                 exclude_buildings=True
             )
@@ -325,12 +324,12 @@ def find_valid_zone(
                 print(f"  ✗ Failed to create zone: {e}")
             continue
 
-        # Validate zoneF
+        # Validate zone
         is_valid, validation_stats = validate_zone_coverage(
             scene=scene,
             tx_name=tx_name,
             zone_mask=zone_mask,
-            zone_params=zone_params,
+            zone_stats=zone_stats,
             map_config=map_config,
             verbose=verbose,
             **validation_kwargs
@@ -339,8 +338,7 @@ def find_valid_zone(
         if is_valid:
             if verbose:
                 print(f"\n✓ Found valid zone after {attempt + 1} attempt(s)!")
-            # Return zone_params directly (no longer wrapping in zone_stats)
-            return zone_mask, zone_params, [zone_center_x, zone_center_y], validation_stats, attempt + 1
+            return zone_mask, zone_stats, [zone_center_x, zone_center_y], validation_stats, attempt + 1
 
     if verbose:
         print(f"\n✗ Failed to find valid zone after {max_attempts} attempts")

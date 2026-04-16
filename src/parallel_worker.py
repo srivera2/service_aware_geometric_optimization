@@ -66,6 +66,15 @@ def process_single_scene(args):
     scene_name, gpu_id, validation_thresholds, parent_folder, output_dir = args
 
     # =========================================================================
+    # STEP 0: CPU THREAD LIMITING - Set BEFORE importing any numeric libraries
+    # This prevents CPU over-subscription when running multiple workers
+    # =========================================================================
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["NUMEXPR_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+
+    # =========================================================================
     # STEP 1: GPU ISOLATION - Set BEFORE importing CUDA libraries
     # =========================================================================
     if gpu_id is not None:
@@ -149,7 +158,7 @@ def process_single_scene(args):
 
         # Find valid zone
         zone_params_template = {'width': 250.0, 'height': 250.0}
-        zone_mask, zone_params, zone_center, validation_stats, attempts = find_valid_zone(
+        zone_mask, zone_stats, zone_center, validation_stats, attempts = find_valid_zone(
             scene=scene,
             tx_name="gnb",
             tx_position=gnb_position,
@@ -174,6 +183,7 @@ def process_single_scene(args):
             }
 
         zone_center_x, zone_center_y = zone_center
+        zone_params = zone_stats['zone_params']
 
         # Run optimization
         best_angles, loss_hist, angle_hist, grad_hist, cov_stats, initial_angles = optimize_boresight_pathsolver(
@@ -183,6 +193,7 @@ def process_single_scene(args):
             scene_xml_path=scene_xml_path,
             zone_mask=zone_mask,
             zone_params=zone_params,
+            zone_stats=zone_stats,
             num_sample_points=100,
             learning_rate=2.0,
             num_iterations=100,
