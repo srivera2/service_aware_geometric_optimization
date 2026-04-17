@@ -1275,8 +1275,9 @@ def compare_multi_tx_performance(
     tx_configs: list,
     multi_result: dict,
     map_config: dict,
-    zone_masks: dict,
+    zone_masks,
     noise_power: float = 1e-10,
+    samples_per_tx: int = int(1e7),
     fig: bool = True,
 ) -> tuple:
     """Evaluate and compare initial vs optimised multi-TX configurations.
@@ -1294,10 +1295,14 @@ def compare_multi_tx_performance(
         Returned by optimize_multi_tx().
     map_config : dict
         Radio-map grid config: 'center', 'size', 'cell_size'.
-    zone_masks : dict  {tx_name: 2-D np.ndarray}
+    zone_masks : dict {tx_name: 2-D np.ndarray} or list of 2-D np.ndarray
         Binary zone masks (1.0 = in zone) aligned to map_config grid.
+        A list is accepted and zipped with tx_configs order.
     noise_power : float
         Thermal noise floor (Watts).
+    samples_per_tx : int
+        Ray samples per TX for the RadioMapSolver evaluation runs.
+        Default 1e7 — enough for a clean visual; use 1e9 for publication-quality.
     fig : bool
         If True, generate comparison plots.
 
@@ -1321,7 +1326,10 @@ def compare_multi_tx_performance(
     """
     import matplotlib.pyplot as plt
 
-    rm_solver = RadioMapSolver()
+    # Normalise zone_masks: accept list (zipped with tx_configs) or dict
+    if isinstance(zone_masks, list):
+        zone_masks = {cfg.name: mask for cfg, mask in zip(tx_configs, zone_masks)}
+
     N = len(tx_configs)
 
     def _watts_to_dbm(w):
@@ -1358,7 +1366,7 @@ def compare_multi_tx_performance(
         return solver(
             scene,
             max_depth=8,
-            samples_per_tx=int(1e9),
+            samples_per_tx=samples_per_tx,
             cell_size=list(map_config["cell_size"]),
             center=map_config["center"],
             orientation=[0, 0, 0],

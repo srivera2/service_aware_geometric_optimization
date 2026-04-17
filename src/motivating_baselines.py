@@ -44,13 +44,106 @@ from baseline_optimizers import (
     _initial_params,
     _make_radiomap_sir_loss,
 )
-from multi_tx_optimizer import TxConfig, _setup_tx_state, _make_qrand
+from multi_tx_optimizer import TxConfig, _setup_tx_state, _make_qrand, _extract_per_rx_power
 from tx_placement import TxPlacement
 
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+def _radiomap_az_el_loss_body(
+    all_params, N, tx_configs, tx_states, scene, rm_solver,
+    map_config, noise_power, zone_masks_np, n_zone_cells, rm_kwargs,
+    epsilon=1e-30,
+):
+    """RadioMap SINR loss with orientation-only params (2 per TX: az, el).
+
+    Mirrors _radiomap_sir_loss_body from baseline_optimizers but omits position
+    optimisation. all_params layout: [az_0, el_0, az_1, el_1, ...]
+    """
+    deg2rad = Float(float(np.pi / 180.0))
+    dr.disable_grad(deg2rad)
+
+    for i, cfg in enumerate(tx_configs):
+        b    = i * 2
+        az_i = all_params[b].array;     dr.enable_grad(az_i)
+        el_i = all_params[b + 1].array; dr.enable_grad(el_i)
+
+        yaw   = az_i * deg2rad
+        pitch = -(el_i * deg2rad)
+        roll  = Float(0.0); dr.disable_grad(roll)
+
+        scene.get(cfg.name).orientation = mi.Point3f(yaw, pitch, roll)
+        # Position is not optimised — left as-is in the scene
+
+    rm = rm_solver(scene, **rm_kwargs)
+
+    eps_f      = Float(float(epsilon));     dr.disable_grad(eps_f)
+    noise_f    = Float(float(noise_power)); dr.disable_grad(noise_f)
+    total_loss = Float(0.0);               dr.disable_grad(total_loss)
+
+    for i in range(N):
+        mask_tf = mi.TensorXf(zone_masks_np[i])
+        dr.disable_grad(mask_tf)
+        n_cells_f = Float(float(n_zone_cells[i])); dr.disable_grad(n_cells_f)
+
+        rss_i = rm.rss[i] * mask_tf
+
+        p_int = None
+        for j in range(N):
+            if j == i:
+                continue
+            p_j   = rm.rss[j] * mask_tf
+            p_int = p_j if p_int is None else (p_int + p_j)
+
+        if p_int is None:
+            metric = rss_i + eps_f
+        else:
+            metric = (rss_i + eps_f) / (p_int + noise_f + eps_f)
+
+        log_metric = dr.log(metric) * mask_tf
+        loss_i     = -dr.sum(log_metric) / n_cells_f
+        total_loss = total_loss + loss_i
+
+    return total_loss
+
+
+def _make_radiomap_az_el_loss(
+    N, tx_configs, tx_states, scene, rm_solver,
+    map_config, noise_power, zone_masks_np, n_zone_cells, rm_kwargs,
+):
+    """Build @dr.wrap loss with 2 params per TX (az, el — no position)."""
+    arg_names = []
+    for i in range(N):
+        b = i * 2
+        arg_names += [f"p{b}", f"p{b+1}"]
+
+    arg_str  = ", ".join(arg_names)
+    list_str = "[" + ", ".join(arg_names) + "]"
+
+    func_code = (
+        f"def _inner({arg_str}):\n"
+        f"    return _body({list_str}, _N, _cfgs, _states, _scene, _rmsolver,\n"
+        f"                 _mcfg, _noise, _masks, _ncells, _rmkw)\n"
+    )
+
+    globs = {
+        "_body":     _radiomap_az_el_loss_body,
+        "_N":        N,
+        "_cfgs":     tx_configs,
+        "_states":   tx_states,
+        "_scene":    scene,
+        "_rmsolver": rm_solver,
+        "_mcfg":     map_config,
+        "_noise":    noise_power,
+        "_masks":    zone_masks_np,
+        "_ncells":   n_zone_cells,
+        "_rmkw":     rm_kwargs,
+    }
+    exec(func_code, globs)
+    inner_fn = globs["_inner"]
+    return dr.wrap(source="torch", target="drjit")(inner_fn)
 
 def _log_grad_norm(params: list) -> float:
     """Mean absolute gradient across all params that have .grad set."""
@@ -507,29 +600,29 @@ def radiomap_gradient_baseline_multi_tx(
 
     rm_solver           = RadioMapSolver()
     rm_solver.loop_mode = "evaluated"   # required for AD through dr.while_loop
-    compute_loss = _make_radiomap_sir_loss(
+    compute_loss = _make_radiomap_az_el_loss(
         N, tx_configs, tx_states, scene, rm_solver,
         map_config, noise_power, zone_masks_np, n_zone_cells, rm_kwargs,
     )
 
+    # Orientation-only params: 2 per TX (az, el). Position is held fixed.
     params = []
     for state in tx_states:
         params.append(torch.tensor(state["initial_azimuth"],   device="cuda",
                                    dtype=torch.float32, requires_grad=True))
         params.append(torch.tensor(state["initial_elevation"], device="cuda",
                                    dtype=torch.float32, requires_grad=True))
-        params.append(torch.tensor(state["tx_position"][0],   device="cuda",
-                                   dtype=torch.float32, requires_grad=True))
-        params.append(torch.tensor(state["tx_position"][1],   device="cuda",
-                                   dtype=torch.float32, requires_grad=True))
 
     optimizer = torch.optim.Adam(params, lr=learning_rate, betas=(0.9, 0.999))
 
-    loss_history      = []
-    iter_time_history = []
-    grad_norm_history = []
-    converged_iter    = None
-    final_bufs        = {i: {"az": [], "el": []} for i in range(N)}
+
+    loss_history         = []
+    iter_time_history    = []
+    grad_norm_history    = []
+    grad_vector_history  = []
+    param_grad_histories = {cfg.name: {"az": [], "el": []} for cfg in tx_configs}
+    converged_iter       = None
+    final_bufs           = {i: {"az": [], "el": []} for i in range(N)}
 
     for iteration in range(num_iterations):
         iter_start = time.time()
@@ -540,27 +633,33 @@ def radiomap_gradient_baseline_multi_tx(
         grad_norm = _log_grad_norm(params)
         grad_norm_history.append(grad_norm)
 
+        grad_vector_history.append([
+            float(p.grad.item()) if p.grad is not None else 0.0 for p in params
+        ])
+
+        for i, cfg in enumerate(tx_configs):
+            b = i * 2
+            param_grad_histories[cfg.name]["az"].append(
+                float(params[b].grad.abs().item()) if params[b].grad is not None else 0.0)
+            param_grad_histories[cfg.name]["el"].append(
+                float(params[b + 1].grad.abs().item()) if params[b + 1].grad is not None else 0.0)
+
         optimizer.step()
         optimizer.zero_grad()
 
         dr.flush_kernel_cache()
         dr.flush_malloc_cache()
 
+        # Orientation-only: clamp az/el, no position projection
         with torch.no_grad():
             for i, state in enumerate(tx_states):
-                b    = i * 4
-                az_t = params[b];     el_t = params[b + 1]
-                x_t  = params[b + 2]; y_t  = params[b + 3]
+                b    = i * 2
+                az_t = params[b]; el_t = params[b + 1]
 
                 az_t.clamp_(AZ_MIN, AZ_MAX)
                 if az_t.item() >= 360.0:
                     az_t.fill_(az_t.item() % 360.0)
                 el_t.clamp_(EL_MIN, EL_MAX)
-
-                proj_x, proj_y = state["tx_placement"].project_to_polygon(
-                    x_t.item(), y_t.item())
-                x_t.data.fill_(proj_x)
-                y_t.data.fill_(proj_y)
 
         loss_val = float(loss.item())
         loss_history.append(loss_val)
@@ -570,14 +669,15 @@ def radiomap_gradient_baseline_multi_tx(
         window_start = max(0, num_iterations - 10)
         if iteration >= window_start:
             for i in range(N):
-                b = i * 4
+                b = i * 2
                 final_bufs[i]["az"].append(float(params[b].item()))
                 final_bufs[i]["el"].append(float(params[b + 1].item()))
 
         for i in range(N):
-            b = i * 4
+            b = i * 2
             tx_states[i].setdefault("az_history", []).append(float(params[b].item()))
             tx_states[i].setdefault("el_history", []).append(float(params[b + 1].item()))
+
 
         if verbose:
             print(f"  Iter {iteration+1:3d}/{num_iterations}  "
@@ -597,23 +697,23 @@ def radiomap_gradient_baseline_multi_tx(
                 break
 
     # Apply best (last-10 average) parameters back to scene
+    # Position is fixed (not optimised) — use initial state positions.
     best_params_flat = []
     for i, (cfg, state) in enumerate(zip(tx_configs, tx_states)):
-        b       = i * 4
+        b       = i * 2
         best_az = (float(np.mean(final_bufs[i]["az"])) if final_bufs[i]["az"]
                    else float(params[b].item()))
         best_el = (float(np.mean(final_bufs[i]["el"])) if final_bufs[i]["el"]
                    else float(params[b + 1].item()))
-        final_x = float(params[b + 2].item())
-        final_y = float(params[b + 3].item())
+        final_x = float(state["tx_position"][0])
+        final_y = float(state["tx_position"][1])
 
         yaw_r, pitch_r = azimuth_elevation_to_yaw_pitch(best_az, best_el)
         scene.get(cfg.name).orientation = mi.Point3f(float(yaw_r), float(pitch_r), 0.0)
-        scene.get(cfg.name).position    = mi.Point3f(float(final_x), float(final_y),
-                                                      float(state["tx_height"]))
+        # Position unchanged — already correct in scene
         state["best_angles"]    = [best_az, best_el]
         state["final_position"] = [final_x, final_y, state["tx_height"]]
-        best_params_flat += [best_az, best_el, final_x, final_y]
+        best_params_flat += [best_az, best_el, final_x, final_y]  # 4-wide for evaluators
 
     best_params_np = np.array(best_params_flat, dtype=np.float64)
 
@@ -657,7 +757,9 @@ def radiomap_gradient_baseline_multi_tx(
         "sampler":              "radiomap_gradient",
         "sampling_strata":      "radiomap_zone_cells",
         "lds":                  lds,
-        "grad_norm_history":    grad_norm_history,
+        "grad_norm_history":     grad_norm_history,
+        "grad_vector_history":   grad_vector_history,
+        "param_grad_histories":  param_grad_histories,
         "final_empirical_loss": float(final_empirical_loss),
         "final_raytraced_loss": float(final_raytraced_loss),
     }
@@ -681,6 +783,126 @@ def radiomap_gradient_baseline_multi_tx(
 # Baseline 4 — Dense PathSolver Gradient
 # ---------------------------------------------------------------------------
 
+def _dense_sir_loss_body(
+    all_params, N, tx_configs, tx_states, scene, p_solver,
+    noise_power, rx_objects, epsilon=1,
+    sir_threshold_db=-3.0, sigmoid_k=0.5,
+):
+    """SIR loss body with fixed receivers.
+
+    Identical to _sir_loss_body in multi_tx_optimizer except receiver positions
+    come from state_i["current_sample_points"] (pre-set fixed grid) rather than
+    being freshly sampled each call.  The repositioning setter is still called
+    inside @dr.wrap on every forward pass — this is required for Mitsuba/Sionna
+    to register the receivers with the scene for that execution context.
+    """
+    deg2rad = Float(float(np.pi / 180.0)); dr.disable_grad(deg2rad)
+
+    for i, cfg in enumerate(tx_configs):
+        az_i = all_params[i * 4];     dr.enable_grad(az_i.array)
+        el_i = all_params[i * 4 + 1]; dr.enable_grad(el_i.array)
+        x_i  = all_params[i * 4 + 2]; dr.enable_grad(x_i.array)
+        y_i  = all_params[i * 4 + 3]; dr.enable_grad(y_i.array)
+
+        jit_rad = Float(float(np.random.normal(0.0, 0.5 * np.pi / 180.0)))
+        dr.disable_grad(jit_rad)
+        pos_jit = Float(float(np.random.normal(0.0, 0.1)))
+        dr.disable_grad(pos_jit)
+
+        yaw   = az_i * deg2rad + jit_rad
+        pitch = -(el_i * deg2rad) + jit_rad
+        roll  = Float(0.0); dr.disable_grad(roll)
+
+        scene.get(cfg.name).orientation = [yaw, pitch, roll]
+        scene.get(cfg.name).position    = [
+            x_i + pos_jit,
+            y_i + pos_jit,
+            Float(float(tx_states[i]["tx_height"])),
+        ]
+
+    # Reposition receivers to their fixed grid locations.  Even though the
+    # positions are the same every call, the setter must run inside @dr.wrap
+    # so Mitsuba registers them with the scene for this forward pass.
+    for i, state_i in enumerate(tx_states):
+        sl  = state_i["rx_slice"]
+        pts = state_i["current_sample_points"]
+        for k, pos in enumerate(pts):
+            rx_objects[f"opt_rx_{sl.start + k}"].position = mi.Point3f(
+                float(pos[0]), float(pos[1]), float(pos[2])
+            )
+
+    paths = p_solver(scene, los=True, refraction=False,
+                     specular_reflection=True, diffuse_reflection=False,
+                     diffraction=False)
+    h_real, h_imag = paths.a
+
+    tx_power_vecs = [_extract_per_rx_power(h_real, h_imag, j) for j in range(N)]
+
+    eps_f      = Float(float(epsilon));     dr.disable_grad(eps_f)
+    noise_f    = Float(float(noise_power)); dr.disable_grad(noise_f)
+    total_loss = Float(0.0);               dr.disable_grad(total_loss)
+
+    zone_areas   = [s["zone_polygon"].area for s in tx_states]
+    total_area   = sum(zone_areas) or 1.0
+    area_weights = [a / total_area for a in zone_areas]
+
+    log10_scale = Float(float(10.0 / np.log(10.0))); dr.disable_grad(log10_scale)
+    thresh_f    = Float(float(sir_threshold_db));     dr.disable_grad(thresh_f)
+    k_f         = Float(float(sigmoid_k));            dr.disable_grad(k_f)
+
+    for i in range(N):
+        sl    = tx_states[i]["rx_slice"]
+        p_sig = tx_power_vecs[i][sl.start:sl.stop]
+
+        p_int = None
+        for j in range(N):
+            if j != i:
+                p_int_j = tx_power_vecs[j][sl.start:sl.stop]
+                p_int   = p_int_j if p_int is None else (p_int + p_int_j)
+
+        metric   = p_sig / noise_f if p_int is None else p_sig / (p_int + noise_f)
+        sir_db   = log10_scale * dr.log(metric + eps_f)
+        soft_cov = Float(1.0) / (Float(1.0) + dr.exp(-k_f * (sir_db - thresh_f)))
+
+        w_i        = Float(float(area_weights[i])); dr.disable_grad(w_i)
+        total_loss = total_loss + (-w_i * dr.mean(soft_cov))
+
+    return total_loss, paths
+
+
+def _make_dense_sir_loss(N, tx_configs, tx_states, scene, p_solver,
+                          noise_power, rx_objects,
+                          sir_threshold_db=-3.0, sigmoid_k=0.5):
+    """Build the @dr.wrap-decorated fixed-receiver SIR loss.
+
+    Mirrors _make_compute_sir_loss from multi_tx_optimizer exactly.
+    """
+    arg_names = [f"p{i * 4 + j}" for i in range(N) for j in range(4)]
+    arg_str   = ", ".join(arg_names)
+    list_str  = "[" + arg_str + "]"
+
+    func_code = (
+        f"def _inner({arg_str}):\n"
+        f"    return _body({list_str}, _N, _cfgs, _states, _scene, _psolver,\n"
+        f"                 _noise, _rxobj,\n"
+        f"                 sir_threshold_db=_thresh_db, sigmoid_k=_sigmoid_k)\n"
+    )
+    globs = {
+        "_body":      _dense_sir_loss_body,
+        "_N":         N,
+        "_cfgs":      tx_configs,
+        "_states":    tx_states,
+        "_scene":     scene,
+        "_psolver":   p_solver,
+        "_noise":     noise_power,
+        "_rxobj":     rx_objects,
+        "_thresh_db": sir_threshold_db,
+        "_sigmoid_k": sigmoid_k,
+    }
+    exec(func_code, globs)
+    return dr.wrap(source="torch", target="drjit")(globs["_inner"])
+
+
 def dense_pathsolver_gradient_baseline_multi_tx(
     scene,
     tx_configs: list,
@@ -689,307 +911,217 @@ def dense_pathsolver_gradient_baseline_multi_tx(
     learning_rate: float = 3.5,
     num_iterations: int = 30,
     noise_power: float = 1e-10,
-    lds: str = "Halton",
-    grid_spacing_m: float = 4.0,
-    max_depth: int = 8,
+    grid_spacing: float = 5.0,
     verbose: bool = True,
-    early_stop_window: int = 10,
-    early_stop_min_improvement: float = 1e-3,
-    early_stop_min_flips: int = 4,
 ) -> dict:
-    """First-order (Adam) optimisation driven by PathSolver over a dense receiver grid.
+    """PathSolver gradient baseline with a configurable receiver grid.
 
-    Instead of sampling a small random set of zone points per iteration, this
-    baseline uses ALL grid cells in the zone at a fixed ``grid_spacing_m``
-    resolution — e.g. a 200×200 m zone at 4 m spacing yields ~2500 receivers.
-    This produces very accurate gradients (exact Image Method paths) but at a
-    per-iteration cost that scales quadratically with zone size.
+    Places receivers on a regular grid of spacing ``grid_spacing`` metres,
+    filtered to cells whose centre falls inside the zone mask.  Smaller values
+    give higher spatial resolution at the cost of more receivers per iteration.
 
-    Per-iteration gradient norms are logged in ``joint["grad_norm_history"]``
-    for direct comparison against Baseline 3 (RadioMapSolver).  Expected to be
-    significantly larger than RadioMapSolver's near-zero gradients.
-
-    Returns
-    -------
-    dict  (same schema as ``optimize_multi_tx``) with additional keys:
-        joint["grad_norm_history"]  — list of per-iter mean |∇param|
-        joint["n_receivers"]        — total receivers added to the scene
+    Returns the same dict schema as ``optimize_multi_tx`` plus:
+        joint["grad_norm_history"]  — per-iter mean |∇param|
+        joint["n_receivers"]        — total receivers placed
+        joint["grid_spacing"]       — grid spacing used (metres)
     """
     N = len(tx_configs)
     if verbose:
-        print(f"\n{'='*70}")
-        print(f"DENSE PATHSOLVER GRADIENT BASELINE  ({N} TX, {num_iterations} iters, "
-              f"lr={learning_rate}, spacing={grid_spacing_m}m)")
-        print(f"{'='*70}")
+        print(f"\n{'='*60}")
+        print(f"DENSE PATHSOLVER BASELINE  ({N} TX, {num_iterations} iters, "
+              f"lr={learning_rate}, grid={grid_spacing:.0f}m)")
+        print(f"{'='*60}")
 
     start_time = time.time()
-    qrand      = _make_qrand(lds)
-    tx_states  = [_setup_tx_state(scene, cfg, scene_xml_path, qrand)
-                  for cfg in tx_configs]
+    qrand     = _make_qrand("Halton")
+    tx_states = [_setup_tx_state(scene, cfg, scene_xml_path, qrand)
+                 for cfg in tx_configs]
 
-    # ------------------------------------------------------------------
-    # Build dense receiver grid for each zone
-    # ------------------------------------------------------------------
-    ground_z = map_config["center"][2] if len(map_config["center"]) > 2 else 1.5
+    zone_masks_np = _zone_masks_from_states(tx_states, map_config)
+    cx, cy    = map_config["center"][0], map_config["center"][1]
+    rx_height = map_config["center"][2] if len(map_config["center"]) > 2 else 1.5
+    sx, sy    = map_config["size"][0], map_config["size"][1]
+    H, W      = zone_masks_np[0].shape
+    cell_w, cell_h = sx / W, sy / H
 
+    # Build a coarser grid by striding the map_config cell grid.
+    # stride_x/y: how many map cells to skip per receiver.
+    stride_x = max(1, round(grid_spacing / cell_w))
+    stride_y = max(1, round(grid_spacing / cell_h))
+    col_idx   = np.arange(0, W, stride_x)
+    row_idx   = np.arange(0, H, stride_y)
+    xs = cx - sx / 2.0 + cell_w * (col_idx + 0.5)
+    ys = cy - sy / 2.0 + cell_h * (row_idx + 0.5)
+    xx, yy = np.meshgrid(xs, ys)
+    all_cell_xy = np.stack([xx.ravel(), yy.ravel()], axis=1)
+
+    # Subsample the zone mask to match the strided grid.
     zone_rx_pts: list[np.ndarray] = []
-    for state in tx_states:
-        minx, miny, maxx, maxy = state["zone_polygon"].bounds
-        xs = np.arange(minx + grid_spacing_m / 2, maxx, grid_spacing_m)
-        ys = np.arange(miny + grid_spacing_m / 2, maxy, grid_spacing_m)
-        XX, YY = np.meshgrid(xs, ys)
-        pts_2d = np.stack([XX.ravel(), YY.ravel()], axis=1)
-        inside = contains(state["zone_polygon"], pts_2d[:, 0], pts_2d[:, 1])
-        pts_in = pts_2d[inside]
-        pts_3d = np.column_stack([pts_in, np.full(len(pts_in), ground_z + 1.5)])
-        zone_rx_pts.append(pts_3d)
+    for i in range(N):
+        sub_mask  = zone_masks_np[i][np.ix_(row_idx, col_idx)].ravel().astype(bool)
+        pts_in    = all_cell_xy[sub_mask]
+        zone_rx_pts.append(np.column_stack([pts_in, np.full(len(pts_in), rx_height)]))
         if verbose:
-            print(f"  Zone {tx_configs[zone_rx_pts.index(pts_3d)].name}: "
-                  f"{len(pts_3d)} receivers at {grid_spacing_m}m spacing")
+            print(f"  Zone {tx_configs[i].name}: {len(pts_in)} receivers "
+                  f"({grid_spacing:.0f} m grid)")
 
-    # ------------------------------------------------------------------
-    # Add receivers to scene (pre-created, fixed positions)
-    # ------------------------------------------------------------------
-    rx_objects: dict[str, Receiver] = {}
-    rx_slices:  list[slice]         = []
+    # Mirror optimize_multi_tx exactly: clear existing receivers, pre-create at
+    # origin, store fixed pts in state["current_sample_points"].  The loss body
+    # repositions them to the fixed grid positions on every call — that setter
+    # must run inside @dr.wrap for Mitsuba to register them each forward pass.
+    for rx_name in list(scene.receivers.keys()):
+        scene.remove(rx_name)
+
     offset = 0
+    rx_objects: dict = {}
     for i, pts in enumerate(zone_rx_pts):
-        sl = slice(offset, offset + len(pts))
-        rx_slices.append(sl)
-        for k, pos in enumerate(pts):
-            rx_name = f"dense_rx_{offset + k}"
-            rx = Receiver(name=rx_name,
-                          position=[float(pos[0]), float(pos[1]), float(pos[2])])
+        tx_states[i]["rx_slice"]              = slice(offset, offset + len(pts))
+        tx_states[i]["current_sample_points"] = pts
+        for k in range(len(pts)):
+            name = f"opt_rx_{offset + k}"
+            rx   = Receiver(name=name, position=[0.0, 0.0, 0.0])
             scene.add(rx)
-            rx_objects[rx_name] = rx
+            rx_objects[name] = rx
         offset += len(pts)
-
-    total_rx = sum(len(p) for p in zone_rx_pts)
+    total_rx = offset
     if verbose:
-        print(f"  Total receivers in scene: {total_rx}")
+        print(f"  Total receivers: {total_rx}")
 
-    # ------------------------------------------------------------------
-    # Build differentiable loss with @dr.wrap
-    # ------------------------------------------------------------------
     p_solver = PathSolver()
     p_solver.loop_mode = "evaluated"
 
-    N_params_per_tx = 4
-    arg_names = [f"p{i * N_params_per_tx + j}"
-                 for i in range(N) for j in range(N_params_per_tx)]
-    arg_str  = ", ".join(arg_names)
-    list_str = "[" + arg_str + "]"
-
-    def _loss_body(all_params):
-        deg2rad = Float(float(np.pi / 180.0))
-        dr.disable_grad(deg2rad)
-
-        for i, cfg in enumerate(tx_configs):
-            b    = i * N_params_per_tx
-            az_i = all_params[b].array;     dr.enable_grad(az_i)
-            el_i = all_params[b + 1].array; dr.enable_grad(el_i)
-            x_i  = all_params[b + 2].array; dr.enable_grad(x_i)
-            y_i  = all_params[b + 3].array; dr.enable_grad(y_i)
-
-            yaw   = az_i * deg2rad
-            pitch = -(el_i * deg2rad)
-            roll  = Float(0.0); dr.disable_grad(roll)
-
-            scene.get(cfg.name).orientation = [yaw, pitch, roll]
-            scene.get(cfg.name).position    = [
-                x_i, y_i,
-                Float(float(tx_states[i]["tx_height"])),
-            ]
-
-        paths  = p_solver(scene, los=True, refraction=False,
-                          specular_reflection=True, diffuse_reflection=False,
-                          diffraction=True)
-        h_real, h_imag = paths.a
-        # h shape: (total_rx, N_tx, max_paths, rx_ant, tx_ant)
-        pwr = cpx_abs_square(h_real, h_imag)   # sum over paths
-        # pwr shape: (total_rx, N_tx, rx_ant, tx_ant) → reduce to (total_rx, N_tx)
-        pwr_per_rx_tx = dr.sum(pwr, axis=(2, 3)) if pwr.ndim > 2 else pwr
-
-        noise_f = Float(float(noise_power)); dr.disable_grad(noise_f)
-        total_loss = Float(0.0); dr.disable_grad(total_loss)
-
-        zone_areas   = [s["zone_polygon"].area for s in tx_states]
-        total_area   = sum(zone_areas) or 1.0
-        area_weights = [a / total_area for a in zone_areas]
-
-        for i in range(N):
-            sl    = rx_slices[i]
-            n_rx_i = sl.stop - sl.start
-            sig   = pwr_per_rx_tx[sl.start:sl.stop, i]
-            interf = dr.zeros(Float, n_rx_i)
-            for j in range(N):
-                if j != i:
-                    interf = interf + pwr_per_rx_tx[sl.start:sl.stop, j]
-
-            metric   = (sig + Float(1e-30)) / (interf + noise_f + Float(1e-30))
-            log_m    = dr.log(metric)
-            loss_i   = -Float(float(area_weights[i])) * dr.sum(log_m) / Float(float(n_rx_i))
-            total_loss = total_loss + loss_i
-
-        return total_loss
-
-    func_code = (
-        f"def _inner({arg_str}):\n"
-        f"    return _body({list_str})\n"
+    compute_loss = _make_dense_sir_loss(
+        N, tx_configs, tx_states, scene, p_solver,
+        noise_power, rx_objects,
     )
-    globs = {"_body": _loss_body}
-    exec(func_code, globs)
-    compute_loss = dr.wrap(source="torch", target="drjit")(globs["_inner"])
 
-    # ------------------------------------------------------------------
-    # PyTorch params + Adam
-    # ------------------------------------------------------------------
+    # PyTorch params: [az, el, x, y] per TX
     params = []
     for state in tx_states:
-        params.append(torch.tensor(state["initial_azimuth"],   device="cuda",
-                                   dtype=torch.float32, requires_grad=True))
-        params.append(torch.tensor(state["initial_elevation"], device="cuda",
-                                   dtype=torch.float32, requires_grad=True))
-        params.append(torch.tensor(state["tx_position"][0],   device="cuda",
-                                   dtype=torch.float32, requires_grad=True))
-        params.append(torch.tensor(state["tx_position"][1],   device="cuda",
-                                   dtype=torch.float32, requires_grad=True))
-
+        params += [
+            torch.tensor(state["initial_azimuth"],   device="cuda", dtype=torch.float32, requires_grad=True),
+            torch.tensor(state["initial_elevation"], device="cuda", dtype=torch.float32, requires_grad=True),
+            torch.tensor(state["tx_position"][0],   device="cuda", dtype=torch.float32, requires_grad=True),
+            torch.tensor(state["tx_position"][1],   device="cuda", dtype=torch.float32, requires_grad=True),
+        ]
     optimizer = torch.optim.Adam(params, lr=learning_rate, betas=(0.9, 0.999))
 
-    loss_history      = []
-    iter_time_history = []
-    grad_norm_history = []
-    converged_iter    = None
-    final_bufs        = {i: {"az": [], "el": []} for i in range(N)}
+    loss_history         = []
+    iter_time_history    = []
+    grad_norm_history    = []
+    grad_vector_history  = []
+    param_grad_histories = {cfg.name: {"az": [], "el": [], "x": [], "y": []}
+                            for cfg in tx_configs}
+    az_histories         = [[] for _ in range(N)]
+    el_histories         = [[] for _ in range(N)]
 
     for iteration in range(num_iterations):
         iter_start = time.time()
 
-        loss = compute_loss(*params)
+        loss, _ = compute_loss(*params)
         loss.backward()
 
         grad_norm = _log_grad_norm(params)
         grad_norm_history.append(grad_norm)
 
+        grad_vector_history.append([
+            float(p.grad.item()) if p.grad is not None else 0.0 for p in params
+        ])
+
+        for i, cfg in enumerate(tx_configs):
+            b = i * 4
+            for j, pname in enumerate(["az", "el", "x", "y"]):
+                g = params[b + j].grad
+                param_grad_histories[cfg.name][pname].append(
+                    float(g.abs().item()) if g is not None else 0.0)
+
         optimizer.step()
         optimizer.zero_grad()
-
         dr.flush_kernel_cache()
         dr.flush_malloc_cache()
 
         with torch.no_grad():
             for i, state in enumerate(tx_states):
-                b    = i * 4
-                az_t = params[b];     el_t = params[b + 1]
-                x_t  = params[b + 2]; y_t  = params[b + 3]
-
-                az_t.clamp_(AZ_MIN, AZ_MAX)
-                if az_t.item() >= 360.0:
-                    az_t.fill_(az_t.item() % 360.0)
-                el_t.clamp_(EL_MIN, EL_MAX)
-
+                b = i * 4
+                params[b].clamp_(AZ_MIN, AZ_MAX)
+                if params[b].item() >= 360.0:
+                    params[b].fill_(params[b].item() % 360.0)
+                params[b + 1].clamp_(EL_MIN, EL_MAX)
                 proj_x, proj_y = state["tx_placement"].project_to_polygon(
-                    x_t.item(), y_t.item())
-                x_t.data.fill_(proj_x)
-                y_t.data.fill_(proj_y)
+                    params[b + 2].item(), params[b + 3].item())
+                params[b + 2].data.fill_(proj_x)
+                params[b + 3].data.fill_(proj_y)
 
         loss_val = float(loss.item())
         loss_history.append(loss_val)
-        dur = time.time() - iter_start
-        iter_time_history.append(dur)
-
-        window_start = max(0, num_iterations - 10)
-        if iteration >= window_start:
-            for i in range(N):
-                b = i * 4
-                final_bufs[i]["az"].append(float(params[b].item()))
-                final_bufs[i]["el"].append(float(params[b + 1].item()))
+        iter_time_history.append(time.time() - iter_start)
 
         for i in range(N):
             b = i * 4
-            tx_states[i].setdefault("az_history", []).append(float(params[b].item()))
-            tx_states[i].setdefault("el_history", []).append(float(params[b + 1].item()))
+            az_histories[i].append(float(params[b].item()))
+            el_histories[i].append(float(params[b + 1].item()))
 
         if verbose:
             print(f"  Iter {iteration+1:3d}/{num_iterations}  "
-                  f"loss={loss_val:.4f}  |∇|={grad_norm:.2e}  ({dur:.1f}s)")
+                  f"loss={loss_val:.4f}  |∇|={grad_norm:.2e}  "
+                  f"({iter_time_history[-1]:.1f}s)")
 
-        if len(loss_history) >= early_stop_window:
-            recent  = loss_history[-early_stop_window:]
-            deltas  = [recent[k + 1] - recent[k] for k in range(len(recent) - 1)]
-            n_flips = sum(1 for k in range(len(deltas) - 1)
-                          if deltas[k] * deltas[k + 1] < 0)
-            net_change = abs(recent[-1] - recent[0])
-            if n_flips >= early_stop_min_flips and net_change < early_stop_min_improvement:
-                converged_iter = iteration + 1
-                if verbose:
-                    print(f"  [early stop] oscillating at iter {converged_iter} "
-                          f"({n_flips} sign flips, net Δloss={net_change:.4f})")
-                break
-
-    # Remove dense receivers from scene
-    for rx_name in rx_objects:
+    for name in list(rx_objects.keys()):
         try:
-            scene.remove(rx_name)
+            scene.remove(name)
         except Exception:
             pass
     gc.collect()
 
-    # Apply best params to scene
-    best_params_flat = []
+    # Apply final params to scene
     for i, (cfg, state) in enumerate(zip(tx_configs, tx_states)):
         b       = i * 4
-        best_az = (float(np.mean(final_bufs[i]["az"])) if final_bufs[i]["az"]
-                   else float(params[b].item()))
-        best_el = (float(np.mean(final_bufs[i]["el"])) if final_bufs[i]["el"]
-                   else float(params[b + 1].item()))
+        best_az = float(params[b].item())
+        best_el = float(params[b + 1].item())
         final_x = float(params[b + 2].item())
         final_y = float(params[b + 3].item())
-
         yaw_r, pitch_r = azimuth_elevation_to_yaw_pitch(best_az, best_el)
         scene.get(cfg.name).orientation = mi.Point3f(float(yaw_r), float(pitch_r), 0.0)
         scene.get(cfg.name).position    = mi.Point3f(float(final_x), float(final_y),
                                                       float(state["tx_height"]))
         state["best_angles"]    = [best_az, best_el]
         state["final_position"] = [final_x, final_y, state["tx_height"]]
-        best_params_flat += [best_az, best_el, final_x, final_y]
 
     elapsed = time.time() - start_time
 
     result = {}
-    for cfg, state in zip(tx_configs, tx_states):
+    for i, (cfg, state) in enumerate(zip(tx_configs, tx_states)):
         result[cfg.name] = {
             "best_angles":      state["best_angles"],
             "final_position":   state["final_position"],
             "initial_angles":   [state["initial_azimuth"], state["initial_elevation"]],
             "initial_position": state["tx_position"],
-            "az_history":       state.get("az_history", []),
-            "el_history":       state.get("el_history", []),
+            "az_history":       az_histories[i],
+            "el_history":       el_histories[i],
         }
     result["joint"] = {
         "loss_history":      loss_history,
         "iter_time_history": iter_time_history,
-        "converged_iter":    converged_iter,
         "elapsed_time_s":    elapsed,
         "num_iterations":    num_iterations,
         "noise_power":       noise_power,
         "sampler":           "dense_pathsolver_gradient",
-        "sampling_strata":   f"dense_grid_{grid_spacing_m}m",
-        "lds":               lds,
-        "grad_norm_history": grad_norm_history,
-        "n_receivers":       total_rx,
+        "sampling_strata":   f"dense_grid_{grid_spacing:.0f}m",
+        "grad_norm_history":    grad_norm_history,
+        "grad_vector_history":  grad_vector_history,
+        "param_grad_histories": param_grad_histories,
+        "n_receivers":          total_rx,
+        "grid_spacing":      grid_spacing,
     }
 
     if verbose:
-        print(f"\n{'='*70}")
-        print(f"DENSE PATHSOLVER GRADIENT BASELINE COMPLETE  ({elapsed:.1f}s)")
+        print(f"\n{'='*60}")
+        print(f"COMPLETE  ({elapsed:.1f}s, mean iter={float(np.mean(iter_time_history)):.1f}s)")
         for cfg in tx_configs:
             r = result[cfg.name]
             print(f"  {cfg.name}: Az={r['best_angles'][0]:.1f}°  "
                   f"El={r['best_angles'][1]:.1f}°  "
                   f"pos=({r['final_position'][0]:.1f}, {r['final_position'][1]:.1f})")
-        print(f"  Mean iter time: {np.mean(iter_time_history):.1f}s")
-        print(f"{'='*70}\n")
+        print(f"{'='*60}\n")
 
     return result
