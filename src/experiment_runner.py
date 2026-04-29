@@ -108,12 +108,12 @@ class ExperimentConfig:
     num_iterations: int = 50
     dead_tail_percentile: float = 1.0
     max_dbscan_points: int = 100_000
-    grad_lds: str = "Halton"
+    grad_lds: str = "Sobol"
     debug_viz: bool = False
 
     # --- Random search ----------------------------------------------------
     rs_n_candidates: int = 400
-    rs_lds: str = "Halton"
+    rs_lds: str = "Sobol"
     rs_seed: Optional[int] = None
 
     # --- PSO --------------------------------------------------------------
@@ -123,23 +123,23 @@ class ExperimentConfig:
     pso_w: float = 0.7
     pso_c1: float = 1.5
     pso_c2: float = 1.5
-    pso_lds: str = "Halton"
+    pso_lds: str = "Sobol"
     pso_seed: Optional[int] = None
 
     # --- Coordinate descent -----------------------------------------------
     cd_num_cycles: int = 10
     cd_n_line_points: int = 20
-    cd_lds: str = "Halton"
+    cd_lds: str = "Sobol"
 
     # --- UMa naive --------------------------------------------------------
     uma_mechanical_downtilt_deg: float = 0.0
     uma_electrical_downtilt_deg: float = 6.0
-    uma_lds: str = "Halton"
+    uma_lds: str = "Sobol"
 
     # --- RadioMap gradient -----------------------------------------------
     rmg_samples_per_tx: int = int(1e7)
     rmg_max_depth: int = 8
-    rmg_lds: str = "Halton"
+    rmg_lds: str = "Sobol"
 
     # --- Loss hyperparameters (shared across gradient + zeroth-order) -----
     # SIR threshold (dB) at the sigmoid centre.  Cells above this are considered
@@ -454,7 +454,14 @@ def _make_serializable(obj: Any) -> Any:
     return obj
 
 
-_RAW_ARRAY_KEYS = {"rsrp_values_dbm", "sir_values_db"}
+_RAW_ARRAY_KEYS = {
+    "rsrp_values_dbm",
+    "sir_values_db",
+    "dominant_tx_map",
+    "boundary_mask",
+    "sinr_db_grid",
+    "_boundary_sinr_values",
+}
 
 
 def _strip_raw_arrays(comparison_stats: dict) -> dict:
@@ -1762,3 +1769,206 @@ def plot_zone_overview(
     plt.show()
 
     return fig, ax
+
+
+# ---------------------------------------------------------------------------
+# Service Zone Boundary Visualisation
+# ---------------------------------------------------------------------------
+
+_BOUNDARY_TX_COLORS = ["#E63946", "#457B9D", "#2A9D8F", "#E9C46A", "#F4A261",
+                        "#9B5DE5", "#F15BB5", "#00BBF9"]
+
+
+def plot_service_boundaries(
+    stats: dict,
+    map_config: dict,
+    tx_names: list,
+    figsize: tuple = (14, 18),
+    sinr_vmin: float = -20.0,
+    sinr_vmax: float = 20.0,
+    title: str | None = None,
+) -> tuple:
+    """Visualise service-zone boundary KPI: dominant TX map, SINR heatmap,
+    and before/after comparison statistics.
+
+    Parameters
+    ----------
+    stats : dict
+        Return value of ``compare_multi_tx_performance()``.  Must contain
+        ``stats["boundary"]["initial"]`` and ``stats["boundary"]["optimized"]``
+        with array fields (``dominant_tx_map``, ``boundary_mask``,
+        ``sinr_db_grid``, ``_boundary_sinr_values``) still populated
+        (i.e. called *before* ``_strip_raw_arrays``).
+    map_config : dict
+        Same map grid config passed to the optimiser: keys ``center``,
+        ``size``, ``cell_size``.
+    tx_names : list[str]
+        TX identifiers in the same order used by the optimiser.
+    figsize : tuple
+        Overall figure size ``(width, height)`` in inches.
+    sinr_vmin, sinr_vmax : float
+        Colormap range for the SINR heatmap rows (dB).
+    title : str or None
+        Optional super-title.
+
+    Returns
+    -------
+    fig, axes : matplotlib Figure and 2-D axes array (3 rows × 2 columns)
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+    from matplotlib.colors import ListedColormap
+    from scipy.ndimage import binary_dilation
+
+    cx, cy = map_config["center"][0], map_config["center"][1]
+    sw, sh = map_config["size"][0], map_config["size"][1]
+    extent = [cx - sw / 2, cx + sw / 2, cy - sh / 2, cy + sh / 2]
+
+    N = len(tx_names)
+    tx_colors = _BOUNDARY_TX_COLORS[:N]
+
+    fig, axes = plt.subplots(3, 2, figsize=figsize)
+    if title:
+        fig.suptitle(title, fontsize=12, fontweight="bold")
+
+    config_types = ("initial", "optimized")
+
+    for col, ct in enumerate(config_types):
+        bnd = stats["boundary"][ct]
+        dom_map   = np.asarray(bnd["dominant_tx_map"])
+        bnd_mask  = np.asarray(bnd["boundary_mask"]).astype(bool)
+        sinr_grid = np.asarray(bnd["sinr_db_grid"])
+        sinr_vals = np.asarray(bnd["_boundary_sinr_values"])
+        r         = bnd["boundary_radius_cells"]
+
+        # ----------------------------------------------------------------
+        # Row 0: dominant TX map + boundary contour
+        # ----------------------------------------------------------------
+        ax0 = axes[0, col]
+        cmap_vals = ["#CCCCCC"] + tx_colors          # index 0 = no-signal gray
+        cmap_dom  = ListedColormap(cmap_vals)
+        dom_display = (dom_map + 1).astype(float)    # shift -1→0, 0..N-1→1..N
+        ax0.imshow(
+            dom_display,
+            origin="lower",
+            extent=extent,
+            cmap=cmap_dom,
+            vmin=-0.5,
+            vmax=N + 0.5,
+            interpolation="nearest",
+            aspect="auto",
+        )
+        if bnd_mask.any():
+            ax0.contour(
+                bnd_mask.astype(float),
+                levels=[0.5],
+                colors=["black"],
+                linewidths=[0.6],
+                origin="lower",
+                extent=extent,
+            )
+        handles = [mpatches.Patch(color=tx_colors[i], label=tx_names[i]) for i in range(N)]
+        handles.append(mpatches.Patch(color="#CCCCCC", label="No signal"))
+        ax0.legend(handles=handles, loc="upper right", fontsize=7, framealpha=0.85)
+        mode_label = "Single-TX mode: coverage-edge boundaries" if bnd["single_tx_mode"] else ""
+        ax0.set_title(
+            f"{ct.capitalize()} — Dominant TX Map"
+            + (f"\n({mode_label})" if mode_label else ""),
+            fontsize=9,
+        )
+        ax0.set_xlabel("X (m)", fontsize=8)
+        ax0.set_ylabel("Y (m)", fontsize=8)
+
+        # ----------------------------------------------------------------
+        # Row 1: SINR heatmap masked to boundary neighbourhood
+        # ----------------------------------------------------------------
+        ax1 = axes[1, col]
+        struct = np.ones((2 * r + 1, 2 * r + 1), dtype=bool)
+        bnd_region = binary_dilation(bnd_mask, structure=struct)
+        sinr_display = np.where(
+            bnd_region & (dom_map >= 0), sinr_grid, np.nan
+        )
+        im = ax1.imshow(
+            sinr_display,
+            origin="lower",
+            extent=extent,
+            cmap="RdYlGn",
+            vmin=sinr_vmin,
+            vmax=sinr_vmax,
+            interpolation="nearest",
+            aspect="auto",
+        )
+        if bnd_mask.any():
+            ax1.contour(
+                bnd_mask.astype(float),
+                levels=[0.5],
+                colors=["black"],
+                linewidths=[0.6],
+                origin="lower",
+                extent=extent,
+            )
+        plt.colorbar(im, ax=ax1, shrink=0.7, label="SINR (dB)")
+        ax1.set_title(
+            f"{ct.capitalize()} — SINR at Boundary Region (±{r} m)", fontsize=9
+        )
+        ax1.set_xlabel("X (m)", fontsize=8)
+        ax1.set_ylabel("Y (m)", fontsize=8)
+
+    # ----------------------------------------------------------------
+    # Row 2 left: CDF of boundary SINR — initial vs optimised overlaid
+    # ----------------------------------------------------------------
+    ax2l = axes[2, 0]
+    colors_ct  = {"initial": "darkorange", "optimized": "steelblue"}
+    labels_ct  = {"initial": "Initial",    "optimized": "Optimised"}
+    for ct in config_types:
+        raw = np.asarray(stats["boundary"][ct]["_boundary_sinr_values"])
+        finite = raw[np.isfinite(raw)]
+        if finite.size == 0:
+            continue
+        xs  = np.sort(finite)
+        cdf = np.arange(1, len(xs) + 1) / len(xs)
+        ax2l.plot(xs, cdf, color=colors_ct[ct], label=labels_ct[ct], linewidth=1.8)
+    ax2l.axvline(0.0, color="#888888", linewidth=0.8, linestyle="--", label="0 dB")
+    delta_p10 = stats["boundary"]["improvement"]["boundary_sinr_p10_db"]
+    ax2l.set_title(f"Boundary SINR CDF  (ΔP10 = {delta_p10:+.1f} dB)", fontsize=9)
+    ax2l.set_xlabel("Boundary SINR (dB)", fontsize=8)
+    ax2l.set_ylabel("CDF", fontsize=8)
+    ax2l.legend(fontsize=8)
+    ax2l.grid(True, alpha=0.3)
+
+    # ----------------------------------------------------------------
+    # Row 2 right: improvement bar chart
+    # ----------------------------------------------------------------
+    ax2r = axes[2, 1]
+    imp = stats["boundary"]["improvement"]
+    metric_pairs = [
+        ("boundary_sinr_mean_db",   "Mean SINR"),
+        ("boundary_sinr_median_db", "Median SINR"),
+        ("boundary_sinr_p10_db",    "P10 SINR"),
+    ]
+    labels  = [lbl for _, lbl in metric_pairs]
+    deltas  = [imp[key] for key, _ in metric_pairs]
+    bar_colors = ["#2CA02C" if d >= 0 else "#D62728" for d in deltas]
+    bars = ax2r.barh(
+        labels, deltas, color=bar_colors, edgecolor="black", linewidth=0.5
+    )
+    ax2r.axvline(0.0, color="black", linewidth=0.8)
+    ax2r.set_xlabel("Improvement (dB)", fontsize=8)
+    ax2r.set_title("Boundary SINR Improvement\n(Optimised − Initial)", fontsize=9)
+    for bar, val in zip(bars, deltas):
+        ha  = "left" if val >= 0 else "right"
+        xoff = 0.05 if val >= 0 else -0.05
+        ax2r.text(
+            val + xoff,
+            bar.get_y() + bar.get_height() / 2,
+            f"{val:+.1f} dB",
+            va="center",
+            ha=ha,
+            fontsize=8,
+        )
+    ax2r.grid(True, alpha=0.3, axis="x")
+
+    plt.tight_layout()
+    plt.show()
+    return fig, axes

@@ -44,7 +44,7 @@ from baseline_optimizers import (
     _initial_params,
     _make_radiomap_sir_loss,
 )
-from multi_tx_optimizer import TxConfig, _setup_tx_state, _make_qrand, _extract_per_rx_power
+from multi_tx_optimizer import TxConfig, _setup_tx_state, _make_qrand, _extract_per_rx_power, _gpu_memory_mb
 from tx_placement import TxPlacement
 
 
@@ -279,7 +279,7 @@ def naive_edge_center_baseline_multi_tx(
     scene_xml_path: str,
     noise_power: float = 1e-10,
     frequency_hz: float = 3.5e9,
-    lds: str = "Halton",
+    lds: str = "Sobol",
     n_empirical_pts: int = 500,
     rx_height: float = 1.5,
     verbose: bool = True,
@@ -389,7 +389,7 @@ def empirical_pso_baseline_multi_tx(
     w: float = 0.7,
     c1: float = 1.5,
     c2: float = 1.5,
-    lds: str = "Halton",
+    lds: str = "Sobol",
     seed: Optional[int] = None,
     verbose: bool = True,
     n_eval_pts: int = 300,
@@ -535,7 +535,7 @@ def radiomap_gradient_baseline_multi_tx(
     num_iterations: int = 50,
     noise_power: float = 1e-10,
     frequency_hz: float = 3.5e9,
-    lds: str = "Halton",
+    lds: str = "Sobol",
     samples_per_tx: int = int(1e7),
     max_depth: int = 8,
     n_empirical_pts: int = 500,
@@ -785,8 +785,8 @@ def radiomap_gradient_baseline_multi_tx(
 
 def _dense_sir_loss_body(
     all_params, N, tx_configs, tx_states, scene, p_solver,
-    noise_power, rx_objects, epsilon=1,
-    sir_threshold_db=-3.0, sigmoid_k=0.5,
+    noise_power, rx_objects, epsilon=1e-30,
+    sir_threshold_db=10.0, sigmoid_k=0.5,
 ):
     """SIR loss body with fixed receivers.
 
@@ -872,7 +872,7 @@ def _dense_sir_loss_body(
 
 def _make_dense_sir_loss(N, tx_configs, tx_states, scene, p_solver,
                           noise_power, rx_objects,
-                          sir_threshold_db=-3.0, sigmoid_k=0.5):
+                          sir_threshold_db=10.0, sigmoid_k=0.5):
     """Build the @dr.wrap-decorated fixed-receiver SIR loss.
 
     Mirrors _make_compute_sir_loss from multi_tx_optimizer exactly.
@@ -912,6 +912,8 @@ def dense_pathsolver_gradient_baseline_multi_tx(
     num_iterations: int = 30,
     noise_power: float = 1e-10,
     grid_spacing: float = 5.0,
+    sir_threshold_db: float = 15.0,
+    sigmoid_k: float = 0.5,
     verbose: bool = True,
 ) -> dict:
     """PathSolver gradient baseline with a configurable receiver grid.
@@ -993,6 +995,7 @@ def dense_pathsolver_gradient_baseline_multi_tx(
     compute_loss = _make_dense_sir_loss(
         N, tx_configs, tx_states, scene, p_solver,
         noise_power, rx_objects,
+        sir_threshold_db=sir_threshold_db, sigmoid_k=sigmoid_k,
     )
 
     # PyTorch params: [az, el, x, y] per TX
@@ -1008,12 +1011,14 @@ def dense_pathsolver_gradient_baseline_multi_tx(
 
     loss_history         = []
     iter_time_history    = []
+    iter_memory_mb       = []
     grad_norm_history    = []
     grad_vector_history  = []
     param_grad_histories = {cfg.name: {"az": [], "el": [], "x": [], "y": []}
                             for cfg in tx_configs}
     az_histories         = [[] for _ in range(N)]
     el_histories         = [[] for _ in range(N)]
+    _gpu_memory_mb()  # warm pynvml handle before the loop
 
     for iteration in range(num_iterations):
         iter_start = time.time()
@@ -1055,6 +1060,7 @@ def dense_pathsolver_gradient_baseline_multi_tx(
         loss_val = float(loss.item())
         loss_history.append(loss_val)
         iter_time_history.append(time.time() - iter_start)
+        iter_memory_mb.append(_gpu_memory_mb())
 
         for i in range(N):
             b = i * 4
@@ -1110,8 +1116,10 @@ def dense_pathsolver_gradient_baseline_multi_tx(
         "grad_norm_history":    grad_norm_history,
         "grad_vector_history":  grad_vector_history,
         "param_grad_histories": param_grad_histories,
-        "n_receivers":          total_rx,
+        "n_receivers":       total_rx,
         "grid_spacing":      grid_spacing,
+        "iter_memory_mb":    iter_memory_mb,
+        "peak_memory_mb":    max(iter_memory_mb) if iter_memory_mb else 0.0,
     }
 
     if verbose:

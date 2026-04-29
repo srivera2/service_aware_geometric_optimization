@@ -16,7 +16,18 @@ compare_multi_tx_performance() : evaluate initial vs optimised configs (RSRP + S
 
 from __future__ import annotations
 
+import os
 import warnings
+
+def _gpu_memory_mb() -> float:
+    """Current GPU memory usage in MB across all allocators (pynvml → torch fallback)."""
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+        info = pynvml.nvmlDeviceGetMemoryInfo(pynvml.nvmlDeviceGetHandleByIndex(0))
+        return info.used / 1024 ** 2
+    except Exception:
+        return torch.cuda.memory_allocated() / 1024 ** 2
 from dataclasses import dataclass
 from typing import Optional
 import time
@@ -27,6 +38,13 @@ import mitsuba as mi
 from IPython.display import display
 import numpy as np
 import scipy.stats.qmc
+from scipy.ndimage import (
+    minimum_filter,
+    maximum_filter,
+    uniform_filter,
+    binary_erosion,
+    binary_dilation,
+)
 import shapely
 import shapely.ops
 import torch
@@ -47,7 +65,8 @@ from triangulate import (
     sample_triangulated_zone,
     prepare_triangulated_sampler,
     sample_from_prepared,
-    visualize_triangulation
+    visualize_triangulation,
+    calculate_discrepancy_score,
 )
 from tx_placement import TxPlacement
 
@@ -102,19 +121,19 @@ class TxConfig:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _make_qrand(lds: str):
+def _make_qrand(lds: str, seed=None):
     """Return a scipy QMC sampler (or None for pure uniform)."""
     if lds == "Sobol":
-        return scipy.stats.qmc.Sobol(d=3, scramble=True, seed=None)
+        return scipy.stats.qmc.Sobol(d=3, scramble=True, seed=seed)
     elif lds == "Halton":
-        return scipy.stats.qmc.Halton(d=3, scramble=True, seed=None)
+        return scipy.stats.qmc.Halton(d=3, scramble=True, seed=seed)
     elif lds == "Latin":
-        return scipy.stats.qmc.LatinHypercube(d=3, scramble=True, seed=None)
+        return scipy.stats.qmc.LatinHypercube(d=3, scramble=True, seed=seed)
     elif lds == "Uniform":
         return None
     else:
         warnings.warn(f"Unknown LDS '{lds}'. Falling back to Halton.")
-        return scipy.stats.qmc.Halton(d=3, scramble=True, seed=None)
+        return scipy.stats.qmc.Halton(d=3, scramble=True, seed=seed)
 
 
 def _setup_tx_state(scene, cfg: TxConfig, scene_xml_path: str, qrand) -> dict:
@@ -225,7 +244,7 @@ def _param_strides(tx_configs):
 
 def _sample_zone_points(state: dict, cfg: TxConfig, n: int,
                         sampler: str, sampling_strata: str,
-                        ground_z: float) -> np.ndarray:
+                        ground_z: float, map_config: dict = None) -> np.ndarray:
     """Sample n receiver points in this TX's coverage zone.
 
     sampler         : "triangulated" | "rejection"
@@ -244,12 +263,25 @@ def _sample_zone_points(state: dict, cfg: TxConfig, n: int,
 
     def _sample_full_zone(n_pts):
         if sampler == "rejection":
-            pts, *_ = sample_grid_points(
-                zone_polygon, n_pts, qrand,
-                building_polygons=cached_bldgs, ground_z=ground_z,
+            zp = dict(cfg.zone_params)
+            if "vertices" in zp and "width" not in zp:
+                from shapely.geometry import Polygon as _Poly
+                _bounds = _Poly(zp["vertices"]).bounds
+                zp["width"]  = _bounds[2] - _bounds[0]
+                zp["height"] = _bounds[3] - _bounds[1]
+                if "center" not in zp:
+                    zp["center"] = [(_bounds[0] + _bounds[2]) / 2,
+                                    (_bounds[1] + _bounds[3]) / 2]
+            zone_stats = {"look_at_xyz": map_config["center"], "zone_params": zp}
+            pts = sample_grid_points(
+                map_config,
+                zone_stats=zone_stats,
+                qrand=qrand,
+                num_points=n_pts,
+                cached_building_polygons=cached_bldgs,
             )
         else:
-            pts = sample_from_prepared(state["tri_full_prepared"], n_pts, ground_z=ground_z)
+            pts = sample_from_prepared(state["tri_full_prepared"], n_pts, qrand=qrand, ground_z=ground_z)
         return pts
 
     def _sample_dead_strata(n_pts):
@@ -278,15 +310,16 @@ def _sample_zone_points(state: dict, cfg: TxConfig, n: int,
                     parts.append(pts)
             return np.vstack(parts) if parts else None
         else:
-            # sample_dead_zones triangulates each stratum and allocates
-            # proportionally by area — pass the pre-computed allocations
-            # by sampling each stratum independently and stacking.
             parts = []
             for dz, k in zip(dead_zones, floors):
                 if k > 0:
-                    pts = sample_dead_zones([dz], k, building_exclusions=[state["building_exclusions"]])
+                    try:
+                        dz_tri, _ = triangulate_zone(dz, state["building_exclusions"])
+                        dz_prepared = prepare_triangulated_sampler(dz_tri)
+                        pts = sample_from_prepared(dz_prepared, k, qrand=qrand, ground_z=ground_z)
+                    except Exception:
+                        pts = None
                     if pts is not None and len(pts) > 0:
-                        pts[:, 2] = ground_z
                         parts.append(pts)
             return np.vstack(parts) if parts else None
 
@@ -330,7 +363,7 @@ def _sample_zone_points(state: dict, cfg: TxConfig, n: int,
                     state["_alive_tri_prepared"] = state["tri_full_prepared"]
                     state["_alive_tri_cache_key"] = cache_key
             alive_pts = sample_from_prepared(
-                state["_alive_tri_prepared"], n_alive, ground_z=ground_z
+                state["_alive_tri_prepared"], n_alive, qrand=qrand, ground_z=ground_z
             )
 
         # Sample each dead zone stratum independently
@@ -609,6 +642,73 @@ def _visualize_dead_zone_pipeline(
     plt.close(fig)
 
 
+def _visualize_receiver_placement(tx_states, tx_configs, iteration, output_dir=None):
+    """Display per-zone LDS sample points inline and optionally save to disk.
+
+    Mirrors _visualize_dead_zone_pipeline: calls display(fig) so output
+    appears inline in Jupyter, then saves to output_dir if provided.
+    """
+    from IPython.display import display
+
+    n = len(tx_states)
+    fig, axes = plt.subplots(1, n, figsize=(6 * n, 6), squeeze=False)
+    cmap = plt.cm.get_cmap("tab10")
+    colors = [cmap(i % 10) for i in range(n)]
+
+    for i, (state, cfg) in enumerate(zip(tx_states, tx_configs)):
+        ax = axes[0][i]
+        c = colors[i]
+
+        # Zone boundary
+        zone = state["zone_polygon"]
+        geoms = list(zone.geoms) if zone.geom_type == "MultiPolygon" else [zone]
+        for geom in geoms:
+            ax.plot(*geom.exterior.xy, color=c, lw=1.5)
+            for interior in geom.interiors:
+                ax.fill(*interior.xy, color="#999999", alpha=0.7)
+
+        # Building footprints
+        for bpoly in state["cached_building_polygons"]:
+            ax.fill(*bpoly.exterior.xy, color="#999999", alpha=0.6)
+            ax.plot(*bpoly.exterior.xy, "k-", lw=0.6)
+
+        # Dead zone strata (if any)
+        for dz in state.get("dead_zones", []):
+            dgeoms = list(dz.geoms) if dz.geom_type in ("MultiPolygon", "GeometryCollection") else [dz]
+            for dg in dgeoms:
+                if dg.geom_type == "Polygon":
+                    ax.fill(*dg.exterior.xy, color="salmon", alpha=0.3)
+                    ax.plot(*dg.exterior.xy, color="red", lw=0.8)
+
+        # Sample points
+        pts = state.get("current_sample_points")
+        if pts is not None and len(pts) > 0:
+            ax.scatter(pts[:, 0], pts[:, 1], s=10, color=c, alpha=0.8,
+                       zorder=4, label=f"n={len(pts)}")
+
+        # TX position
+        pos = state.get("current_tx_position") or state["tx_position"]
+        ax.scatter([pos[0]], [pos[1]], s=100, marker="^", color="red",
+                   zorder=5, label="TX")
+
+        ax.set_title(f"{cfg.name}  —  iter {iteration}", fontsize=9)
+        ax.set_aspect("equal")
+        ax.grid(True, alpha=0.2)
+        ax.legend(fontsize=7, loc="upper right")
+
+    plt.tight_layout()
+    display(fig)
+
+    if output_dir is not None:
+        os.makedirs(output_dir, exist_ok=True)
+        fig.savefig(
+            os.path.join(output_dir, f"sampling_{iteration:04d}.png"),
+            dpi=90, bbox_inches="tight",
+        )
+
+    plt.close(fig)
+
+
 def _extract_per_rx_power(h_real, h_imag, tx_idx: int):
     """Return a TensorXf of shape (num_rx,) with power from tx_idx only.
 
@@ -692,7 +792,7 @@ def _sir_loss_body(
     ground_z = map_config["center"][2]
     for i, (cfg, state_i) in enumerate(zip(tx_configs, tx_states)):
         n      = cfg.num_sample_points
-        pts    = _sample_zone_points(state_i, cfg, n, sampler, sampling_strata, ground_z)
+        pts    = _sample_zone_points(state_i, cfg, n, sampler, sampling_strata, ground_z, map_config)
         state_i["current_sample_points"] = pts
         sl     = state_i["rx_slice"]
         for k, pos in enumerate(pts):
@@ -841,7 +941,7 @@ def optimize_multi_tx(
     noise_power: float = 1e-10,
     dead_tail_percentile: float = 50.0,
     max_dbscan_points: int = 100_000,
-    lds: str = "Halton",
+    lds: str = "Sobol",
     sampler: str = "triangulated",
     sampling_strata: str = "proportional",
     verbose: bool = True,
@@ -852,6 +952,9 @@ def optimize_multi_tx(
     early_stop_min_flips: int = 4,
     sir_threshold_db: float = -3.0,
     sigmoid_k: float = 0.5,
+    save_sampling_frames: bool = False,
+    sampling_frames_dir: str = "sampling_frames",
+    frame_save_interval: int = 1,
 ) -> dict:
     """Jointly optimise N transmitters for SIR coverage.
 
@@ -1024,11 +1127,14 @@ def optimize_multi_tx(
     # ------------------------------------------------------------------
     # 6. Tracking
     # ------------------------------------------------------------------
-    loss_history     = []
-    lr_history       = []
-    iter_time_history = []
-    converged_iter   = None
-    rm_solver        = RadioMapSolver()
+    loss_history         = []
+    lr_history           = []
+    iter_time_history    = []
+    iter_memory_mb       = []
+    discrepancy_history  = []
+    converged_iter       = None
+    rm_solver         = RadioMapSolver()
+    _gpu_memory_mb()  # warm pynvml handle before the loop
 
     # Best-seen (incumbent) tracking — report the parameter snapshot that
     # achieved the lowest loss, not the final iterate.  Averaging or using
@@ -1061,9 +1167,11 @@ def optimize_multi_tx(
             if cfg_k.optimize_power:
                 scene.get(cfg_k.name).power_dbm = [float(pvals[b + 4])]
 
-        # Single RadioMap pass — rm.rss shape (N_tx, H, W) gives per-TX
-        # cell-aggregated power, smoothing out multipath fades.
-        rm = rm_solver(
+        # Per-TX dead zone accumulation — skip entirely in 'full' mode
+        # since dead zones are never used for sampling there.
+        if sampling_strata != "full":
+            # Run the RadioMapSolver()
+            rm = rm_solver(
             scene,
             max_depth=12,
             samples_per_tx=int(100e7),
@@ -1078,11 +1186,8 @@ def optimize_multi_tx(
             edge_diffraction=True,
             refraction=False,
             stop_threshold=None,
-        )
+            )
 
-        # Per-TX dead zone accumulation — skip entirely in 'full' mode
-        # since dead zones are never used for sampling there.
-        if sampling_strata != "full":
             for i, (cfg, state) in enumerate(zip(tx_configs, tx_states)):
                 _accumulate_dead_zones(
                     state, cfg, i, rm,
@@ -1090,9 +1195,20 @@ def optimize_multi_tx(
                     debug_viz=debug_viz, iteration=iteration,
                 )
 
+        # Reseed the LDS sampler so each iteration uses an independent scramble
+        new_qrand = _make_qrand(lds, seed=iteration)
+        for state in tx_states:
+            state["qrand"] = new_qrand
+
         # Differentiable forward pass
         loss, path_out = compute_sir_loss(*params)
         loss.backward()
+
+        if save_sampling_frames and (iteration % frame_save_interval == 0):
+            _visualize_receiver_placement(
+                tx_states, tx_configs, iteration,
+                output_dir=sampling_frames_dir,
+            )
 
         optimizer.step()
         optimizer.zero_grad()
@@ -1134,6 +1250,17 @@ def optimize_multi_tx(
                 pw_val = float(params[b + 4].item())
                 tx_states[i]["power_history"].append(pw_val)
 
+        # Star discrepancy of receiver samples — average across all TXs.
+        # Uses current_sample_points set by compute_sir_loss each iteration.
+        _disc_vals = []
+        for state in tx_states:
+            pts = state.get("current_sample_points")
+            if pts is not None and len(pts) >= 4:
+                pts_xy = pts[:, :2]
+                d = calculate_discrepancy_score(pts_xy, state["zone_polygon"], num_probes=100)
+                _disc_vals.append(d)
+        discrepancy_history.append(float(np.mean(_disc_vals)) if _disc_vals else float("nan"))
+
         # Update incumbent: snapshot full parameter vector at lowest loss seen
         if loss_val < best_loss_seen:
             best_loss_seen   = loss_val
@@ -1158,6 +1285,7 @@ def optimize_multi_tx(
 
         dur = time.time() - iter_start
         iter_time_history.append(dur)
+        iter_memory_mb.append(_gpu_memory_mb())
 
         if verbose:
             current_lr = optimizer.param_groups[0]['lr']
@@ -1239,18 +1367,25 @@ def optimize_multi_tx(
             entry["power_history"]  = state["power_history"]
         result[cfg.name] = entry
 
+    _valid_disc = [d for d in discrepancy_history if not np.isnan(d)]
     result["joint"] = {
-        "loss_history":      loss_history,
-        "lr_history":        lr_history,
-        "iter_time_history": iter_time_history,
-        "converged_iter":    converged_iter,
-        "elapsed_time_s":    elapsed,
-        "num_iterations":    num_iterations,
-        "initial_lr":        learning_rate,
-        "noise_power":       noise_power,
-        "sampler":           sampler,
-        "sampling_strata":   sampling_strata,
-        "lds":               lds,
+        "loss_history":        loss_history,
+        "lr_history":          lr_history,
+        "iter_time_history":   iter_time_history,
+        "converged_iter":      converged_iter,
+        "elapsed_time_s":      elapsed,
+        "num_iterations":      num_iterations,
+        "initial_lr":          learning_rate,
+        "noise_power":         noise_power,
+        "sampler":             sampler,
+        "sampling_strata":     sampling_strata,
+        "lds":                 lds,
+        "n_receivers":         total_rx,
+        "iter_memory_mb":      iter_memory_mb,
+        "peak_memory_mb":      max(iter_memory_mb) if iter_memory_mb else 0.0,
+        "discrepancy_history": discrepancy_history,
+        "mean_discrepancy":    float(np.mean(_valid_disc)) if _valid_disc else None,
+        "median_discrepancy":  float(np.median(_valid_disc)) if _valid_disc else None,
     }
 
     if verbose:
@@ -1264,6 +1399,131 @@ def optimize_multi_tx(
         print(f"{'='*70}\n")
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Service Zone Boundary KPI
+# ---------------------------------------------------------------------------
+
+def compute_service_boundary_metrics(
+    rss_np: list,
+    tx_names: list,
+    noise_power: float = 1e-10,
+    boundary_radius: int = 12,
+) -> dict:
+    """Compute service-zone boundary KPI from a list of RSS maps.
+
+    For each cell in the coverage grid, the *dominant TX* is whichever TX
+    delivers the strongest received signal.  A *boundary cell* is one whose
+    dominant TX differs from at least one 8-connected neighbour.  This
+    function characterises the SINR experienced in the spatial neighbourhood
+    of those boundary cells — the metric that best captures how cleanly
+    optimisation has separated competing coverage zones.
+
+    Parameters
+    ----------
+    rss_np : list[np.ndarray(H, W)]
+        Linear-power (Watts) RSS maps, one per TX, aligned to the same grid.
+    tx_names : list[str]
+        TX identifiers parallel to rss_np.
+    noise_power : float
+        Thermal noise floor in Watts.
+    boundary_radius : int
+        Half-width (in grid cells) of the box filter used to characterise
+        SINR in the *surrounding area* of each boundary cell.  Default 12
+        cells ≈ 12 m at 1 m cell_size, matching 3GPP A3 trigger range.
+
+    Returns
+    -------
+    dict with scalar KPIs (JSON-safe) and large array fields
+    (``dominant_tx_map``, ``boundary_mask``, ``sinr_db_grid``,
+    ``_boundary_sinr_values``) that are stripped before JSON serialisation.
+    """
+    N = len(rss_np)
+    rss_stack = np.stack(rss_np, axis=0)          # (N, H, W)
+    H, W = rss_stack.shape[1], rss_stack.shape[2]
+
+    # ---- viable coverage mask -----------------------------------------------
+    any_signal = np.any(rss_stack > 0.0, axis=0)  # (H, W) bool
+
+    # ---- dominant TX per cell -----------------------------------------------
+    dominant_tx = np.argmax(rss_stack, axis=0)                    # (H, W) int
+    dominant_tx_masked = np.where(any_signal, dominant_tx, -1)    # -1 = no signal
+
+    # ---- boundary detection (8-connected, vectorised via min/max filter) ----
+    if N > 1:
+        local_min = minimum_filter(dominant_tx_masked, size=3, mode="nearest")
+        local_max = maximum_filter(dominant_tx_masked, size=3, mode="nearest")
+        boundary_mask = (local_min != local_max) & any_signal
+    else:
+        # Single-TX: define boundary as the inner edge of the coverage footprint
+        interior = binary_erosion(any_signal, structure=np.ones((3, 3), dtype=bool))
+        boundary_mask = any_signal & ~interior
+
+    # ---- full-grid SINR (vectorised gather) ---------------------------------
+    tx_idx_safe = np.clip(dominant_tx_masked, 0, N - 1)
+    row_idx = np.arange(H)[:, None]
+    col_idx = np.arange(W)[None, :]
+    signal_grid = rss_stack[tx_idx_safe, row_idx, col_idx]        # (H, W)
+    interf_grid = rss_stack.sum(axis=0) - signal_grid             # (H, W)
+    sinr_linear = signal_grid / (interf_grid + noise_power)
+    sinr_db_grid = np.where(
+        any_signal,
+        10.0 * np.log10(np.maximum(sinr_linear, 1e-18)),
+        np.nan,
+    )
+
+    # ---- neighbourhood SINR via box filter ----------------------------------
+    kernel = 2 * boundary_radius + 1
+    sinr_smoothed = uniform_filter(
+        np.nan_to_num(sinr_db_grid, nan=0.0), size=kernel, mode="nearest"
+    )
+    brows, bcols = np.where(boundary_mask)
+    boundary_sinr_nbhd  = sinr_smoothed[brows, bcols]   # neighbourhood-avg SINR
+    boundary_sinr_local = sinr_db_grid[brows, bcols]    # point SINR at boundary
+
+    # ---- boundary corridor width (double erosion estimate) ------------------
+    if boundary_mask.any():
+        eroded_1 = binary_erosion(boundary_mask, structure=np.ones((3, 3), dtype=bool))
+        eroded_2 = binary_erosion(eroded_1,      structure=np.ones((3, 3), dtype=bool))
+        perimeter = max(float(boundary_mask.sum() - eroded_2.sum()), 1.0)
+        boundary_width = float(boundary_mask.sum()) / perimeter
+    else:
+        boundary_width = 0.0
+
+    n_viable = int(any_signal.sum())
+    n_bnd    = int(boundary_mask.sum())
+
+    def _safe_stat(arr, fn):
+        finite = arr[np.isfinite(arr)]
+        return float(fn(finite)) if finite.size > 0 else float("nan")
+
+    return {
+        # --- scalars (always kept) ---
+        "n_boundary_cells":            n_bnd,
+        "boundary_fraction":           n_bnd / max(n_viable, 1),
+        "boundary_sinr_mean_db":       _safe_stat(boundary_sinr_nbhd,  np.mean),
+        "boundary_sinr_median_db":     _safe_stat(boundary_sinr_nbhd,  np.median),
+        "boundary_sinr_p10_db":        _safe_stat(boundary_sinr_nbhd,  lambda a: np.percentile(a, 10)),
+        "boundary_sinr_p90_db":        _safe_stat(boundary_sinr_nbhd,  lambda a: np.percentile(a, 90)),
+        "boundary_sinr_std_db":        _safe_stat(boundary_sinr_nbhd,  np.std),
+        "boundary_sinr_local_mean_db": _safe_stat(boundary_sinr_local, np.mean),
+        "boundary_sinr_local_p10_db":  _safe_stat(boundary_sinr_local, lambda a: np.percentile(a, 10)),
+        "boundary_width_cells":        boundary_width,
+        "per_tx_boundary_cell_counts": {
+            tx_names[i]: int((dominant_tx_masked[boundary_mask] == i).sum())
+            for i in range(N)
+        } if n_bnd > 0 else {n: 0 for n in tx_names},
+        "boundary_radius_cells": boundary_radius,
+        "n_tx":           N,
+        "single_tx_mode": N == 1,
+
+        # --- large arrays (stripped before JSON save) ---
+        "dominant_tx_map":       dominant_tx_masked,
+        "boundary_mask":         boundary_mask,
+        "sinr_db_grid":          sinr_db_grid,
+        "_boundary_sinr_values": boundary_sinr_local,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1452,6 +1712,7 @@ def compare_multi_tx_performance(
         print(f"Computing RadioMap for {config_type} configuration...")
         _set_scene_state(config_type)
         rm    = _run_radiomap()
+        rm.show(metric="sinr")
         # rss shape: (N, H, W)
         rss_np = [rm.rss.numpy()[i, :, :] for i in range(N)]
         rss_configs[config_type] = rss_np
@@ -1492,6 +1753,31 @@ def compare_multi_tx_performance(
             "optimized_params": opt_params,
         }
 
+    # ---- Service boundary metrics (across all TXs simultaneously) ----------
+    _tx_names = [c.name for c in tx_configs]
+    for _ct in ("initial", "optimized"):
+        _bnd = compute_service_boundary_metrics(
+            rss_np=rss_configs[_ct],
+            tx_names=_tx_names,
+            noise_power=noise_power,
+        )
+        stats.setdefault("boundary", {})[_ct] = _bnd
+
+    _b_i = stats["boundary"]["initial"]
+    _b_o = stats["boundary"]["optimized"]
+    _bnd_imp_keys = [
+        "boundary_sinr_mean_db",
+        "boundary_sinr_median_db",
+        "boundary_sinr_p10_db",
+        "boundary_sinr_local_mean_db",
+    ]
+    stats["boundary"]["improvement"] = {
+        k: _b_o[k] - _b_i[k] for k in _bnd_imp_keys
+    }
+    stats["boundary"]["improvement"]["boundary_fraction_delta"] = (
+        _b_o["boundary_fraction"] - _b_i["boundary_fraction"]
+    )
+
     # Print before/after metrics summary
     print(f"\n{'='*70}")
     print("RESULTS")
@@ -1528,6 +1814,18 @@ def compare_multi_tx_performance(
               f"  [covered cells]")
         print(f"    SIR p90:     {im['sir_p90_db']:+7.1f} dB   →  "
               f"{om['sir_p90_db']:+7.1f} dB   [covered cells]")
+
+    _bi = stats["boundary"]["initial"]
+    _bo = stats["boundary"]["optimized"]
+    _bimp = stats["boundary"]["improvement"]
+    print(f"  Boundary KPI  (neighbourhood radius {_bi['boundary_radius_cells']} cells):")
+    print(f"    Boundary cells: {_bi['n_boundary_cells']}  →  {_bo['n_boundary_cells']}")
+    print(f"    SINR nbhd mean: {_bi['boundary_sinr_mean_db']:+7.1f} dB  →  "
+          f"{_bo['boundary_sinr_mean_db']:+7.1f} dB  "
+          f"({_bimp['boundary_sinr_mean_db']:+.1f} dB)")
+    print(f"    SINR nbhd p10:  {_bi['boundary_sinr_p10_db']:+7.1f} dB  →  "
+          f"{_bo['boundary_sinr_p10_db']:+7.1f} dB  "
+          f"({_bimp['boundary_sinr_p10_db']:+.1f} dB)")
     print(f"{'='*70}\n")
 
     jnt = multi_result.get("joint", {})

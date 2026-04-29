@@ -616,8 +616,10 @@ def sample_from_prepared(prepared, num_samples, qrand=None, ground_z=0.0):
     target_counts = (areas / total_area) * num_samples
     int_counts    = np.floor(target_counts).astype(int)
     frac_part     = target_counts - int_counts
-    bonus         = (np.random.random(len(areas)) < frac_part).astype(int)
-    final_counts  = int_counts + bonus
+    remainder     = num_samples - int(np.sum(int_counts))
+    final_counts  = int_counts.copy()
+    for i in np.argsort(-frac_part)[:remainder]:
+        final_counts[i] += 1
 
     triangle_indices = np.repeat(np.arange(len(areas)), final_counts)
     actual_total     = len(triangle_indices)
@@ -699,11 +701,13 @@ def sample_triangulated_zone(tri_verts, num_samples, qrand, ground_z=0.0):
     target_counts = (areas / total_area) * num_samples
     int_counts = np.floor(target_counts).astype(int)
     
-    # Stochastic Rounding (Fixes the "Blackout" issue for small triangles)
-    frac_part = target_counts - int_counts
-    # Use independent random (not qrand) for the rounding decision to avoid aliasing
-    bonus_points = (np.random.random(len(areas)) < frac_part).astype(int)
-    final_counts = int_counts + bonus_points
+    # Largest-remainder allocation: guarantees exactly num_samples total,
+    # gives small triangles proportional representation without stochastic variance.
+    frac_part    = target_counts - int_counts
+    remainder    = num_samples - int(np.sum(int_counts))
+    final_counts = int_counts.copy()
+    for i in np.argsort(-frac_part)[:remainder]:
+        final_counts[i] += 1
 
     # --- Step 3: Expand Indices ---
     # The 'triangle_indices' are now pointing to our SORTED list.

@@ -198,7 +198,7 @@ def process_single_scene(args):
             learning_rate=2.0,
             num_iterations=100,
             verbose=False,
-            lds="Halton",
+            lds="Sobol",
             save_radiomap_frames=False,
             frame_save_interval=10,
             output_dir=output_dir
