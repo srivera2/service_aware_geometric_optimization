@@ -17,7 +17,10 @@ class TxPlacement:
         self.scene_xml_path = scene_xml_path
         self.building_info = extract_building_info(scene_xml_path)
         self.building_id = building_id
-        self.building = self.building_info[self.building_id]
+        if self.building_id is None:
+            self.building = 0
+        else:
+            self.building = self.building_info[self.building_id]
 
         # Get or create the transmitter
         self.tx = scene.get(tx_name)

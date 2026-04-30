@@ -31,10 +31,11 @@ import shapely
 import shapely.ops
 import torch
 import drjit as dr
+import random
 from drjit.auto import Float
 from shapely.geometry import Polygon as ShapelyPolygon
 from sklearn.cluster import HDBSCAN, DBSCAN
-from sionna.rt import PathSolver, RadioMapSolver, Receiver, cpx_abs_square
+from sionna.rt import load_scene, PathSolver, RadioMapSolver, Transmitter, Receiver, cpx_abs_square, AntennaArray
 
 from angle_utils import (
     azimuth_elevation_to_yaw_pitch,
@@ -52,6 +53,8 @@ from triangulate import (
 )
 from tx_placement import TxPlacement
 
+# Initialize random number generator
+random.seed()
 
 # ---------------------------------------------------------------------------
 # TxConfig
@@ -88,6 +91,7 @@ class TxConfig:
         Override initial elevation; None -> auto-compute.
     """
     name: str
+    on_building: bool
     building_id: int
     zone_params: dict
     tx_height_offset: float = 10.0
@@ -97,6 +101,28 @@ class TxConfig:
     power_dbm_bounds: tuple = (0.0, 50.0)
     initial_azimuth_deg: Optional[float] = None
     initial_elevation_deg: Optional[float] = None
+
+
+@dataclass
+class JammerConfig:
+    """Configuration for one friendly jammer in the joint optimisation.
+
+    Parameters
+    ----------
+    name : str
+        Unique name registered in jam_scene (e.g. "jam_0").
+    initial_position : list[float] or None
+        [x, y] starting position in metres.  None -> sampled uniformly from
+        the map bounds at startup.
+    initial_power_dbm : float
+        Starting transmit power [dBm].
+    power_dbm_bounds : tuple[float, float]
+        (min, max) dBm clamp applied after each gradient step.
+    """
+    name: str
+    initial_position: Optional[list] = None   # [x, y]; None = random
+    initial_power_dbm: float = 23.0
+    power_dbm_bounds: tuple = (0.0, 40.0)
 
 
 # ---------------------------------------------------------------------------
@@ -128,9 +154,14 @@ def _setup_tx_state(scene, cfg: TxConfig, scene_xml_path: str, qrand) -> dict:
     tx_position = [tx_x, tx_y, tx_z]
     tx_power_dbm = float(tx.power_dbm[0])
 
-    tx_placement = TxPlacement(
-        scene, cfg.name, scene_xml_path, cfg.building_id, create_if_missing=False
-    )
+    if cfg.on_building:
+        tx_placement = TxPlacement(
+            scene, cfg.name, scene_xml_path, cfg.building_id, create_if_missing=False
+        )
+    else:
+        tx_placement = TxPlacement(
+            scene, cfg.name, scene_xml_path, None, create_if_missing=False
+        )
 
     # Zone geometry --------------------------------------------------------
     zone_type = "polygon" if "vertices" in cfg.zone_params else "box"
@@ -218,8 +249,18 @@ def _setup_tx_state(scene, cfg: TxConfig, scene_xml_path: str, qrand) -> dict:
 
 
 def _param_strides(tx_configs):
-    """Return (strides, offsets) for the flat parameter list."""
+    """Return (strides, offsets) for the gNB flat parameter list."""
     strides = [5 if cfg.optimize_power else 4 for cfg in tx_configs]
+    offsets = [sum(strides[:k]) for k in range(len(strides))]
+    return strides, offsets
+
+
+def _jam_param_strides(jam_configs):
+    """Return (strides, offsets) for the jammer flat parameter list.
+
+    Each jammer always contributes exactly 3 params: [x, y, power_dbm].
+    """
+    strides = [3] * len(jam_configs)
     offsets = [sum(strides[:k]) for k in range(len(strides))]
     return strides, offsets
 
@@ -617,12 +658,16 @@ def _extract_per_rx_power(h_real, h_imag, tx_idx: int):
 def _sir_loss_body(
     all_params, N, tx_configs, tx_states, scene, p_solver,
     map_config, noise_power, sampler, sampling_strata, rx_objects,
-    ref_powers_dbm, epsilon=1e-30,
+    ref_powers_dbm, jam_configs, jam_scene, jam_rx_objects, jam_objects,
+    epsilon=1e-30,
 ):
     """Core SIR loss (executes inside the @dr.wrap DrJit context).
 
-    all_params : list of DrJit Float scalars ordered as:
-        [az_0, el_0, x_0, y_0, (pow_0,)  az_1, el_1, x_1, y_1, (pow_1,) ...]
+    Runs two PathSolver calls: one for gNB signal (directional pattern) and
+    one for jammer interference (iso pattern) using a separate jam_scene.
+
+    all_params : flat list of DrJit Float scalars:
+        [az_0, el_0, x_0, y_0, (pow_0,) ...gNB params...  x_j0, y_j0, pdbm_j0, ...]
     """
     deg2rad = Float(float(np.pi / 180.0))
     dr.disable_grad(deg2rad)
@@ -690,7 +735,7 @@ def _sir_loss_body(
             )
 
     # ------------------------------------------------------------------
-    # Single PathSolver call
+    # gNB PathSolver call (directional pattern, scene)
     # ------------------------------------------------------------------
     paths = p_solver(
         scene,
@@ -703,20 +748,90 @@ def _sir_loss_body(
     # h_real shape: (total_rx, N, max_paths, rx_ant, tx_ant) - DrJit TensorXf
 
     # ------------------------------------------------------------------
-    # Per-TX power vectors (length total_rx each)
+    # Per-gNB power vectors (length total_rx each)
     # ------------------------------------------------------------------
     tx_power_vecs = []
     for j in range(N):
         p_raw = _extract_per_rx_power(h_real, h_imag, j)
-        # Apply power scale (differentiable if optimize_power)
         tx_power_vecs.append(p_raw * pow_scales[j])
 
+    # Force evaluation so h_real/h_imag GPU buffers can actually be released
+    # before the jammer solve allocates its own path data.
+    dr.eval(*tx_power_vecs)
+    del paths, h_real, h_imag
+
     # ------------------------------------------------------------------
-    # SIR loss: sum over all zones
+    # Set jammer positions and compute power scale factors
+    # ------------------------------------------------------------------
+    _, gnb_offsets = _param_strides(tx_configs)
+    total_gnb_params = gnb_offsets[-1] + (5 if tx_configs[-1].optimize_power else 4)
+    _, jam_offsets = _jam_param_strides(jam_configs)
+
+    jam_pow_scales = []
+    for j, jcfg in enumerate(jam_configs):
+        b   = total_gnb_params + jam_offsets[j]
+        xj  = all_params[b];     dr.enable_grad(xj.array)
+        yj  = all_params[b + 1]; dr.enable_grad(yj.array)
+        pj  = all_params[b + 2]; dr.enable_grad(pj.array)
+
+        pos_jit = Float(float(np.random.normal(0.0, 0.1)))
+        dr.disable_grad(pos_jit)
+
+        jam_scene.get(jcfg.name).position = [
+            xj + pos_jit,
+            yj + pos_jit,
+            Float(10.0),
+        ]
+        scale_j = dr.power(
+            Float(10.0),
+            (pj - Float(float(jcfg.initial_power_dbm))) / Float(10.0),
+        )
+        jam_pow_scales.append(scale_j)
+
+    # Sync jam_rx_objects positions to match the current receiver layout.
+    for rx_name, jam_rx in jam_rx_objects.items():
+        jam_rx.position = rx_objects[rx_name].position
+
+    # ------------------------------------------------------------------
+    # Jammer PathSolver call (iso pattern, jam_scene)
+    # ------------------------------------------------------------------
+    # Diffuse reflection is disabled for the jammer solve: it is the most
+    # memory-intensive mode and an interference model does not require it.
+    jam_paths = p_solver(
+        jam_scene,
+        los=True,
+        refraction=False,
+        specular_reflection=True,
+        diffuse_reflection=False,
+    )
+    jh_real, jh_imag = jam_paths.a
+
+    # Per-jammer power vectors (length total_rx each)
+    J = len(jam_configs)
+    jam_power_vecs = []
+    for j in range(J):
+        jp_raw = _extract_per_rx_power(jh_real, jh_imag, j)
+        jam_power_vecs.append(jp_raw * jam_pow_scales[j])
+
+    dr.eval(*jam_power_vecs)
+    del jam_paths, jh_real, jh_imag
+
+    # ------------------------------------------------------------------
+    # Loss: signal / (gNB cross-interference + jammer interference + noise)
     # ------------------------------------------------------------------
     eps_f   = Float(float(epsilon));  dr.disable_grad(eps_f)
     noise_f = Float(float(noise_power)); dr.disable_grad(noise_f)
     total_loss = Float(0.0);  dr.disable_grad(total_loss)
+
+    # Sum jammer power across all jammers at every receiver point.
+    total_jam_power = None
+    for jp in jam_power_vecs:
+        total_jam_power = jp if total_jam_power is None else (total_jam_power + jp)
+
+    # Debug: verify both solves produced non-trivial power.
+    print(f"  [dbg] mean gNB power  : {dr.mean(tx_power_vecs[0])}")
+    if total_jam_power is not None:
+        print(f"  [dbg] mean jam power  : {dr.mean(total_jam_power)}")
 
     for i, (cfg, state_i) in enumerate(zip(tx_configs, tx_states)):
         sl    = state_i["rx_slice"]
@@ -725,67 +840,87 @@ def _sir_loss_body(
         # calls .array and strips AD gradient tracking.
         p_sig = tx_power_vecs[i][sl.start:sl.stop]
 
-        p_int = None
+        # gNB cross-interference from other base stations.
+        p_gnb_int = None
         for j in range(N):
             if j == i:
                 continue
             p_int_j = tx_power_vecs[j][sl.start:sl.stop]
-            p_int = p_int_j if p_int is None else (p_int + p_int_j)
+            p_gnb_int = p_int_j if p_gnb_int is None else (p_gnb_int + p_int_j)
 
-        if p_int is None:
-            # N == 1: no interference — optimise raw log-power
-            metric = p_sig
+        # Jammer interference at this zone's receivers.
+        p_jam_int = total_jam_power[sl.start:sl.stop] if total_jam_power is not None else noise_f
+
+        # Denominator: cross-interference + jammer + noise floor.
+        if p_gnb_int is not None:
+            denom = p_gnb_int + p_jam_int + noise_f
         else:
-            metric = p_sig / (p_int + noise_f)
+            denom = p_jam_int + noise_f
+
+        metric = p_sig / denom
+        print(f"  [dbg] {cfg.name} mean SIR : {dr.mean(metric)}")
 
         loss_i = -dr.mean(dr.log(metric + eps_f))
         total_loss = total_loss + loss_i
 
-    return total_loss, paths
+    return total_loss
 
 
 def _make_compute_sir_loss(
     N, tx_configs, tx_states, scene, p_solver,
     map_config, noise_power, sampler, sampling_strata,
-    rx_objects, ref_powers_dbm,
+    rx_objects, ref_powers_dbm, jam_configs, jam_scene, jam_rx_objects, jam_objects,
 ):
     """Build and return the @dr.wrap-decorated SIR loss function.
 
     Uses exec() to produce a function with a *fixed* positional signature
     matching exactly the number of scalar parameters — required by @dr.wrap.
+    The flat signature is: [gNB params...] + [jammer params...]
+    where each jammer contributes [x, y, power_dbm].
     """
-    _, offsets = _param_strides(tx_configs)
-    total_params = offsets[-1] + (5 if tx_configs[-1].optimize_power else 4)
+    _, gnb_offsets = _param_strides(tx_configs)
+    _, jam_offsets = _jam_param_strides(jam_configs)
+    total_jam_params = (jam_offsets[-1] + 3) if jam_configs else 0
 
+    # gNB param names: p0, p1, ...
     arg_names = []
     for i, cfg in enumerate(tx_configs):
-        b = offsets[i]
+        b = gnb_offsets[i]
         arg_names += [f"p{b}", f"p{b+1}", f"p{b+2}", f"p{b+3}"]
         if cfg.optimize_power:
             arg_names.append(f"p{b+4}")
 
-    arg_str = ", ".join(arg_names)
+    # Jammer param names: j0, j1, ... (appended after gNB params)
+    for k in range(total_jam_params):
+        arg_names.append(f"j{k}")
+
+    arg_str  = ", ".join(arg_names)
     list_str = "[" + ", ".join(arg_names) + "]"
 
     func_code = (
         f"def _inner({arg_str}):\n"
         f"    return _body({list_str}, _N, _cfgs, _states, _scene, _psolver,\n"
-        f"                 _mcfg, _noise, _sampler, _strata, _rxobj, _refpow)\n"
+        f"                 _mcfg, _noise, _sampler, _strata, _rxobj, _refpow,\n"
+        f"                 _jam_cfgs, _jam_scene, _jam_rxobj, _jam_obj)\n"
     )
 
     globs = {
-        "_body":    _sir_loss_body,
-        "_N":       N,
-        "_cfgs":    tx_configs,
-        "_states":  tx_states,
-        "_scene":   scene,
-        "_psolver": p_solver,
-        "_mcfg":    map_config,
-        "_noise":   noise_power,
-        "_sampler": sampler,
-        "_strata":  sampling_strata,
-        "_rxobj":   rx_objects,
-        "_refpow":  ref_powers_dbm,
+        "_body":     _sir_loss_body,
+        "_N":        N,
+        "_cfgs":     tx_configs,
+        "_states":   tx_states,
+        "_scene":    scene,
+        "_psolver":  p_solver,
+        "_mcfg":     map_config,
+        "_noise":    noise_power,
+        "_sampler":  sampler,
+        "_strata":   sampling_strata,
+        "_rxobj":    rx_objects,
+        "_refpow":   ref_powers_dbm,
+        "_jam_cfgs": jam_configs,
+        "_jam_scene": jam_scene,
+        "_jam_rxobj": jam_rx_objects,
+        "_jam_obj":  jam_objects,
     }
     exec(func_code, globs)
     inner_fn = globs["_inner"]
@@ -801,6 +936,8 @@ def optimize_multi_tx(
     tx_configs: list,
     map_config: dict,
     scene_xml_path: str,
+    jammer_array: AntennaArray,
+    jam_configs: list,
     learning_rate: float = 3.0,
     num_iterations: int = 50,
     noise_power: float = 1e-10,
@@ -883,6 +1020,14 @@ def optimize_multi_tx(
     N = len(tx_configs)
     assert N >= 1, "tx_configs must contain at least one TxConfig"
 
+    # Set up randrange boundaries based on map size
+    # Starting with randomly placed receivers
+    lower_bound_x = map_config['center'][0] - map_config['size'][0] / 2
+    print(lower_bound_x)
+    upper_bound_x = map_config['center'][0] + map_config['size'][0] / 2
+    lower_bound_y = map_config['center'][1] - map_config['size'][1] / 2
+    upper_bound_y = map_config['center'][1] + map_config['size'][1] / 2
+
     if verbose:
         print(f"\n{'='*70}")
         print(f"MULTI-TX SIR OPTIMIZATION  ({N} transmitters)")
@@ -921,6 +1066,44 @@ def optimize_multi_tx(
         scene.add(rx)
         rx_objects[rx_name] = rx
 
+    # ------------------------------------------------------------------
+    # Build a separate jam_scene for the jammer solve.
+    # Jammers use an isotropic antenna pattern and must be isolated from
+    # the gNB scene so each solve uses a different tx_array.
+    # ------------------------------------------------------------------
+    jam_scene = load_scene(scene_xml_path)
+    jam_scene.frequency = scene.frequency
+    for mat_name, mat in scene.radio_materials.items():
+        if mat_name in jam_scene.radio_materials:
+            jam_scene.radio_materials[mat_name].scattering_coefficient = (
+                mat.scattering_coefficient
+            )
+    jam_scene.tx_array = jammer_array
+    jam_scene.rx_array = scene.rx_array
+
+    # Add jammers as Transmitter objects driven by JammerConfig.
+    # initial_position=None -> sample uniformly from map bounds.
+    jam_objects = {}
+    for jcfg in jam_configs:
+        if jcfg.initial_position is not None:
+            jx, jy = float(jcfg.initial_position[0]), float(jcfg.initial_position[1])
+        else:
+            jx = float(random.randrange(int(lower_bound_x), int(upper_bound_x), 1))
+            jy = float(random.randrange(int(lower_bound_y), int(upper_bound_y), 1))
+        pos = mi.Point3f([jx, jy, 10.0])
+        jammer = Transmitter(name=jcfg.name, position=pos,
+                             power_dbm=jcfg.initial_power_dbm)
+        jam_scene.add(jammer)
+        jam_objects[jcfg.name] = jammer
+
+    # Mirror the receiver pool in jam_scene so the second solve has targets.
+    jam_rx_objects = {}
+    for idx in range(total_rx):
+        rx_name = f"opt_rx_{idx}"
+        jam_rx = Receiver(name=rx_name, position=[0.0, 0.0, 0.0])
+        jam_scene.add(jam_rx)
+        jam_rx_objects[rx_name] = jam_rx
+
     if verbose:
         print(f"Pre-created {total_rx} receivers "
               f"({[cfg.num_sample_points for cfg in tx_configs]} per zone)")
@@ -937,6 +1120,7 @@ def optimize_multi_tx(
         N, tx_configs, tx_states, scene, p_solver,
         map_config, noise_power, sampler, sampling_strata,
         rx_objects, ref_powers_dbm,
+        jam_configs, jam_scene, jam_rx_objects, jam_objects,
     )
 
     # ------------------------------------------------------------------
@@ -957,7 +1141,19 @@ def optimize_multi_tx(
             params.append(torch.tensor(state["initial_power_dbm"], device="cuda",
                                        dtype=torch.float32, requires_grad=True))
 
-    optimizer = torch.optim.Adam(params, lr=learning_rate, betas=(0.9, 0.999))
+    # Jammer params: [x, y, power_dbm] per jammer (always all three).
+    jam_params = []
+    for jcfg in jam_configs:
+        jammer = jam_objects[jcfg.name]
+        init_pos = jammer.position.numpy().flatten()
+        jam_params.append(torch.tensor(float(init_pos[0]), device="cuda",
+                                       dtype=torch.float32, requires_grad=True))
+        jam_params.append(torch.tensor(float(init_pos[1]), device="cuda",
+                                       dtype=torch.float32, requires_grad=True))
+        jam_params.append(torch.tensor(jcfg.initial_power_dbm, device="cuda",
+                                       dtype=torch.float32, requires_grad=True))
+
+    optimizer = torch.optim.Adam(params + jam_params, lr=learning_rate, betas=(0.9, 0.999))
     #optimizer = torch.optim.SGD(params, lr=learning_rate, momentum=0.25)
 
     # ------------------------------------------------------------------
@@ -995,35 +1191,34 @@ def optimize_multi_tx(
 
         # Single RadioMap pass — rm.rss shape (N_tx, H, W) gives per-TX
         # cell-aggregated power, smoothing out multipath fades.
-        rm = rm_solver(
-            scene,
-            max_depth=12,
-            samples_per_tx=int(100e7),
-            cell_size=[1.0, 1.0],
-            center=map_config["center"],
-            orientation=[0, 0, 0],
-            size=map_config["size"],
-            los=True,
-            specular_reflection=True,
-            diffuse_reflection=True,
-            diffraction=True,
-            edge_diffraction=True,
-            refraction=False,
-            stop_threshold=None,
-        )
-
-        # Per-TX dead zone accumulation — skip entirely in 'full' mode
-        # since dead zones are never used for sampling there.
         if sampling_strata != "full":
+            # Calculate Coverage
+            rm = rm_solver(
+                scene,
+                max_depth=12,
+                samples_per_tx=int(100e7),
+                cell_size=[1.0, 1.0],
+                center=map_config["center"],
+                orientation=[0, 0, 0],
+                size=map_config["size"],
+                los=True,
+                specular_reflection=True,
+                diffuse_reflection=True,
+                diffraction=True,
+                edge_diffraction=True,
+                refraction=False,
+                stop_threshold=None,
+            )
+            # Cluster and build dead zones
             for i, (cfg, state) in enumerate(zip(tx_configs, tx_states)):
                 _accumulate_dead_zones(
                     state, cfg, i, rm,
                     map_config, dead_tail_percentile, max_dbscan_points,
                     debug_viz=debug_viz, iteration=iteration,
                 )
-
+            
         # Differentiable forward pass
-        loss, path_out = compute_sir_loss(*params)
+        loss = compute_sir_loss(*params, *jam_params)
         loss.backward()
 
         optimizer.step()
@@ -1041,12 +1236,15 @@ def optimize_multi_tx(
                 if az_t.item() >= 360.0:
                     az_t.fill_(az_t.item() % 360.0)
 
-                # Position: project to building polygon
-                proj_x, proj_y = state["tx_placement"].project_to_polygon(
-                    x_t.item(), y_t.item()
-                )
-                x_t.data.fill_(proj_x)
-                y_t.data.fill_(proj_y)
+                # Iterate through the transmitters and project if they are constrained to a building.
+                for i in range(N):
+                    if tx_configs[i].on_building:
+                        # Position: project to building polygon
+                        proj_x, proj_y = state["tx_placement"].project_to_polygon(
+                            x_t.item(), y_t.item()
+                        )
+                        x_t.data.fill_(proj_x)
+                        y_t.data.fill_(proj_y)
 
                 # Power clamp
                 if cfg.optimize_power:
@@ -1056,6 +1254,7 @@ def optimize_multi_tx(
         # Track histories
         loss_val = float(loss.item())
         loss_history.append(loss_val)
+
         for i, cfg in enumerate(tx_configs):
             b = offsets[i]
             az_val = float(params[b].item())
@@ -1092,6 +1291,11 @@ def optimize_multi_tx(
             dur = time.time() - iter_start
             print(f"  Iter {iteration+1:3d}/{num_iterations}  loss={loss_val:.4f}  "
                   f"({dur:.1f}s)")
+
+        # Make sure there are no memory leaks...    
+        del loss
+        torch.cuda.empty_cache()
+        dr.flush_malloc_cache()
 
     # ------------------------------------------------------------------
     # 8. Finalise: reset scene to plain-float state; remove temp receivers
