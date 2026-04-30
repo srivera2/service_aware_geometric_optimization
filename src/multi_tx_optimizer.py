@@ -77,8 +77,6 @@ class TxConfig:
             {'vertices': [(x1,y1), ...]}                   # polygon
     tx_height_offset : float
         Metres above the rooftop surface (default 10 m).
-    num_sample_points : int
-        Receivers sampled per iteration for this TX's zone.
     optimize_power : bool
         If True, tx.power_dbm is an optimisable parameter.
     initial_power_dbm : float or None
@@ -95,7 +93,6 @@ class TxConfig:
     building_id: int
     zone_params: dict
     tx_height_offset: float = 10.0
-    num_sample_points: int = 100
     optimize_power: bool = False
     initial_power_dbm: Optional[float] = None
     power_dbm_bounds: tuple = (0.0, 50.0)
@@ -132,16 +129,16 @@ class JammerConfig:
 def _make_qrand(lds: str):
     """Return a scipy QMC sampler (or None for pure uniform)."""
     if lds == "Sobol":
-        return scipy.stats.qmc.Sobol(d=3, scramble=True, seed=None)
+        return scipy.stats.qmc.Sobol(d=3, scramble=False, seed=None)
     elif lds == "Halton":
-        return scipy.stats.qmc.Halton(d=3, scramble=True, seed=None)
+        return scipy.stats.qmc.Halton(d=3, scramble=False, seed=None)
     elif lds == "Latin":
-        return scipy.stats.qmc.LatinHypercube(d=3, scramble=True, seed=None)
+        return scipy.stats.qmc.LatinHypercube(d=3, scramble=False, seed=None)
     elif lds == "Uniform":
         return None
     else:
         warnings.warn(f"Unknown LDS '{lds}'. Falling back to Halton.")
-        return scipy.stats.qmc.Halton(d=3, scramble=True, seed=None)
+        return scipy.stats.qmc.Halton(d=3, scramble=False, seed=None)
 
 
 def _setup_tx_state(scene, cfg: TxConfig, scene_xml_path: str, qrand) -> dict:
@@ -657,7 +654,7 @@ def _extract_per_rx_power(h_real, h_imag, tx_idx: int):
 
 def _sir_loss_body(
     all_params, N, tx_configs, tx_states, scene, p_solver,
-    map_config, noise_power, sampler, sampling_strata, rx_objects,
+    noise_power, rx_objects,
     ref_powers_dbm, jam_configs, jam_scene, jam_rx_objects, jam_objects,
     epsilon=1e-30,
 ):
@@ -720,21 +717,6 @@ def _sir_loss_body(
         ]
 
     # ------------------------------------------------------------------
-    # Resample and reposition receivers for each zone
-    # ------------------------------------------------------------------
-    ground_z = map_config["center"][2]
-    for i, (cfg, state_i) in enumerate(zip(tx_configs, tx_states)):
-        n      = cfg.num_sample_points
-        pts    = _sample_zone_points(state_i, cfg, n, sampler, sampling_strata, ground_z)
-        state_i["current_sample_points"] = pts
-        sl     = state_i["rx_slice"]
-        for k, pos in enumerate(pts):
-            rx_name = f"opt_rx_{sl.start + k}"
-            rx_objects[rx_name].position = mi.Point3f(
-                float(pos[0]), float(pos[1]), float(pos[2])
-            )
-
-    # ------------------------------------------------------------------
     # gNB PathSolver call (directional pattern, scene)
     # ------------------------------------------------------------------
     paths = p_solver(
@@ -788,10 +770,6 @@ def _sir_loss_body(
         )
         jam_pow_scales.append(scale_j)
 
-    # Sync jam_rx_objects positions to match the current receiver layout.
-    for rx_name, jam_rx in jam_rx_objects.items():
-        jam_rx.position = rx_objects[rx_name].position
-
     # ------------------------------------------------------------------
     # Jammer PathSolver call (iso pattern, jam_scene)
     # ------------------------------------------------------------------
@@ -817,59 +795,51 @@ def _sir_loss_body(
     del jam_paths, jh_real, jh_imag
 
     # ------------------------------------------------------------------
-    # Loss: signal / (gNB cross-interference + jammer interference + noise)
+    # Loss: at each receiver, the UE selects the BS with highest SINR.
+    # SINR_i[k] = P_i[k] / (cross-gNB interference + jammer + noise)
+    # loss = -mean_k( log( max_i SINR_i[k] ) )
     # ------------------------------------------------------------------
     eps_f   = Float(float(epsilon));  dr.disable_grad(eps_f)
     noise_f = Float(float(noise_power)); dr.disable_grad(noise_f)
-    total_loss = Float(0.0);  dr.disable_grad(total_loss)
 
-    # Sum jammer power across all jammers at every receiver point.
+    # Total jammer power at every receiver (sum across all jammers).
     total_jam_power = None
     for jp in jam_power_vecs:
         total_jam_power = jp if total_jam_power is None else (total_jam_power + jp)
 
-    # Debug: verify both solves produced non-trivial power.
-    print(f"  [dbg] mean gNB power  : {dr.mean(tx_power_vecs[0])}")
-    if total_jam_power is not None:
-        print(f"  [dbg] mean jam power  : {dr.mean(total_jam_power)}")
+    # Per-BS SINR at every receiver; take element-wise maximum across BS.
+    best_sinr = None
+    for i in range(N):
+        p_sig = tx_power_vecs[i]
 
-    for i, (cfg, state_i) in enumerate(zip(tx_configs, tx_states)):
-        sl    = state_i["rx_slice"]
-
-        # Slice the TensorXf directly — avoids dr.gather which internally
-        # calls .array and strips AD gradient tracking.
-        p_sig = tx_power_vecs[i][sl.start:sl.stop]
-
-        # gNB cross-interference from other base stations.
         p_gnb_int = None
         for j in range(N):
             if j == i:
                 continue
-            p_int_j = tx_power_vecs[j][sl.start:sl.stop]
-            p_gnb_int = p_int_j if p_gnb_int is None else (p_gnb_int + p_int_j)
+            p_gnb_int = tx_power_vecs[j] if p_gnb_int is None else (p_gnb_int + tx_power_vecs[j])
 
-        # Jammer interference at this zone's receivers.
-        p_jam_int = total_jam_power[sl.start:sl.stop] if total_jam_power is not None else noise_f
-
-        # Denominator: cross-interference + jammer + noise floor.
+        denom = noise_f
         if p_gnb_int is not None:
-            denom = p_gnb_int + p_jam_int + noise_f
-        else:
-            denom = p_jam_int + noise_f
+            denom = denom + p_gnb_int
+        if total_jam_power is not None:
+            denom = denom + total_jam_power
 
-        metric = p_sig / denom
-        print(f"  [dbg] {cfg.name} mean SIR : {dr.mean(metric)}")
+        sinr_i = p_sig / denom
+        best_sinr = sinr_i if best_sinr is None else dr.maximum(best_sinr, sinr_i)
 
-        loss_i = -dr.mean(dr.log(metric + eps_f))
-        total_loss = total_loss + loss_i
+    # Debug: verify both solves produced plausible values.
+    print(f"  [dbg] mean gNB power  : {dr.mean(tx_power_vecs[0])}")
+    if total_jam_power is not None:
+        print(f"  [dbg] mean jam power  : {dr.mean(total_jam_power)}")
+    print(f"  [dbg] mean best-SINR  : {dr.mean(best_sinr)}")
 
-    return total_loss
+    return -dr.mean(dr.log(best_sinr + eps_f))
 
 
 def _make_compute_sir_loss(
     N, tx_configs, tx_states, scene, p_solver,
-    map_config, noise_power, sampler, sampling_strata,
-    rx_objects, ref_powers_dbm, jam_configs, jam_scene, jam_rx_objects, jam_objects,
+    noise_power, rx_objects, ref_powers_dbm,
+    jam_configs, jam_scene, jam_rx_objects, jam_objects,
 ):
     """Build and return the @dr.wrap-decorated SIR loss function.
 
@@ -900,7 +870,7 @@ def _make_compute_sir_loss(
     func_code = (
         f"def _inner({arg_str}):\n"
         f"    return _body({list_str}, _N, _cfgs, _states, _scene, _psolver,\n"
-        f"                 _mcfg, _noise, _sampler, _strata, _rxobj, _refpow,\n"
+        f"                 _noise, _rxobj, _refpow,\n"
         f"                 _jam_cfgs, _jam_scene, _jam_rxobj, _jam_obj)\n"
     )
 
@@ -911,10 +881,7 @@ def _make_compute_sir_loss(
         "_states":   tx_states,
         "_scene":    scene,
         "_psolver":  p_solver,
-        "_mcfg":     map_config,
         "_noise":    noise_power,
-        "_sampler":  sampler,
-        "_strata":   sampling_strata,
         "_rxobj":    rx_objects,
         "_refpow":   ref_powers_dbm,
         "_jam_cfgs": jam_configs,
@@ -940,6 +907,7 @@ def optimize_multi_tx(
     jam_configs: list,
     learning_rate: float = 3.0,
     num_iterations: int = 50,
+    num_sample_points: int = 100,
     noise_power: float = 1e-10,
     dead_tail_percentile: float = 1.0,
     max_dbscan_points: int = 100_000,
@@ -1043,15 +1011,13 @@ def optimize_multi_tx(
                  for cfg in tx_configs]
 
     # ------------------------------------------------------------------
-    # 2. Assign receiver index slices
+    # 2. All BSes share the same receiver pool (global shared zone).
     # ------------------------------------------------------------------
-    offset = 0
-    for cfg, state in zip(tx_configs, tx_states):
-        n = cfg.num_sample_points
-        state["rx_slice"] = slice(offset, offset + n)
-        state["rx_indices_drjit"] = None  # unused — kept for schema consistency
-        offset += n
-    total_rx = offset
+    total_rx = num_sample_points
+    shared_slice = slice(0, total_rx)
+    for state in tx_states:
+        state["rx_slice"] = shared_slice
+        state["rx_indices_drjit"] = None
 
     # ------------------------------------------------------------------
     # 3. Clear existing receivers; pre-create total_rx receivers at origin
@@ -1090,7 +1056,7 @@ def optimize_multi_tx(
         else:
             jx = float(random.randrange(int(lower_bound_x), int(upper_bound_x), 1))
             jy = float(random.randrange(int(lower_bound_y), int(upper_bound_y), 1))
-        pos = mi.Point3f([jx, jy, 10.0])
+        pos = mi.Point3f([jx, jy, 45.0])
         jammer = Transmitter(name=jcfg.name, position=pos,
                              power_dbm=jcfg.initial_power_dbm)
         jam_scene.add(jammer)
@@ -1105,8 +1071,22 @@ def optimize_multi_tx(
         jam_rx_objects[rx_name] = jam_rx
 
     if verbose:
-        print(f"Pre-created {total_rx} receivers "
-              f"({[cfg.num_sample_points for cfg in tx_configs]} per zone)")
+        print(f"Pre-created {total_rx} shared receivers across {N} base stations")
+
+    # ------------------------------------------------------------------
+    # Pre-sample fixed receiver positions once for the shared zone.
+    # All BS states reference the same point set.
+    # ------------------------------------------------------------------
+    ground_z = float(map_config["center"][2]) if len(map_config["center"]) > 2 else 0.0
+    pts = _sample_zone_points(tx_states[0], tx_configs[0], num_sample_points,
+                              sampler, "full", ground_z)
+    for state in tx_states:
+        state["current_sample_points"] = pts
+    for k, pos in enumerate(pts):
+        rx_name = f"opt_rx_{k}"
+        p3 = mi.Point3f(float(pos[0]), float(pos[1]), float(pos[2]))
+        rx_objects[rx_name].position = p3
+        jam_rx_objects[rx_name].position = p3
 
     # ------------------------------------------------------------------
     # 4. PathSolver + @dr.wrap closure
@@ -1118,8 +1098,7 @@ def optimize_multi_tx(
 
     compute_sir_loss = _make_compute_sir_loss(
         N, tx_configs, tx_states, scene, p_solver,
-        map_config, noise_power, sampler, sampling_strata,
-        rx_objects, ref_powers_dbm,
+        noise_power, rx_objects, ref_powers_dbm,
         jam_configs, jam_scene, jam_rx_objects, jam_objects,
     )
 
@@ -1285,7 +1264,14 @@ def optimize_multi_tx(
             ]
 
         if on_iteration_callback is not None:
-            on_iteration_callback(iteration, tx_states, tx_configs)
+            _, joff = _jam_param_strides(jam_configs)
+            jam_positions = [
+                [float(jam_params[joff[j]].item()),
+                 float(jam_params[joff[j] + 1].item())]
+                for j in range(len(jam_configs))
+            ]
+            on_iteration_callback(iteration, tx_states, tx_configs,
+                                  jam_positions=jam_positions)
 
         if verbose:
             dur = time.time() - iter_start
