@@ -696,12 +696,33 @@ def visualize_multi_tx_strata(
                 if part.geom_type == "Polygon":
                     ax.fill(*part.exterior.xy, **kwargs)
 
-    # 1. Zone background and outline — use first state
+    from shapely.affinity import scale as _shapely_scale
+
+    # 1. Zone background, outer-ring, and outlines — use first state
     first_state = tx_states[0]
     draw_box = first_state.get("box_polygon") or first_state.get("zone_polygon")
+    zone_poly = first_state.get("zone_polygon")
+
+    box_poly = first_state.get("box_polygon")
+    if box_poly is not None:
+        # Outer ring: scale raw box 2x, subtract original box, then punch out buildings.
+        # Mirrors _sample_outside_zone exactly — never scale the building-subtracted polygon.
+        centroid = box_poly.centroid
+        outer_poly = _shapely_scale(box_poly, xfact=2.0, yfact=2.0, origin=centroid)
+        outer_ring = outer_poly.difference(box_poly)
+        cached_bldgs = first_state.get("cached_building_polygons", [])
+        if cached_bldgs:
+            import shapely.ops as _shops
+            outer_ring = outer_ring.difference(_shops.unary_union(cached_bldgs))
+        _fill_geom(outer_ring, alpha=0.10, fc="#e74c3c", ec="none", zorder=0)
+        outer_geoms = [outer_poly] if outer_poly.geom_type == "Polygon" else list(outer_poly.geoms)
+        for j, part in enumerate(outer_geoms):
+            ax.plot(*part.exterior.xy, color="#c0392b", linewidth=1.5,
+                    linestyle=":", zorder=5,
+                    label="Outer Ring (2×)" if j == 0 else None)
+
     if draw_box is not None:
-        _fill_geom(draw_box, alpha=0.12, fc="green", ec="none", zorder=1)
-        outline = draw_box if draw_box.geom_type == "Polygon" else draw_box.geoms
+        _fill_geom(draw_box, alpha=0.15, fc="green", ec="none", zorder=1)
         geoms = [draw_box] if draw_box.geom_type == "Polygon" else list(draw_box.geoms)
         for j, part in enumerate(geoms):
             ax.plot(*part.exterior.xy, color="steelblue", linewidth=2,
@@ -717,7 +738,7 @@ def visualize_multi_tx_strata(
         except Exception:
             pass
 
-    # 3. Shared sample points — use first state that has them
+    # 3a. Inside sample points
     sample_pts = None
     for state in tx_states:
         pts = state.get("current_sample_points")
@@ -728,7 +749,20 @@ def visualize_multi_tx_strata(
         ax.scatter(sample_pts[:, 0], sample_pts[:, 1],
                    c="white", s=18, alpha=0.85, marker="o",
                    edgecolors="black", linewidths=0.4,
-                   zorder=6, label=f"Receivers ({len(sample_pts)})")
+                   zorder=6, label=f"RX inside ({len(sample_pts)})")
+
+    # 3b. Outside sample points
+    outside_pts = None
+    for state in tx_states:
+        pts = state.get("outside_sample_points")
+        if pts is not None and len(pts) > 0:
+            outside_pts = pts
+            break
+    if outside_pts is not None:
+        ax.scatter(outside_pts[:, 0], outside_pts[:, 1],
+                   c="#e74c3c", s=18, alpha=0.75, marker="x",
+                   linewidths=0.6,
+                   zorder=6, label=f"RX outside ({len(outside_pts)})")
 
     # 4. Base station positions
     for k, (state, cfg) in enumerate(zip(tx_states, tx_configs)):

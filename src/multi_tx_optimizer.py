@@ -11,7 +11,7 @@ Public API
 ----------
 TxConfig                       : dataclass describing one transmitter
 optimize_multi_tx()            : run the joint optimization
-compare_multi_tx_performance() : evaluate initial vs optimised configs (RSRP + SIR)
+compare_multi_tx_performance() : evaluate optimised BS-only SINR containment within target zone
 """
 
 from __future__ import annotations
@@ -33,6 +33,7 @@ import torch
 import drjit as dr
 import random
 from drjit.auto import Float
+from shapely.affinity import scale as shapely_scale
 from shapely.geometry import Polygon as ShapelyPolygon
 from sklearn.cluster import HDBSCAN, DBSCAN
 from sionna.rt import load_scene, PathSolver, RadioMapSolver, Transmitter, Receiver, cpx_abs_square, AntennaArray
@@ -394,6 +395,41 @@ def _sample_zone_points(state: dict, cfg: TxConfig, n: int,
         raise ValueError(f"Unknown sampling_strata: {sampling_strata!r}")
 
 
+def _sample_outside_zone(state: dict, n: int, ground_z: float) -> np.ndarray:
+    """Sample n points in the ring between the zone and its 2x-scaled version.
+
+    Scale the raw box polygon (no building exclusions applied yet), subtract the
+    original box, then punch out building footprints from the ring so that the
+    outer region geometry is consistent with the inside zone.
+    """
+    from shapely import contains_xy as _cxy
+    import shapely.ops
+
+    box_poly = state["box_polygon"]
+    centroid = box_poly.centroid
+    outer_poly = shapely_scale(box_poly, xfact=2.0, yfact=2.0, origin=centroid)
+    outer_ring = outer_poly.difference(box_poly)
+
+    cached_bldgs = state.get("cached_building_polygons", [])
+    if cached_bldgs:
+        bldg_union = shapely.ops.unary_union(cached_bldgs)
+        outer_ring = outer_ring.difference(bldg_union)
+
+    minx, miny, maxx, maxy = outer_ring.bounds
+    rng = np.random.default_rng()
+    pts: list = []
+    while len(pts) < n:
+        batch = max((n - len(pts)) * 4, 512)
+        xs = rng.uniform(minx, maxx, batch)
+        ys = rng.uniform(miny, maxy, batch)
+        mask = _cxy(outer_ring, xs, ys)
+        for x, y in zip(xs[mask], ys[mask]):
+            pts.append([x, y, ground_z])
+            if len(pts) >= n:
+                break
+    return np.array(pts[:n], dtype=np.float32)
+
+
 def _accumulate_dead_zones(
     state, cfg, tx_idx, rm,
     map_config, dead_tail_percentile, max_dbscan_points,
@@ -656,15 +692,40 @@ def _sir_loss_body(
     all_params, N, tx_configs, tx_states, scene, p_solver,
     noise_power, rx_objects,
     ref_powers_dbm, jam_configs, jam_scene, jam_rx_objects, jam_objects,
+    num_inside=None,
+    boundary_mask=None,
+    gamma_db=0.0,
+    sigma_db=10.0,
+    lambda_in=0.0,
+    lambda_out=10.0,
+    lambda_sharp=0.0,
+    lambda_pwr=7.0,
     epsilon=1e-30,
 ):
-    """Core SIR loss (executes inside the @dr.wrap DrJit context).
+    """Containment SIR loss with hinge penalties and boundary sharpening.
 
-    Runs two PathSolver calls: one for gNB signal (directional pattern) and
-    one for jammer interference (iso pattern) using a separate jam_scene.
+    Loss components (all in dB-space):
+      L_in    : squared hinge on (gamma - SINR) for inside cells
+                -> penalizes service holes
+      L_out   : squared hinge on (SINR - gamma) for outside cells
+                -> penalizes detectable leakage
+      L_sharp : Gaussian bump centered at gamma over boundary-shell cells
+                -> penalizes fuzzy threshold crossings
+      L_pwr   : L2 on jammer power scale factors
+                -> discourages spending jammer power unnecessarily
 
-    all_params : flat list of DrJit Float scalars:
-        [az_0, el_0, x_0, y_0, (pow_0,) ...gNB params...  x_j0, y_j0, pdbm_j0, ...]
+    Parameters
+    ----------
+    boundary_mask : 1-D bool/int array of length total_rx, or None
+        Marks receivers lying within delta of the zone boundary. If None,
+        the sharpness term is skipped.
+    gamma_db : float
+        Detection / decode threshold in dB. Set from threat model.
+    sigma_db : float
+        Width of the boundary-fuzziness Gaussian, in dB.
+    lambda_in, lambda_out, lambda_sharp, lambda_pwr : float
+        Loss-term weights. Sweep lambda_out / lambda_in for the
+        leakage / service-hole Pareto frontier.
     """
     deg2rad = Float(float(np.pi / 180.0))
     dr.disable_grad(deg2rad)
@@ -672,14 +733,13 @@ def _sir_loss_body(
     _, offsets = _param_strides(tx_configs)
 
     # ------------------------------------------------------------------
-    # Build power-scale factors (DrJit differentiable via dr.power)
+    # Build power-scale factors for each gNB (DrJit-differentiable)
     # ------------------------------------------------------------------
     pow_scales = []
     for i, cfg in enumerate(tx_configs):
         if cfg.optimize_power:
             pow_i = all_params[offsets[i] + 4]
             dr.enable_grad(pow_i.array)
-            # Linear power ratio relative to the reference used in PathSolver
             scale_i = dr.power(
                 Float(10.0),
                 (pow_i - Float(float(ref_powers_dbm[i]))) / Float(10.0),
@@ -691,7 +751,7 @@ def _sir_loss_body(
             pow_scales.append(c)
 
     # ------------------------------------------------------------------
-    # Set TX orientations and positions
+    # Set TX orientations and positions (independent jitter per axis)
     # ------------------------------------------------------------------
     for i, cfg in enumerate(tx_configs):
         b    = offsets[i]
@@ -700,19 +760,22 @@ def _sir_loss_body(
         x_i  = all_params[b + 2]; dr.enable_grad(x_i.array)
         y_i  = all_params[b + 3]; dr.enable_grad(y_i.array)
 
-        jit_rad = Float(float(np.random.normal(0.0, 0.5 * np.pi / 180.0)))
-        dr.disable_grad(jit_rad)
-        pos_jit = Float(float(np.random.normal(0.0, 0.1)))
-        dr.disable_grad(pos_jit)
+        # Independent samples per DOF (previously a single scalar reused)
+        jit_yaw   = Float(float(np.random.normal(0.0, 0.5 * np.pi / 180.0)))
+        jit_pitch = Float(float(np.random.normal(0.0, 0.5 * np.pi / 180.0)))
+        jit_x     = Float(float(np.random.normal(0.0, 0.1)))
+        jit_y     = Float(float(np.random.normal(0.0, 0.1)))
+        for j in (jit_yaw, jit_pitch, jit_x, jit_y):
+            dr.disable_grad(j)
 
-        yaw   = az_i * deg2rad + jit_rad
-        pitch = -(el_i * deg2rad) + jit_rad
-        roll  = Float(0.0);  dr.disable_grad(roll)
+        yaw   = az_i * deg2rad + jit_yaw
+        pitch = -(el_i * deg2rad) + jit_pitch
+        roll  = Float(0.0); dr.disable_grad(roll)
 
         scene.get(cfg.name).orientation = [yaw, pitch, roll]
         scene.get(cfg.name).position = [
-            x_i + pos_jit,
-            y_i + pos_jit,
+            x_i + jit_x,
+            y_i + jit_y,
             Float(float(tx_states[i]["tx_height"])),
         ]
 
@@ -727,28 +790,26 @@ def _sir_loss_body(
         diffuse_reflection=True,
     )
     h_real, h_imag = paths.a
-    # h_real shape: (total_rx, N, max_paths, rx_ant, tx_ant) - DrJit TensorXf
 
-    # ------------------------------------------------------------------
-    # Per-gNB power vectors (length total_rx each)
-    # ------------------------------------------------------------------
     tx_power_vecs = []
     for j in range(N):
         p_raw = _extract_per_rx_power(h_real, h_imag, j)
         tx_power_vecs.append(p_raw * pow_scales[j])
 
-    # Force evaluation so h_real/h_imag GPU buffers can actually be released
-    # before the jammer solve allocates its own path data.
     dr.eval(*tx_power_vecs)
     del paths, h_real, h_imag
 
     # ------------------------------------------------------------------
-    # Set jammer positions and compute power scale factors
+    # Compute total gNB parameter count correctly (per-config)
     # ------------------------------------------------------------------
-    _, gnb_offsets = _param_strides(tx_configs)
-    total_gnb_params = gnb_offsets[-1] + (5 if tx_configs[-1].optimize_power else 4)
+    total_gnb_params = sum(
+        5 if cfg.optimize_power else 4 for cfg in tx_configs
+    )
     _, jam_offsets = _jam_param_strides(jam_configs)
 
+    # ------------------------------------------------------------------
+    # Set jammer positions and build power-scale factors
+    # ------------------------------------------------------------------
     jam_pow_scales = []
     for j, jcfg in enumerate(jam_configs):
         b   = total_gnb_params + jam_offsets[j]
@@ -756,12 +817,13 @@ def _sir_loss_body(
         yj  = all_params[b + 1]; dr.enable_grad(yj.array)
         pj  = all_params[b + 2]; dr.enable_grad(pj.array)
 
-        pos_jit = Float(float(np.random.normal(0.0, 0.1)))
-        dr.disable_grad(pos_jit)
+        jit_x = Float(float(np.random.normal(0.0, 0.1)))
+        jit_y = Float(float(np.random.normal(0.0, 0.1)))
+        dr.disable_grad(jit_x); dr.disable_grad(jit_y)
 
         jam_scene.get(jcfg.name).position = [
-            xj + pos_jit,
-            yj + pos_jit,
+            xj + jit_x,
+            yj + jit_y,
             Float(10.0),
         ]
         scale_j = dr.power(
@@ -773,8 +835,6 @@ def _sir_loss_body(
     # ------------------------------------------------------------------
     # Jammer PathSolver call (iso pattern, jam_scene)
     # ------------------------------------------------------------------
-    # Diffuse reflection is disabled for the jammer solve: it is the most
-    # memory-intensive mode and an interference model does not require it.
     jam_paths = p_solver(
         jam_scene,
         los=True,
@@ -784,7 +844,6 @@ def _sir_loss_body(
     )
     jh_real, jh_imag = jam_paths.a
 
-    # Per-jammer power vectors (length total_rx each)
     J = len(jam_configs)
     jam_power_vecs = []
     for j in range(J):
@@ -795,19 +854,15 @@ def _sir_loss_body(
     del jam_paths, jh_real, jh_imag
 
     # ------------------------------------------------------------------
-    # Loss: at each receiver, the UE selects the BS with highest SINR.
-    # SINR_i[k] = P_i[k] / (cross-gNB interference + jammer + noise)
-    # loss = -mean_k( log( max_i SINR_i[k] ) )
+    # Per-receiver SINR with best-BS selection
     # ------------------------------------------------------------------
-    eps_f   = Float(float(epsilon));  dr.disable_grad(eps_f)
+    eps_f   = Float(float(epsilon));   dr.disable_grad(eps_f)
     noise_f = Float(float(noise_power)); dr.disable_grad(noise_f)
 
-    # Total jammer power at every receiver (sum across all jammers).
     total_jam_power = None
     for jp in jam_power_vecs:
         total_jam_power = jp if total_jam_power is None else (total_jam_power + jp)
 
-    # Per-BS SINR at every receiver; take element-wise maximum across BS.
     best_sinr = None
     for i in range(N):
         p_sig = tx_power_vecs[i]
@@ -827,19 +882,96 @@ def _sir_loss_body(
         sinr_i = p_sig / denom
         best_sinr = sinr_i if best_sinr is None else dr.maximum(best_sinr, sinr_i)
 
-    # Debug: verify both solves produced plausible values.
-    print(f"  [dbg] mean gNB power  : {dr.mean(tx_power_vecs[0])}")
-    if total_jam_power is not None:
-        print(f"  [dbg] mean jam power  : {dr.mean(total_jam_power)}")
-    print(f"  [dbg] mean best-SINR  : {dr.mean(best_sinr)}")
+    # ------------------------------------------------------------------
+    # Convert SINR to dB once (linear -> dB), then build hinge losses
+    # ------------------------------------------------------------------
+    log10 = Float(float(np.log(10.0))); dr.disable_grad(log10)
+    # Clamp before log: receivers with no signal paths have best_sinr≈0, giving
+    # d(log)/d(x) = 1/eps_f ≈ 1e30 which explodes gradients and causes Adam NaN.
+    # A floor of 1e-10 (-100 dB SINR) is physically below any useful threshold;
+    # dr.maximum is differentiable (grad=1 above floor, 0 below), so the gradient
+    # is cleanly zeroed for dead receivers rather than blowing up.
+    sinr_floored = dr.maximum(best_sinr, Float(1e-10))
+    sinr_db = Float(10.0) * dr.log(sinr_floored) / log10
 
-    return -dr.mean(dr.log(best_sinr + eps_f))
+    gamma_f = Float(float(gamma_db));  dr.disable_grad(gamma_f)
+    sigma_f = Float(float(sigma_db));  dr.disable_grad(sigma_f)
+    zero_f  = Float(0.0);              dr.disable_grad(zero_f)
+
+    # Inside / outside split
+    if num_inside is not None and num_inside < dr.width(best_sinr):
+        n_in = int(num_inside)
+        sinr_in  = sinr_db[:n_in]
+        sinr_out = sinr_db[n_in:]
+
+        # L_in: squared hinge on (gamma - SINR), only positive part
+        deficit = dr.maximum(gamma_f - sinr_in, zero_f)
+        loss_inside = dr.mean(deficit * deficit)
+
+        # L_out: squared hinge on (SINR - gamma)
+        excess = dr.maximum(sinr_out - gamma_f, zero_f)
+        loss_outside = dr.mean(excess * excess)
+    else:
+        # No partition provided: treat all cells as "inside"
+        deficit = dr.maximum(gamma_f - sinr_db, zero_f)
+        loss_inside = dr.mean(deficit * deficit)
+        loss_outside = Float(0.0); dr.disable_grad(loss_outside)
+
+    # L_sharp: Gaussian bump centered at gamma, over boundary shell cells.
+    # Penalizes cells lingering near threshold => forces a sharp transition.
+    loss_sharp = Float(0.0); dr.disable_grad(loss_sharp)
+    if boundary_mask is not None:
+        idx = np.asarray(boundary_mask)
+        if idx.dtype == bool:
+            idx = np.where(idx)[0]
+        if idx.size > 0:
+            # Slice preserves the AD graph (same pattern as inside/outside).
+            # Convert to a Python list of ints for DrJit indexing.
+            idx_list = idx.tolist()
+            # Build a stacked tensor of boundary SINRs.
+            sinr_b = dr.gather(type(sinr_db), sinr_db, idx_list)
+            delta = (sinr_b - gamma_f) / sigma_f
+            loss_sharp = dr.mean(dr.exp(Float(-0.5) * delta * delta))
+
+    # L_pwr: L2 on jammer linear power scales (cost of jammer activity)
+    if J > 0:
+        pwr_sq_sum = None
+        for s in jam_pow_scales:
+            term = s * s
+            pwr_sq_sum = term if pwr_sq_sum is None else (pwr_sq_sum + term)
+        loss_pwr = pwr_sq_sum / Float(float(J))
+    else:
+        loss_pwr = Float(0.0); dr.disable_grad(loss_pwr)
+
+    # ------------------------------------------------------------------
+    # Compose total loss
+    # ------------------------------------------------------------------
+    lam_in    = Float(float(lambda_in));    dr.disable_grad(lam_in)
+    lam_out   = Float(float(lambda_out));   dr.disable_grad(lam_out)
+    lam_sharp = Float(float(lambda_sharp)); dr.disable_grad(lam_sharp)
+    lam_pwr   = Float(float(lambda_pwr));   dr.disable_grad(lam_pwr)
+
+    total = (lam_in    * loss_inside +
+             lam_out   * loss_outside +
+             lam_sharp * loss_sharp +
+             lam_pwr   * loss_pwr)
+
+    # Optional debug (comment out for production training)
+    if num_inside is not None and num_inside < dr.width(best_sinr):
+        n_in = int(num_inside)
+        print(f"  [dbg] mean SINR_dB inside : {dr.mean(sinr_db[:n_in])}")
+        print(f"  [dbg] mean SINR_dB outside: {dr.mean(sinr_db[n_in:])}")
+    print(f"  [dbg] L_in={dr.mean(loss_inside)}  L_out={dr.mean(loss_outside)}  "
+          f"L_sharp={dr.mean(loss_sharp)}  L_pwr={dr.mean(loss_pwr)}")
+
+    return total
 
 
 def _make_compute_sir_loss(
     N, tx_configs, tx_states, scene, p_solver,
     noise_power, rx_objects, ref_powers_dbm,
     jam_configs, jam_scene, jam_rx_objects, jam_objects,
+    num_inside=None,
 ):
     """Build and return the @dr.wrap-decorated SIR loss function.
 
@@ -871,23 +1003,25 @@ def _make_compute_sir_loss(
         f"def _inner({arg_str}):\n"
         f"    return _body({list_str}, _N, _cfgs, _states, _scene, _psolver,\n"
         f"                 _noise, _rxobj, _refpow,\n"
-        f"                 _jam_cfgs, _jam_scene, _jam_rxobj, _jam_obj)\n"
+        f"                 _jam_cfgs, _jam_scene, _jam_rxobj, _jam_obj,\n"
+        f"                 num_inside=_num_inside)\n"
     )
 
     globs = {
-        "_body":     _sir_loss_body,
-        "_N":        N,
-        "_cfgs":     tx_configs,
-        "_states":   tx_states,
-        "_scene":    scene,
-        "_psolver":  p_solver,
-        "_noise":    noise_power,
-        "_rxobj":    rx_objects,
-        "_refpow":   ref_powers_dbm,
-        "_jam_cfgs": jam_configs,
-        "_jam_scene": jam_scene,
-        "_jam_rxobj": jam_rx_objects,
-        "_jam_obj":  jam_objects,
+        "_body":       _sir_loss_body,
+        "_N":          N,
+        "_cfgs":       tx_configs,
+        "_states":     tx_states,
+        "_scene":      scene,
+        "_psolver":    p_solver,
+        "_noise":      noise_power,
+        "_rxobj":      rx_objects,
+        "_refpow":     ref_powers_dbm,
+        "_jam_cfgs":   jam_configs,
+        "_jam_scene":  jam_scene,
+        "_jam_rxobj":  jam_rx_objects,
+        "_jam_obj":    jam_objects,
+        "_num_inside": num_inside,
     }
     exec(func_code, globs)
     inner_fn = globs["_inner"]
@@ -1012,8 +1146,12 @@ def optimize_multi_tx(
 
     # ------------------------------------------------------------------
     # 2. All BSes share the same receiver pool (global shared zone).
+    #    First num_sample_points receivers are inside the zone;
+    #    next num_sample_points are in the outer ring (2x-scaled zone minus zone).
     # ------------------------------------------------------------------
-    total_rx = num_sample_points
+    n_inside  = num_sample_points
+    n_outside = num_sample_points
+    total_rx  = n_inside + n_outside
     shared_slice = slice(0, total_rx)
     for state in tx_states:
         state["rx_slice"] = shared_slice
@@ -1071,19 +1209,28 @@ def optimize_multi_tx(
         jam_rx_objects[rx_name] = jam_rx
 
     if verbose:
-        print(f"Pre-created {total_rx} shared receivers across {N} base stations")
+        print(f"Pre-created {total_rx} receivers ({n_inside} inside + {n_outside} outside) "
+              f"across {N} base stations")
 
     # ------------------------------------------------------------------
     # Pre-sample fixed receiver positions once for the shared zone.
-    # All BS states reference the same point set.
+    # Receivers 0..n_inside-1   → inside zone
+    # Receivers n_inside..total_rx-1 → outer ring (2x-scaled zone minus zone)
     # ------------------------------------------------------------------
     ground_z = float(map_config["center"][2]) if len(map_config["center"]) > 2 else 0.0
-    pts = _sample_zone_points(tx_states[0], tx_configs[0], num_sample_points,
+    pts = _sample_zone_points(tx_states[0], tx_configs[0], n_inside,
                               sampler, "full", ground_z)
+    out_pts = _sample_outside_zone(tx_states[0], n_outside, ground_z)
     for state in tx_states:
         state["current_sample_points"] = pts
+        state["outside_sample_points"] = out_pts
     for k, pos in enumerate(pts):
         rx_name = f"opt_rx_{k}"
+        p3 = mi.Point3f(float(pos[0]), float(pos[1]), float(pos[2]))
+        rx_objects[rx_name].position = p3
+        jam_rx_objects[rx_name].position = p3
+    for k, pos in enumerate(out_pts):
+        rx_name = f"opt_rx_{n_inside + k}"
         p3 = mi.Point3f(float(pos[0]), float(pos[1]), float(pos[2]))
         rx_objects[rx_name].position = p3
         jam_rx_objects[rx_name].position = p3
@@ -1100,6 +1247,7 @@ def optimize_multi_tx(
         N, tx_configs, tx_states, scene, p_solver,
         noise_power, rx_objects, ref_powers_dbm,
         jam_configs, jam_scene, jam_rx_objects, jam_objects,
+        num_inside=n_inside,
     )
 
     # ------------------------------------------------------------------
@@ -1200,6 +1348,10 @@ def optimize_multi_tx(
         loss = compute_sir_loss(*params, *jam_params)
         loss.backward()
 
+        # Clip gradients before the Adam step to guard against log-gradient
+        # explosions when receivers have near-zero signal (d(log)/dx = 1/x → ∞).
+        torch.nn.utils.clip_grad_norm_(params + jam_params, max_norm=10.0)
+
         optimizer.step()
         optimizer.zero_grad()
 
@@ -1215,15 +1367,13 @@ def optimize_multi_tx(
                 if az_t.item() >= 360.0:
                     az_t.fill_(az_t.item() % 360.0)
 
-                # Iterate through the transmitters and project if they are constrained to a building.
-                for i in range(N):
-                    if tx_configs[i].on_building:
-                        # Position: project to building polygon
-                        proj_x, proj_y = state["tx_placement"].project_to_polygon(
-                            x_t.item(), y_t.item()
-                        )
-                        x_t.data.fill_(proj_x)
-                        y_t.data.fill_(proj_y)
+                # Position: project to building polygon if this TX is building-mounted.
+                if cfg.on_building:
+                    proj_x, proj_y = state["tx_placement"].project_to_polygon(
+                        x_t.item(), y_t.item()
+                    )
+                    x_t.data.fill_(proj_x)
+                    y_t.data.fill_(proj_y)
 
                 # Power clamp
                 if cfg.optimize_power:
@@ -1339,6 +1489,26 @@ def optimize_multi_tx(
         "lds":             lds,
     }
 
+    # ------------------------------------------------------------------
+    # 10. Persist final jammer state into result and jam_scene
+    # ------------------------------------------------------------------
+    if jam_configs:
+        _, joff = _jam_param_strides(jam_configs)
+        jammers_final = {}
+        for j, jcfg in enumerate(jam_configs):
+            b   = joff[j]
+            xf  = float(jam_params[b].item())
+            yf  = float(jam_params[b + 1].item())
+            pf  = float(jam_params[b + 2].item())
+            jam_scene.get(jcfg.name).position  = mi.Point3f(xf, yf, 45.0)
+            jam_scene.get(jcfg.name).power_dbm = [pf]
+            jammers_final[jcfg.name] = {
+                "final_position":    [xf, yf, 45.0],
+                "final_power_dbm":   pf,
+                "initial_power_dbm": jcfg.initial_power_dbm,
+            }
+        result["joint"]["jammers"] = jammers_final
+
     if verbose:
         print(f"\n{'='*70}")
         print(f"OPTIMIZATION COMPLETE  ({elapsed:.1f}s)")
@@ -1347,9 +1517,14 @@ def optimize_multi_tx(
             print(f"  {cfg.name}: Az={r['best_angles'][0]:.1f}°, "
                   f"El={r['best_angles'][1]:.1f}°, "
                   f"pos=({r['final_position'][0]:.1f}, {r['final_position'][1]:.1f})")
+        if jam_configs:
+            for jcfg in jam_configs:
+                jd = result["joint"]["jammers"][jcfg.name]
+                print(f"  {jcfg.name}: pos=({jd['final_position'][0]:.1f}, "
+                      f"{jd['final_position'][1]:.1f}), pwr={jd['final_power_dbm']:.1f} dBm")
         print(f"{'='*70}\n")
 
-    return result
+    return result, jam_scene if jam_configs else None
 
 
 # ---------------------------------------------------------------------------
@@ -1364,82 +1539,44 @@ def compare_multi_tx_performance(
     zone_masks: dict,
     noise_power: float = 1e-10,
     fig: bool = True,
+    gamma_db: float = 0.0,
+    jam_scene=None,
+    jammer_configs: list = None,
 ) -> tuple:
-    """Evaluate and compare initial vs optimised multi-TX configurations.
+    """Evaluate the optimised multi-TX configuration for coverage shaping.
 
-    Runs RadioMapSolver once per configuration (initial / optimised) with all
-    TXs active simultaneously.  Computes per-zone RSRP and SIR statistics and
-    optionally generates comparison plots.
+    Reports how well SINR is contained within the target zone:
+      rho_leak : fraction of OUTSIDE cells with SINR >= gamma  (lower is better)
+      rho_hole : fraction of INSIDE  cells with SINR <  gamma  (lower is better)
 
-    Parameters
-    ----------
-    scene : sionna.rt.Scene
-    tx_configs : list[TxConfig]
-        Must be in scene transmitter insertion order.
-    multi_result : dict
-        Returned by optimize_multi_tx().
-    map_config : dict
-        Radio-map grid config: 'center', 'size', 'cell_size'.
-    zone_masks : dict  {tx_name: 2-D np.ndarray}
-        Binary zone masks (1.0 = in zone) aligned to map_config grid.
-    noise_power : float
-        Thermal noise floor (Watts).
-    fig : bool
-        If True, generate comparison plots.
-
-    Returns
-    -------
-    (fig_or_None, stats_dict)
-        stats_dict is fully JSON-serialisable.  Structure::
-
-            {
-              tx_name: {
-                "initial":    { rsrp_mean_dbm, rsrp_p10_dbm, sir_median_db, ... },
-                "optimized":  { ... },
-                "improvement":{ rsrp_mean_db, rsrp_p10_db, sir_median_db, ... },
-                "initial_params":   { azimuth, elevation, position, power_dbm },
-                "optimized_params": { azimuth, elevation, position, power_dbm },
-              },
-              "joint": {
-                "loss_history", "sampler", "lds", "sampling_strata"
-              }
-            }
+    Signal = highest BS signal at each cell (jammers never count as signal).
+    Interference = other BSs + friendly jammer power (if jam_scene provided).
+    SINR formula mirrors the loss function exactly:
+      SINR_i(r) = P_BS_i / (noise + Σ_{j≠i} P_BS_j + Σ_k P_jam_k)
+      best_SINR  = max_i(SINR_i)
     """
     import matplotlib.pyplot as plt
+    from matplotlib.colors import TwoSlopeNorm
 
-    rm_solver = RadioMapSolver()
     N = len(tx_configs)
-
-    def _watts_to_dbm(w):
-        return 10.0 * np.log10(np.maximum(w, 1e-18)) + 30.0
+    gamma_db = float(gamma_db)
 
     def _watts_to_db(w):
         return 10.0 * np.log10(np.maximum(w, 1e-18))
 
-    def _set_scene_state(config_type: str):
-        """Apply initial or optimised TX parameters to the scene."""
+    def _set_scene_optimized():
         for cfg in tx_configs:
             r = multi_result[cfg.name]
-            angles   = r["initial_angles"]   if config_type == "initial" else r["best_angles"]
-            pos      = r["initial_position"] if config_type == "initial" else r["final_position"]
-            pow_dbm  = (r.get("best_power_dbm", None)
-                        if config_type == "optimized"
-                        else multi_result[cfg.name].get("initial_power_dbm",
-                             multi_result[cfg.name].get("best_power_dbm", None)))
+            angles  = r["best_angles"]
+            pos     = r["final_position"]
+            pow_dbm = r.get("best_power_dbm", None)
             yaw_r, pitch_r = azimuth_elevation_to_yaw_pitch(angles[0], angles[1])
-            scene.get(cfg.name).orientation = mi.Point3f(
-                float(yaw_r), float(pitch_r), 0.0
-            )
-            scene.get(cfg.name).position = mi.Point3f(
-                float(pos[0]), float(pos[1]), float(pos[2])
-            )
+            scene.get(cfg.name).orientation = mi.Point3f(float(yaw_r), float(pitch_r), 0.0)
+            scene.get(cfg.name).position    = mi.Point3f(float(pos[0]), float(pos[1]), float(pos[2]))
             if pow_dbm is not None:
                 scene.get(cfg.name).power_dbm = [float(pow_dbm)]
 
     def _run_radiomap():
-        # Fresh instance each call: reusing the same RadioMapSolver across
-        # scene-state changes causes the DrJit compiled kernel to return
-        # stale (initial) results for the optimized run.
         solver = RadioMapSolver()
         return solver(
             scene,
@@ -1456,164 +1593,175 @@ def compare_multi_tx_performance(
             stop_threshold=None,
         )
 
-    def _compute_zone_metrics(rss_np, tx_idx, tx_name):
-        """Compute RSRP and SIR metrics within the target zone.
+    def _bs_sinr_field(rss_list_2d, jam_map=None):
+        """Best-SINR (max over BSs) over the full 2-D grid, in dB.
 
-        Zero-RSS cells (permanently shadowed or zero sample hits) are included
-        in RSRP stats but excluded from SIR stats.  A cell with zero signal has
-        no meaningful SIR — it is a coverage gap, not an interference problem.
-        coverage_fraction reports what fraction of zone cells actually have signal.
+        Signal = P_BS_i; Interference = other BSs + optional jammer map.
         """
-        mask   = zone_masks[tx_name] == 1.0
-        n_zone = int(np.sum(mask))
+        best = None
+        for i in range(N):
+            p_sig = rss_list_2d[i]
+            p_int = sum(rss_list_2d[j] for j in range(N) if j != i)
+            denom = p_int + noise_power
+            if jam_map is not None:
+                denom = denom + jam_map
+            sinr_i = p_sig / denom
+            best = sinr_i if best is None else np.maximum(best, sinr_i)
+        return _watts_to_db(best)
 
-        # --- RSRP (all zone cells) ---
-        rsrp_w   = rss_np[tx_idx][mask]
-        rsrp_dbm = _watts_to_dbm(rsrp_w)
-
-        # --- Coverage: cells where this TX delivers non-zero signal ---
-        covered  = rsrp_w > 0.0
-        n_covered = int(np.sum(covered))
-        coverage_fraction = n_covered / n_zone if n_zone > 0 else 0.0
-
-        # --- SIR: only on covered cells ---
-        if n_covered == 0:
-            sir_db = np.full(1, 10.0 * np.log10(1e-18))  # placeholder floor
-        else:
-            rsrp_w_cov  = rsrp_w[covered]
-            interf_w    = np.zeros_like(rsrp_w_cov)
-            for j in range(N):
-                if j != tx_idx:
-                    interf_w += rss_np[j][mask][covered]
-            sir_linear = rsrp_w_cov / (interf_w + noise_power)
-            sir_db     = _watts_to_db(sir_linear)
-
+    def _summarize_sinr(values_db):
+        if values_db.size == 0:
+            return None
         return {
-            "rsrp_mean_dbm":      float(np.mean(rsrp_dbm)),
-            "rsrp_median_dbm":    float(np.median(rsrp_dbm)),
-            "rsrp_p10_dbm":       float(np.percentile(rsrp_dbm, 10)),
-            "rsrp_p90_dbm":       float(np.percentile(rsrp_dbm, 90)),
-            "rsrp_std_db":        float(np.std(rsrp_dbm)),
-            "coverage_fraction":  coverage_fraction,
-            "n_covered_cells":    n_covered,
-            "n_zone_cells":       n_zone,
-            "sir_mean_db":        float(np.mean(sir_db)),
-            "sir_median_db":      float(np.median(sir_db)),
-            "sir_p10_db":         float(np.percentile(sir_db, 10)),
-            "sir_p90_db":         float(np.percentile(sir_db, 90)),
-            "rsrp_values_dbm":    rsrp_dbm.tolist(),
-            "sir_values_db":      sir_db.tolist(),
+            "sinr_mean_db":   float(np.mean(values_db)),
+            "sinr_median_db": float(np.median(values_db)),
+            "sinr_p10_db":    float(np.percentile(values_db, 10)),
+            "sinr_p90_db":    float(np.percentile(values_db, 90)),
+            "sinr_values_db": values_db.tolist(),
         }
 
-    # Print initial and optimized TX params before running RadioMaps
-    print(f"\n{'='*70}")
-    print("BEFORE / AFTER COMPARISON")
-    print(f"{'='*70}")
+    # ------------------------------------------------------------------
+    # Masks: inside = target zone, outside = complement of union
+    # ------------------------------------------------------------------
+    grid_shape   = next(iter(zone_masks.values())).shape
+    inside_masks = {cfg.name: (zone_masks[cfg.name] == 1.0) for cfg in tx_configs}
+    union_inside = np.zeros(grid_shape, dtype=bool)
     for cfg in tx_configs:
-        r = multi_result[cfg.name]
+        union_inside |= inside_masks[cfg.name]
+    outside_mask = ~union_inside
+
+    # ------------------------------------------------------------------
+    # Print parameter before/after table
+    # ------------------------------------------------------------------
+    print(f"\n{'='*70}")
+    print("BS PARAMETERS  —  BEFORE / AFTER")
+    print(f"{'='*70}")
+    print(f"  {'Name':<14} {'Param':<10} {'Initial':>10}  {'Optimised':>10}  {'Delta':>10}")
+    print(f"  {'-'*64}")
+    for cfg in tx_configs:
+        r  = multi_result[cfg.name]
         ia, ie = r["initial_angles"]
-        ip     = r["initial_position"]
         oa, oe = r["best_angles"]
-        op     = r["final_position"]
-        print(f"  {cfg.name}:")
-        print(f"    Initial:   Az={ia:.1f}°, El={ie:.1f}°, "
-              f"pos=({ip[0]:.1f}, {ip[1]:.1f})")
-        print(f"    Optimised: Az={oa:.1f}°, El={oe:.1f}°, "
-              f"pos=({op[0]:.1f}, {op[1]:.1f})")
+        ip = r["initial_position"]
+        op = r["final_position"]
+        rows = [
+            ("Azimuth",   f"{ia:+8.2f}°",   f"{oa:+8.2f}°",   f"{oa-ia:+8.2f}°"),
+            ("Elevation", f"{ie:+8.2f}°",   f"{oe:+8.2f}°",   f"{oe-ie:+8.2f}°"),
+            ("X (m)",     f"{ip[0]:+8.1f}", f"{op[0]:+8.1f}", f"{op[0]-ip[0]:+8.1f}"),
+            ("Y (m)",     f"{ip[1]:+8.1f}", f"{op[1]:+8.1f}", f"{op[1]-ip[1]:+8.1f}"),
+        ]
+        if "best_power_dbm" in r:
+            init_pow = r.get("initial_power_dbm", float("nan"))
+            opt_pow  = r["best_power_dbm"]
+            rows.append(("Power dBm", f"{init_pow:+8.2f}", f"{opt_pow:+8.2f}",
+                          f"{opt_pow - init_pow:+8.2f}"))
+        for k, (param, iv, ov, dv) in enumerate(rows):
+            name_col = cfg.name if k == 0 else ""
+            print(f"  {name_col:<14} {param:<10} {iv:>10}  {ov:>10}  {dv:>10}")
+        print(f"  {'-'*64}")
     print(f"{'='*70}\n")
 
-    # Run RadioMapSolver for both configurations
+    # ------------------------------------------------------------------
+    # Run RadioMapSolver for optimized BS configuration
+    # ------------------------------------------------------------------
+    print("Computing RadioMap for optimized BS configuration...")
+    _set_scene_optimized()
+    rm          = _run_radiomap()
+    # NaN = no propagation path → treat as 0 received power
+    rss_list_2d = [np.nan_to_num(rm.rss.numpy()[i], nan=0.0) for i in range(N)]
+
+    # ------------------------------------------------------------------
+    # Run RadioMapSolver for jammers (if provided)
+    # ------------------------------------------------------------------
+    jam_interference_map = None
+    if jam_scene is not None and jammer_configs:
+        jammers_data = multi_result["joint"].get("jammers", {})
+        for jcfg in jammer_configs:
+            if jcfg.name in jammers_data:
+                jd  = jammers_data[jcfg.name]
+                pos = jd["final_position"]
+                jam_scene.get(jcfg.name).position  = mi.Point3f(*[float(v) for v in pos])
+                jam_scene.get(jcfg.name).power_dbm = [float(jd["final_power_dbm"])]
+        print("Computing RadioMap for jammer interference...")
+        jam_solver = RadioMapSolver()
+        jam_rm = jam_solver(
+            jam_scene,
+            max_depth=8,
+            samples_per_tx=int(1e9),
+            cell_size=list(map_config["cell_size"]),
+            center=map_config["center"],
+            orientation=[0, 0, 0],
+            size=map_config["size"],
+            los=True,
+            specular_reflection=True,
+            diffuse_reflection=False,
+            refraction=False,
+            stop_threshold=None,
+        )
+        jam_rss = np.nan_to_num(jam_rm.rss.numpy(), nan=0.0)  # (J, H, W)
+        jam_interference_map = np.sum(jam_rss, axis=0)         # (H, W)
+
+    sinr_field = _bs_sinr_field(rss_list_2d, jam_map=jam_interference_map)
+
+    # ------------------------------------------------------------------
+    # Per-TX containment metrics
+    # ------------------------------------------------------------------
     stats = {}
-    rss_configs = {}
+    for cfg in tx_configs:
+        r        = multi_result[cfg.name]
+        in_mask  = inside_masks[cfg.name]
+        in_vals  = sinr_field[in_mask]
+        out_vals = sinr_field[outside_mask]
 
-    for config_type in ("initial", "optimized"):
-        print(f"Computing RadioMap for {config_type} configuration...")
-        _set_scene_state(config_type)
-        rm    = _run_radiomap()
-        # rss shape: (N, H, W)
-        rss_np = [rm.rss.numpy()[i, :, :] for i in range(N)]
-        rss_configs[config_type] = rss_np
+        rho_leak = float(np.mean(out_vals >= gamma_db)) if out_vals.size else None
+        rho_hole = float(np.mean(in_vals  <  gamma_db)) if in_vals.size  else None
 
-    # Per-TX stats
-    for tx_idx, cfg in enumerate(tx_configs):
-        r = multi_result[cfg.name]
-        m_init = _compute_zone_metrics(rss_configs["initial"],   tx_idx, cfg.name)
-        m_opt  = _compute_zone_metrics(rss_configs["optimized"], tx_idx, cfg.name)
-
-        improvement = {
-            "rsrp_mean_db":   m_opt["rsrp_mean_dbm"]   - m_init["rsrp_mean_dbm"],
-            "rsrp_p10_db":    m_opt["rsrp_p10_dbm"]    - m_init["rsrp_p10_dbm"],
-            "rsrp_median_db": m_opt["rsrp_median_dbm"] - m_init["rsrp_median_dbm"],
-            "sir_mean_db":    m_opt["sir_mean_db"]      - m_init["sir_mean_db"],
-            "sir_median_db":  m_opt["sir_median_db"]    - m_init["sir_median_db"],
-            "sir_p10_db":     m_opt["sir_p10_db"]       - m_init["sir_p10_db"],
-        }
-
-        init_params = {
-            "azimuth":   r["initial_angles"][0],
-            "elevation": r["initial_angles"][1],
-            "position":  r["initial_position"],
-        }
-        opt_params = {
-            "azimuth":   r["best_angles"][0],
-            "elevation": r["best_angles"][1],
-            "position":  r["final_position"],
-        }
+        init_params = {"azimuth": r["initial_angles"][0], "elevation": r["initial_angles"][1],
+                       "position": r["initial_position"]}
+        opt_params  = {"azimuth": r["best_angles"][0],    "elevation": r["best_angles"][1],
+                       "position": r["final_position"]}
         if "best_power_dbm" in r:
-            opt_params["power_dbm"] = r["best_power_dbm"]
+            init_params["power_dbm"] = r.get("initial_power_dbm", float("nan"))
+            opt_params["power_dbm"]  = r["best_power_dbm"]
 
         stats[cfg.name] = {
-            "initial":          m_init,
-            "optimized":        m_opt,
-            "improvement":      improvement,
-            "initial_params":   init_params,
+            "initial_params":  init_params,
             "optimized_params": opt_params,
+            "sinr_inside":     _summarize_sinr(in_vals),
+            "sinr_outside":    _summarize_sinr(out_vals),
+            "containment":     {"rho_leak": rho_leak, "rho_hole": rho_hole},
+            "az_history":      r.get("az_history", []),
+            "el_history":      r.get("el_history", []),
+            "power_history":   r.get("power_history", []),
         }
 
-    # Print before/after metrics summary
+    # ------------------------------------------------------------------
+    # Print containment summary
+    # ------------------------------------------------------------------
+    sinr_mode = "BS+JAMMER" if jam_interference_map is not None else "BS-ONLY"
     print(f"\n{'='*70}")
-    print("RESULTS")
+    print(f"{sinr_mode} SINR CONTAINMENT  (gamma = {gamma_db:+.1f} dB)")
     print(f"{'='*70}")
     for cfg in tx_configs:
-        s     = stats[cfg.name]
-        im    = s["initial"]
-        om    = s["optimized"]
-        imp   = s["improvement"]
-        icov = im["coverage_fraction"] * 100
-        ocov = om["coverage_fraction"] * 100
-        # Zone cells: non-building cells inside the target polygon (zone_mask==1)
-        # Covered cells: zone cells with RSS > 0 (not in radio shadow / not a sample miss)
-        # SIR is only meaningful for covered cells; zero-RSS cells have no signal to measure SIR on
-        print(f"  {cfg.name}  ({im['n_zone_cells']} non-building zone cells):")
-        print(f"    Coverage:     {icov:5.1f}%  →  {ocov:5.1f}%"
-              f"  ({ocov - icov:+.1f} pp)")
-        print(f"    RSRP mean:   {im['rsrp_mean_dbm']:+7.1f} dBm  →  "
-              f"{om['rsrp_mean_dbm']:+7.1f} dBm  ({imp['rsrp_mean_db']:+.1f} dB)")
-        print(f"    RSRP median: {im['rsrp_median_dbm']:+7.1f} dBm  →  "
-              f"{om['rsrp_median_dbm']:+7.1f} dBm  ({imp['rsrp_median_db']:+.1f} dB)")
-        print(f"    RSRP p10:    {im['rsrp_p10_dbm']:+7.1f} dBm  →  "
-              f"{om['rsrp_p10_dbm']:+7.1f} dBm  ({imp['rsrp_p10_db']:+.1f} dB)")
-        print(f"    RSRP p90:    {im['rsrp_p90_dbm']:+7.1f} dBm  →  "
-              f"{om['rsrp_p90_dbm']:+7.1f} dBm")
-        print(f"    SIR mean:    {im['sir_mean_db']:+7.1f} dB   →  "
-              f"{om['sir_mean_db']:+7.1f} dB   ({imp['sir_mean_db']:+.1f} dB)"
-              f"  [covered cells]")
-        print(f"    SIR median:  {im['sir_median_db']:+7.1f} dB   →  "
-              f"{om['sir_median_db']:+7.1f} dB   ({imp['sir_median_db']:+.1f} dB)"
-              f"  [covered cells]")
-        print(f"    SIR p10:     {im['sir_p10_db']:+7.1f} dB   →  "
-              f"{om['sir_p10_db']:+7.1f} dB   ({imp['sir_p10_db']:+.1f} dB)"
-              f"  [covered cells]")
-        print(f"    SIR p90:     {im['sir_p90_db']:+7.1f} dB   →  "
-              f"{om['sir_p90_db']:+7.1f} dB   [covered cells]")
+        s  = stats[cfg.name]
+        c  = s["containment"]
+        si = s["sinr_inside"]
+        so = s["sinr_outside"]
+        def _fmt(v): return f"{100*v:5.1f}%" if v is not None else "  n/a "
+        print(f"  {cfg.name}:")
+        print(f"    rho_leak  (outside >= gamma): {_fmt(c['rho_leak'])}")
+        print(f"    rho_hole  (inside  <  gamma): {_fmt(c['rho_hole'])}")
+        if si: print(f"    SINR inside  mean / p10: {si['sinr_mean_db']:+.1f} / {si['sinr_p10_db']:+.1f} dB")
+        if so: print(f"    SINR outside mean / p10: {so['sinr_mean_db']:+.1f} / {so['sinr_p10_db']:+.1f} dB")
+        print()
     print(f"{'='*70}\n")
 
     jnt = multi_result.get("joint", {})
     stats["joint"] = {
-        "loss_history":    jnt.get("loss_history", []),
-        "sampler":         jnt.get("sampler", ""),
-        "lds":             jnt.get("lds", ""),
-        "sampling_strata": jnt.get("sampling_strata", ""),
+        "loss_history":         jnt.get("loss_history", []),
+        "gamma_db":             gamma_db,
+        "jammers":              jnt.get("jammers", {}),
+        "jam_interference_used": jam_interference_map is not None,
     }
 
     # ------------------------------------------------------------------
@@ -1622,57 +1770,130 @@ def compare_multi_tx_performance(
     if not fig:
         return None, stats
 
-    n_cols = 3  # RSRP hist | SIR CDF | loss curve (shared)
-    n_rows = N
-    fig_obj, axes = plt.subplots(n_rows, n_cols, figsize=(16, 5 * n_rows))
+    # Layout: N rows (one per BS) + 1 summary row
+    # Cols: Spatial SINR map | Inside vs Outside CDF | Trajectory
+    n_rows = N + 1
+    fig_obj, axes = plt.subplots(n_rows, 3, figsize=(18, 5 * n_rows))
     if n_rows == 1:
         axes = axes[np.newaxis, :]
 
     for tx_idx, cfg in enumerate(tx_configs):
-        s       = stats[cfg.name]
-        init_m  = s["initial"]
-        opt_m   = s["optimized"]
-        imp_m   = s["improvement"]
+        s = stats[cfg.name]
+        c = s["containment"]
 
-        rsrp_init = np.array(init_m["rsrp_values_dbm"])
-        rsrp_opt  = np.array(opt_m["rsrp_values_dbm"])
-        sir_init  = np.array(init_m["sir_values_db"])
-        sir_opt   = np.array(opt_m["sir_values_db"])
-
-        # --- RSRP histogram ---
+        # Col 0: Spatial BS-only SINR map with target zone contour
         ax = axes[tx_idx, 0]
-        all_rsrp = np.concatenate([rsrp_init, rsrp_opt])
-        bins = np.linspace(all_rsrp.min(), all_rsrp.max(), 80)
-        ax.hist(rsrp_init, bins=bins, alpha=0.55, color="orange",
-                density=True, label="Initial")
-        ax.hist(rsrp_opt,  bins=bins, alpha=0.55, color="steelblue",
-                density=True, label="Optimised")
-        ax.set_title(f"{cfg.name}  RSRP  (Δmean={imp_m['rsrp_mean_db']:+.1f} dB)")
-        ax.set_xlabel("RSRP (dBm)"); ax.set_ylabel("Density"); ax.legend()
+        vmin, vmax = gamma_db - 20, gamma_db + 20
+        norm = TwoSlopeNorm(vmin=vmin, vcenter=gamma_db, vmax=vmax)
+        im = ax.imshow(np.flipud(sinr_field), cmap="RdBu_r", norm=norm,
+                       interpolation="nearest", aspect="equal")
+        ax.contour(np.flipud(inside_masks[cfg.name].astype(float)),
+                   levels=[0.5], colors="black", linewidths=1.5)
+        # Overlay jammer positions
+        if jam_scene is not None and jammer_configs:
+            jammers_data = multi_result["joint"].get("jammers", {})
+            cx_m, cy_m = map_config["center"][0], map_config["center"][1]
+            sx_m, sy_m = map_config["size"][0],   map_config["size"][1]
+            cw, ch     = map_config["cell_size"][0], map_config["cell_size"][1]
+            H_px = int(round(sy_m / ch))
+            for jcfg in jammer_configs:
+                if jcfg.name in jammers_data:
+                    jx, jy = jammers_data[jcfg.name]["final_position"][:2]
+                    px = (jx - (cx_m - sx_m / 2)) / cw
+                    py = H_px - (jy - (cy_m - sy_m / 2)) / ch
+                    ax.scatter(px, py, marker="x", color="yellow", s=80,
+                               linewidths=2, zorder=5, label=jcfg.name)
+            ax.legend(fontsize=7, loc="upper right")
+        jam_label = "+Jammers" if jam_interference_map is not None else "BS-only"
+        ax.set_title(f"{cfg.name}  SINR ({jam_label}) dB", fontsize=10)
+        ax.set_xticks([]); ax.set_yticks([])
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="SINR (dB)")
 
-        # --- SIR CDF ---
+        # Col 1: Inside vs Outside SINR CDF on the same axes
         ax = axes[tx_idx, 1]
-        for vals, label, color in [
-            (sir_init, "Initial",   "orange"),
-            (sir_opt,  "Optimised", "steelblue"),
-        ]:
-            sorted_v = np.sort(vals)
-            cdf = np.arange(1, len(sorted_v) + 1) / len(sorted_v)
-            ax.plot(sorted_v, cdf, color=color, label=label)
-        ax.set_title(f"{cfg.name}  SIR CDF  (Δmedian={imp_m['sir_median_db']:+.1f} dB)")
-        ax.set_xlabel("SIR (dB)"); ax.set_ylabel("CDF"); ax.legend()
-        ax.grid(True, alpha=0.3)
+        si = s["sinr_inside"]
+        so = s["sinr_outside"]
+        if si:
+            arr = np.sort(np.asarray(si["sinr_values_db"], dtype=float))
+            ax.plot(arr, np.arange(1, len(arr) + 1) / len(arr),
+                    color="steelblue", linewidth=1.8, label=f"Inside  (N={len(arr)})")
+        if so:
+            arr = np.sort(np.asarray(so["sinr_values_db"], dtype=float))
+            ax.plot(arr, np.arange(1, len(arr) + 1) / len(arr),
+                    color="coral", linewidth=1.8, label=f"Outside (N={len(arr)})")
+        ax.axvline(gamma_db, color="black", linestyle="--", linewidth=1.0, alpha=0.7,
+                   label=f"γ = {gamma_db:+.1f} dB")
+        parts = []
+        if c["rho_leak"] is not None: parts.append(f"ρ_leak={100*c['rho_leak']:.1f}%")
+        if c["rho_hole"] is not None: parts.append(f"ρ_hole={100*c['rho_hole']:.1f}%")
+        ax.set_title(f"{cfg.name}  SINR CDF — " + "  ".join(parts), fontsize=10)
+        ax.set_xlabel("BS-only SINR (dB)"); ax.set_ylabel("CDF")
+        ax.set_xlim(gamma_db - 30, gamma_db + 30)
+        ax.legend(fontsize=8, loc="lower right"); ax.grid(True, alpha=0.3)
 
-        # --- Loss curve (first TX row only; duplicated for visual consistency) ---
+        # Col 2: Parameter trajectory (azimuth / elevation / power vs iteration)
         ax = axes[tx_idx, 2]
-        if "loss_history" in stats["joint"] and stats["joint"]["loss_history"]:
-            ax.plot(stats["joint"]["loss_history"], color="crimson")
-            ax.set_title("Joint SIR Loss")
-            ax.set_xlabel("Iteration"); ax.set_ylabel("Loss")
+        az_h = s["az_history"]
+        el_h = s["el_history"]
+        pw_h = s["power_history"]
+        if az_h or el_h:
+            from matplotlib.lines import Line2D
+            handles_t = []
+            if az_h:
+                ax.plot(np.arange(len(az_h)), az_h, color="steelblue", linewidth=1.5)
+                ax.set_ylabel("Azimuth (°)", color="steelblue")
+                ax.tick_params(axis="y", labelcolor="steelblue")
+                handles_t.append(Line2D([0], [0], color="steelblue", label="Azimuth"))
+            if el_h:
+                ax2_t = ax.twinx()
+                ax2_t.plot(np.arange(len(el_h)), el_h, color="darkorange", linewidth=1.5)
+                ax2_t.set_ylabel("Elevation (°)", color="darkorange")
+                ax2_t.tick_params(axis="y", labelcolor="darkorange")
+                handles_t.append(Line2D([0], [0], color="darkorange", label="Elevation"))
+                if pw_h:
+                    ax2_t.plot(np.arange(len(pw_h)), pw_h, color="green",
+                               linewidth=1.2, linestyle="--")
+                    handles_t.append(Line2D([0], [0], color="green",
+                                            linestyle="--", label="Power (dBm)"))
+            ax.set_xlabel("Iteration")
+            ax.set_title(f"{cfg.name}  Parameter Trajectory", fontsize=10)
             ax.grid(True, alpha=0.3)
+            ax.legend(handles=handles_t, fontsize=8, loc="upper right")
         else:
             ax.axis("off")
 
-    plt.suptitle("Multi-TX SIR Optimisation: Initial vs Optimised", fontsize=13, weight="bold")
+    # ------------------------------------------------------------------
+    # Summary row: loss curve | containment bar | (off)
+    # ------------------------------------------------------------------
+    ax_loss = axes[N, 0]
+    loss_hist = stats["joint"]["loss_history"]
+    if loss_hist:
+        ax_loss.plot(loss_hist, color="crimson", linewidth=1.8)
+        ax_loss.set_title("Joint Loss History", fontsize=10)
+        ax_loss.set_xlabel("Iteration"); ax_loss.set_ylabel("Loss")
+        ax_loss.grid(True, alpha=0.3)
+    else:
+        ax_loss.axis("off")
+
+    ax_cont = axes[N, 1]
+    names         = [cfg.name for cfg in tx_configs]
+    rho_leak_vals = [100 * (stats[cfg.name]["containment"]["rho_leak"] or 0) for cfg in tx_configs]
+    rho_hole_vals = [100 * (stats[cfg.name]["containment"]["rho_hole"] or 0) for cfg in tx_configs]
+    x = np.arange(len(names))
+    w = 0.35
+    ax_cont.bar(x - w / 2, rho_leak_vals, w, color="coral",     alpha=0.85, label="ρ_leak (outside ≥ γ)")
+    ax_cont.bar(x + w / 2, rho_hole_vals, w, color="steelblue", alpha=0.85, label="ρ_hole (inside < γ)")
+    ax_cont.set_xticks(x); ax_cont.set_xticklabels(names, fontsize=9)
+    ax_cont.set_ylabel("Fraction (%)"); ax_cont.set_ylim(0, 100)
+    sinr_label = "BS+Jammer SINR" if jam_interference_map is not None else "BS-only SINR"
+    ax_cont.set_title(f"{sinr_label} Containment  (γ = {gamma_db:+.1f} dB)", fontsize=10)
+    ax_cont.legend(fontsize=8); ax_cont.grid(True, alpha=0.3, axis="y")
+
+    axes[N, 2].axis("off")
+
+    plt.suptitle(
+        f"Friendly-Jammer Coverage Shaping — {sinr_label} vs Target Zone   "
+        f"(γ = {gamma_db:+.1f} dB)",
+        fontsize=13, weight="bold")
     plt.tight_layout()
     return fig_obj, stats
