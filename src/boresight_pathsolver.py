@@ -708,7 +708,7 @@ def visualize_multi_tx_strata(
         # Outer ring: scale raw box 2x, subtract original box, then punch out buildings.
         # Mirrors _sample_outside_zone exactly — never scale the building-subtracted polygon.
         centroid = box_poly.centroid
-        outer_poly = _shapely_scale(box_poly, xfact=2.0, yfact=2.0, origin=centroid)
+        outer_poly = _shapely_scale(box_poly, xfact=3.0, yfact=3.0, origin=centroid)
         outer_ring = outer_poly.difference(box_poly)
         cached_bldgs = first_state.get("cached_building_polygons", [])
         if cached_bldgs:
