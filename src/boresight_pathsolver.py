@@ -107,7 +107,37 @@ def create_zone_mask(
         # Look-at is simply the center of the box
         look_at_pos = np.array([bx, by, target_height], dtype=np.float32)
 
-    elif zone_type == "polygon":
+    elif zone_type == "circle":
+        cx_z, cy_z = float(zone_params["center"][0]), float(zone_params["center"][1])
+        r_z = float(zone_params["radius"])
+        _thetas = np.linspace(0, 2 * np.pi, 120, endpoint=False)
+        zone_params = dict(zone_params)
+        zone_params["vertices"] = [(cx_z + r_z * np.cos(t), cy_z + r_z * np.sin(t))
+                                   for t in _thetas]
+        zone_type = "polygon"
+
+    elif zone_type == "square":
+        cx_z, cy_z = float(zone_params["center"][0]), float(zone_params["center"][1])
+        _s = float(zone_params["side"]) / 2
+        zone_params = dict(zone_params)
+        zone_params["vertices"] = [(cx_z - _s, cy_z - _s), (cx_z + _s, cy_z - _s),
+                                   (cx_z + _s, cy_z + _s), (cx_z - _s, cy_z + _s)]
+        zone_type = "polygon"
+
+    elif zone_type == "rotated_rect":
+        cx_z, cy_z = float(zone_params["center"][0]), float(zone_params["center"][1])
+        _hw = float(zone_params["width"]) / 2
+        _hh = float(zone_params["height"]) / 2
+        _th = float(np.deg2rad(zone_params.get("angle_deg", 0.0)))
+        _c, _s_th = np.cos(_th), np.sin(_th)
+        _raw = [(-_hw, -_hh), (_hw, -_hh), (_hw, _hh), (-_hw, _hh)]
+        zone_params = dict(zone_params)
+        zone_params["vertices"] = [(cx_z + x * _c - y * _s_th,
+                                    cy_z + x * _s_th + y * _c)
+                                   for x, y in _raw]
+        zone_type = "polygon"
+
+    if zone_type == "polygon":
         print("Creating polygon")
         # Set up outer area (map size)
         width_m, height_m = map_config["size"]
@@ -160,9 +190,11 @@ def create_zone_mask(
         zone_params["width"] = maxx - minx
         zone_params["height"] = maxy - miny
 
-    else:
-        print("Polygon configuration is not clear. Double check your configuration")
-        exit
+    elif zone_type != "box":
+        raise ValueError(
+            f"Unknown zone_type '{zone_type}'. "
+            "Supported: 'box', 'polygon', 'circle', 'square', 'rotated_rect'."
+        )
 
     # 3. Exclude building footprints (independent of the zone type)
     num_excluded_buildings = 0
@@ -653,6 +685,7 @@ def visualize_multi_tx_strata(
     tx_states,
     tx_configs,
     map_config,
+    outer_zone_size=350.0,
     iteration=None,
     title=None,
     figsize=None,
@@ -677,6 +710,7 @@ def visualize_multi_tx_strata(
     fig : matplotlib.figure.Figure
     """
     import matplotlib.pyplot as plt
+    from shapely.geometry import Polygon as ShapelyPolygon
 
     if figsize is None:
         figsize = (9, 9)
@@ -708,7 +742,13 @@ def visualize_multi_tx_strata(
         # Outer ring: scale raw box 2x, subtract original box, then punch out buildings.
         # Mirrors _sample_outside_zone exactly — never scale the building-subtracted polygon.
         centroid = box_poly.centroid
-        outer_poly = _shapely_scale(box_poly, xfact=3.0, yfact=3.0, origin=centroid)
+        #outer_poly = _shapely_scale(box_poly, xfact=3.0, yfact=3.0, origin=centroid)
+        cx, cy = centroid.x, centroid.y
+        h = outer_zone_size
+        outer_poly = ShapelyPolygon([
+            (cx - h, cy - h), (cx + h, cy - h),
+            (cx + h, cy + h), (cx - h, cy + h),
+        ])
         outer_ring = outer_poly.difference(box_poly)
         cached_bldgs = first_state.get("cached_building_polygons", [])
         if cached_bldgs:

@@ -10,6 +10,10 @@ transmitter's target coverage zone.
 Public API
 ----------
 TxConfig                       : dataclass describing one transmitter
+JammerConfig                   : dataclass describing one friendly jammer
+seed_bs_positions()            : LOS-aware greedy farthest-point BS placement inside zone
+seed_jammer_positions()        : concave-edge jammer placement outside zone
+setup_bs_transmitters()        : seed + place + configure n BSs in one call
 optimize_multi_tx()            : run the joint optimization
 compare_multi_tx_performance() : evaluate optimised BS-only SINR containment within target zone
 """
@@ -128,6 +132,693 @@ class JammerConfig:
     power_dbm_bounds: tuple = (0.0, 40.0)
     initial_azimuth_deg: float = 0.0
     initial_elevation_deg: float = 0.0
+
+
+# ---------------------------------------------------------------------------
+# Placement seeding utilities
+# ---------------------------------------------------------------------------
+
+def _los_blocked(bx, by, bz, tx, ty, tz, bldg_polys_2d, bldg_heights):
+    """Return True if the 3-D segment (bx,by,bz)→(tx,ty,tz) is blocked.
+
+    For each building whose 2-D footprint intersects the segment we compute
+    the height of the LOS line at the nearest intersection centroid.  If any
+    building roof exceeds that height the path is considered blocked.
+    """
+    from shapely.geometry import LineString as _LS2
+    seg = _LS2([(bx, by), (tx, ty)])
+    h_dist = np.hypot(tx - bx, ty - by)
+    if h_dist < 1e-6:
+        return False
+    for poly, z_h in zip(bldg_polys_2d, bldg_heights):
+        if not seg.intersects(poly):
+            continue
+        ic = seg.intersection(poly).centroid
+        d = np.hypot(ic.x - bx, ic.y - by)
+        h_at = bz + (tz - bz) * (d / h_dist)
+        if z_h > h_at:
+            return True
+    return False
+
+
+def _project_to_zone_edge(
+    pos_xy: list,
+    centroid,
+    zone_poly,
+    building_polygons=None,
+    step_back_m: float = 3.0,
+) -> list:
+    """Project pos_xy to the farthest zone boundary along centroid→pos direction.
+
+    Walks the ray from the zone centroid through pos_xy until it exits the zone
+    polygon, then steps back step_back_m so the result is clearly interior.
+    If the stepped-back point lands inside a building, it retreats in further
+    increments until clear (or gives up after 20 tries).
+    """
+    from shapely.geometry import LineString as _LS, Point as _Pt
+
+    cx, cy = float(centroid.x), float(centroid.y)
+    dx = pos_xy[0] - cx
+    dy = pos_xy[1] - cy
+    length = (dx ** 2 + dy ** 2) ** 0.5
+    if length < 1e-6:
+        return pos_xy
+
+    dx /= length
+    dy /= length
+
+    far = 20_000.0
+    ray = _LS([(cx, cy), (cx + dx * far, cy + dy * far)])
+    inter = ray.intersection(zone_poly)
+
+    def _coords(geom):
+        if geom.is_empty:
+            return []
+        t = geom.geom_type
+        if t == "Point":
+            return [(geom.x, geom.y)]
+        if t == "MultiPoint":
+            return [(g.x, g.y) for g in geom.geoms]
+        if t == "LineString":
+            return list(geom.coords)
+        if t in ("MultiLineString", "GeometryCollection"):
+            out = []
+            for g in geom.geoms:
+                out.extend(_coords(g))
+            return out
+        return []
+
+    coords = _coords(inter)
+    if not coords:
+        return pos_xy
+
+    # Farthest point along the ray from the centroid
+    best_t, best_pt = -1.0, pos_xy
+    for (x, y) in coords:
+        t = (x - cx) * dx + (y - cy) * dy
+        if t > best_t:
+            best_t = t
+            best_pt = [x, y]
+
+    # Step back from edge so the point is clearly inside the zone
+    px = best_pt[0] - dx * step_back_m
+    py = best_pt[1] - dy * step_back_m
+
+    # Retreat further if we landed inside a building
+    if building_polygons:
+        pt = _Pt(px, py)
+        for _ in range(20):
+            if not any(bp.contains(pt) for bp in building_polygons):
+                break
+            px -= dx * step_back_m
+            py -= dy * step_back_m
+            pt = _Pt(px, py)
+
+    return [px, py]
+
+
+def seed_bs_positions(
+    zone_params: dict,
+    n_bs: int,
+    building_polygons=None,
+    building_info: dict = None,
+    bs_height: float = 25.0,
+    target_z: float = 1.5,
+    seed: int = 42,
+    project_to_edge: bool = False,
+) -> list:
+    """Place n_bs base stations inside the zone, maximally spread and LOS-clear.
+
+    Candidates are sampled inside the zone polygon (building footprints
+    excluded), then split into two pools:
+
+    * **LOS pool** — positions with an unobstructed 3-D line of sight from
+      ``(x, y, bs_height)`` to the zone centroid at ``target_z``.
+    * **Fallback pool** — all remaining interior positions.
+
+    Greedy farthest-point selection runs on the LOS pool first.  If the LOS
+    pool is exhausted before ``n_bs`` stations are placed, the algorithm
+    continues into the fallback pool (with a printed warning).
+
+    Parameters
+    ----------
+    zone_params : dict
+        ``{'vertices': [(x,y), ...]}`` or ``{'center', 'width', 'height'}``.
+    n_bs : int
+        Number of base stations to place.
+    building_polygons : list[ShapelyPolygon] or None
+        2-D building footprints used to exclude positions from the interior
+        candidate grid.  Pass the same list used in ``_setup_tx_state``.
+    building_info : dict or None
+        Dict returned by ``extract_building_info``; used for the 3-D LOS
+        check.  If ``None``, the LOS filter is skipped.
+    bs_height : float
+        BS elevation (metres above scene origin).  Default 25 m.
+    target_z : float
+        Height of the LOS target point at the zone centroid.  Default 1.5 m.
+    seed : int
+        RNG seed for reproducible candidate sampling.
+    project_to_edge : bool
+        If True, each selected position is projected outward from the zone
+        centroid to the farthest zone boundary in that direction, pushing BSs
+        into concave protrusions of the zone.  Default False.
+
+    Returns
+    -------
+    list of [x, y] positions (floats, metres).
+    """
+    from shapely import contains_xy as _cxy
+    from shapely.geometry import Point as _Pt
+
+    rng = np.random.default_rng(seed)
+
+    if "vertices" in zone_params:
+        zone_poly = ShapelyPolygon(zone_params["vertices"])
+    else:
+        cx0, cy0 = zone_params["center"][0], zone_params["center"][1]
+        w, h = zone_params["width"], zone_params["height"]
+        zone_poly = ShapelyPolygon([
+            (cx0 - w / 2, cy0 - h / 2), (cx0 + w / 2, cy0 - h / 2),
+            (cx0 + w / 2, cy0 + h / 2), (cx0 - w / 2, cy0 + h / 2),
+        ])
+
+    valid_poly = zone_poly
+    if building_polygons:
+        bldg_union = shapely.ops.unary_union(building_polygons)
+        valid_poly = zone_poly.difference(bldg_union)
+
+    minx, miny, maxx, maxy = valid_poly.bounds
+    n_cand = max(4000, n_bs * 400)
+    xs = rng.uniform(minx, maxx, n_cand * 5)
+    ys = rng.uniform(miny, maxy, n_cand * 5)
+    inside = _cxy(valid_poly, xs, ys)
+    candidates = np.column_stack([xs[inside], ys[inside]])[:n_cand]
+
+    if len(candidates) < n_bs:
+        raise ValueError(
+            f"seed_bs_positions: only {len(candidates)} valid interior candidates "
+            f"for {n_bs} BSs — zone may be too small or heavily occluded by buildings."
+        )
+
+    # ── LOS filter ────────────────────────────────────────────────────────────
+    # Used only as a preference signal within each k-means cluster below,
+    # NOT as a hard gate — avoids starving non-convex zone lobes of candidates.
+    if building_info:
+        cent = zone_poly.centroid
+        cx_los, cy_los = float(cent.x), float(cent.y)
+        bldg_polys_2d = []
+        bldg_heights  = []
+        for info in building_info.values():
+            verts = info.get("vertices", [])
+            z_h   = info.get("z_height", 0.0)
+            if len(verts) >= 3:
+                bldg_polys_2d.append(ShapelyPolygon([(v[0], v[1]) for v in verts]))
+                bldg_heights.append(float(z_h))
+
+        los_ok = np.array([
+            not _los_blocked(
+                float(candidates[i, 0]), float(candidates[i, 1]), bs_height,
+                cx_los, cy_los, target_z,
+                bldg_polys_2d, bldg_heights,
+            )
+            for i in range(len(candidates))
+        ])
+    else:
+        los_ok = np.ones(len(candidates), dtype=bool)
+
+    # ── K-means++ spread: one BS per zone region ───────────────────────────────
+    # Partition ALL interior candidates (no LOS gate) into n_bs clusters so
+    # every part of the zone is represented.  Within each cluster, prefer the
+    # LOS-clear candidate nearest the cluster centre; fall back to any candidate.
+    from sklearn.cluster import KMeans as _KMeans
+
+    km = _KMeans(n_clusters=n_bs, init="k-means++", n_init=10, random_state=seed)
+    km.fit(candidates.astype(float))
+    labels  = km.labels_           # cluster index per candidate
+    centers = km.cluster_centers_  # n_bs × 2 ideal positions
+
+    used   = set()
+    result = []
+    for k in range(n_bs):
+        cluster_idx = np.where(labels == k)[0]
+        if len(cluster_idx) == 0:
+            continue
+
+        los_in_cluster = cluster_idx[los_ok[cluster_idx]]
+        pool_idx = los_in_cluster if len(los_in_cluster) > 0 else cluster_idx
+
+        dists = np.linalg.norm(candidates[pool_idx] - centers[k], axis=1)
+        best  = pool_idx[int(np.argmin(dists))]
+        result.append(candidates[best])
+        used.add(int(best))
+
+    # Safety: fill any empty-cluster gaps from remaining unused candidates
+    if len(result) < n_bs:
+        for i in range(len(candidates)):
+            if len(result) >= n_bs:
+                break
+            if i not in used:
+                result.append(candidates[i])
+                used.add(i)
+
+    positions = [[float(p[0]), float(p[1])] for p in result[:n_bs]]
+
+    if project_to_edge:
+        centroid = zone_poly.centroid
+        positions = [
+            _project_to_zone_edge(p, centroid, zone_poly, building_polygons)
+            for p in positions
+        ]
+
+    return positions
+
+
+def setup_bs_transmitters(
+    scene,
+    zone_params: dict,
+    n_bs: int,
+    scene_xml_path: str,
+    bs_height: float = 25.0,
+    target_z: float = 1.5,
+    name_prefix: str = "bs",
+    seed: int = 42,
+    project_to_edge: bool = False,
+    optimize_power: bool = False,
+    initial_power_dbm: Optional[float] = None,
+    power_dbm_bounds: tuple = (0.0, 50.0),
+) -> tuple:
+    """Create and place n_bs base stations in the scene, ready for optimisation.
+
+    Combines position seeding, scene registration, and ``TxConfig`` creation
+    into a single call so adding more BSs only requires changing ``n_bs``.
+
+    Steps
+    -----
+    1. Load building geometry from *scene_xml_path* for footprint exclusion and
+       3-D LOS filtering.
+    2. Call :func:`seed_bs_positions` (LOS-aware greedy farthest-point spread).
+    3. For each BS: add a :class:`~sionna.rt.Transmitter` to the scene if it
+       does not already exist, or update its position if it does.
+    4. Return a ``TxConfig`` list and the seeded ``[x, y, z]`` positions.
+
+    Parameters
+    ----------
+    scene : sionna.rt.Scene
+    zone_params : dict
+        ``{'vertices': [(x,y), ...]}`` or ``{'center', 'width', 'height'}``.
+    n_bs : int
+        Number of base stations to create.
+    scene_xml_path : str
+        Path to the scene XML; used to extract building info.
+    bs_height : float
+        Transmitter elevation (metres).  Default 25 m.
+    target_z : float
+        LOS target height at zone centroid (metres).  Default 1.5 m.
+    name_prefix : str
+        Transmitter names will be ``"{name_prefix}_{i}"`` for i = 0 … n_bs-1.
+    seed : int
+        Reproducibility seed passed to ``seed_bs_positions``.
+    project_to_edge : bool
+        If True, each BS is projected outward from the zone centroid to the
+        farthest zone boundary in its direction, pushing BSs into concave
+        protrusions.  Default False.
+    optimize_power : bool
+        Whether transmit power is an optimisable parameter.
+    initial_power_dbm : float or None
+        Override starting power; ``None`` → read from scene.
+    power_dbm_bounds : tuple[float, float]
+        (min, max) dBm clamp for power optimisation.
+
+    Returns
+    -------
+    tx_configs : list[TxConfig]
+    bs_positions_xyz : list[[x, y, z]]
+        Seeded positions including elevation, for use as ``origin_point`` in
+        :func:`~boresight_pathsolver.create_zone_mask`.
+    """
+    from scene_parser import extract_building_info
+
+    building_info = extract_building_info(scene_xml_path)
+
+    # 2-D building polygons for footprint exclusion (no height needed here)
+    building_polygons = []
+    for info in building_info.values():
+        verts = info.get("vertices", [])
+        if len(verts) >= 3:
+            try:
+                p = ShapelyPolygon([(v[0], v[1]) for v in verts])
+                if p.is_valid:
+                    building_polygons.append(p)
+            except Exception:
+                pass
+
+    positions_xy = seed_bs_positions(
+        zone_params=zone_params,
+        n_bs=n_bs,
+        building_polygons=building_polygons,
+        building_info=building_info,
+        bs_height=bs_height,
+        target_z=target_z,
+        seed=seed,
+        project_to_edge=project_to_edge,
+    )
+
+    bs_positions_xyz = [[float(x), float(y), bs_height] for x, y in positions_xy]
+    tx_configs = []
+
+    for i, (x, y, z) in enumerate(bs_positions_xyz):
+        name = f"{name_prefix}_{i}"
+        existing = scene.get(name)
+        if existing is None:
+            tx = Transmitter(name=name, position=[x, y, z])
+            scene.add(tx)
+        else:
+            existing.position = mi.Point3f(float(x), float(y), float(z))
+
+        tx_configs.append(TxConfig(
+            name=name,
+            on_building=False,
+            building_id=0,
+            zone_params=zone_params,
+            optimize_power=optimize_power,
+            initial_power_dbm=initial_power_dbm,
+            power_dbm_bounds=power_dbm_bounds,
+        ))
+        print(f"  {name}: ({x:.1f}, {y:.1f}, {z:.1f})")
+
+    return tx_configs, bs_positions_xyz
+
+
+def seed_jammer_positions(
+    zone_params: dict,
+    n_jammers: Optional[int] = None,
+    bs_positions: list = None,
+    standoff_distance: float = 100.0,
+    min_bs_distance: float = 80.0,
+    concave_order: int = 8,
+    max_gap_deg: float = 90.0,
+    interpolation_factor: int = 1,
+    seed: int = 42,
+) -> list:
+    """Place jammers outside the zone at every boundary feature.
+
+    Produces one jammer per *concave corner* (local radius minimum — inward
+    dip of the zone boundary) **and** one jammer per *convex arc peak* (the
+    vertex of maximum radius on each arc between consecutive concave corners).
+    Together these seed points cover the full perimeter: inward pockets AND
+    outward lobes all get a jammer to suppress leakage from every direction.
+
+    Each jammer is placed radially outward from the zone centroid:
+    ``position = boundary_vertex + outward_normal × standoff_distance``
+    Jammers are then pushed further outward in 10 m steps until they are at
+    least ``min_bs_distance`` metres from every BS.
+
+    For box zones jammers are placed evenly around the exterior perimeter.
+
+    Parameters
+    ----------
+    zone_params : dict
+        ``{'vertices': [(x,y), ...]}`` or ``{'center', 'width', 'height'}``.
+        Also accepts ``{'center', 'radius'}`` (circle),
+        ``{'center', 'side'}`` (square), and
+        ``{'center', 'width', 'height', 'angle_deg'}`` (rotated rectangle).
+    n_jammers : int or None
+        Maximum number of jammers to place.  ``None`` (default) → place one
+        per detected boundary feature (all concave corners + all convex arc
+        peaks), giving full perimeter coverage.
+    bs_positions : list of [x, y] or [x, y, z]
+        Friendly base-station positions; only x/y are used.
+    standoff_distance : float
+        Metres past the zone boundary vertex where the jammer is initially
+        seeded.  A larger standoff gives the optimizer room to raise power
+        without immediately leaking into the protected zone.  Default 100 m.
+    min_bs_distance : float
+        Minimum distance (metres) from any BS.  Jammers that start too close
+        are pushed further outward in 10 m steps (max 30 steps).
+    concave_order : int
+        Half-window for local-minimum detection on the radius profile.
+    max_gap_deg : float
+        Maximum allowed angular gap (degrees, measured from the centroid)
+        between consecutive jammers.  After feature-based seeding, any gap
+        larger than this threshold gets a fill jammer inserted at the gap
+        midpoint.  Default 90°.
+    interpolation_factor : int
+        Multiplier applied to the jammer count after all other placement
+        logic.  ``1`` (default) leaves the set unchanged.  ``2`` inserts one
+        contour-following jammer between every consecutive pair, doubling the
+        count.  ``k`` inserts ``k-1`` evenly-spaced jammers per gap, so the
+        total approaches ``k × original``.  Inserted jammers are ray-cast to
+        the zone boundary and placed at ``standoff_distance`` outward, so they
+        follow the zone contour rather than straight-line interpolating.
+    seed : int
+        Unused (placement is deterministic); kept for API consistency.
+
+    Returns
+    -------
+    list of [x, y] positions (floats, metres).
+    """
+    from shapely.geometry import Point as _Pt, LineString as _LS
+
+    # ── Normalise non-polygon zone types to vertex list ──────────────────────
+    zone_params = dict(zone_params)  # shallow copy — don't mutate caller's dict
+    if "radius" in zone_params:
+        _cx, _cy = float(zone_params["center"][0]), float(zone_params["center"][1])
+        _r = float(zone_params["radius"])
+        _thetas = np.linspace(0, 2 * np.pi, 120, endpoint=False)
+        zone_params = {"vertices": [(_cx + _r * np.cos(t), _cy + _r * np.sin(t))
+                                    for t in _thetas]}
+    elif "side" in zone_params:
+        _cx, _cy = float(zone_params["center"][0]), float(zone_params["center"][1])
+        _s = float(zone_params["side"]) / 2
+        zone_params = {"vertices": [(_cx - _s, _cy - _s), (_cx + _s, _cy - _s),
+                                    (_cx + _s, _cy + _s), (_cx - _s, _cy + _s)]}
+    elif "angle_deg" in zone_params:
+        _cx, _cy = float(zone_params["center"][0]), float(zone_params["center"][1])
+        _hw = float(zone_params["width"]) / 2
+        _hh = float(zone_params["height"]) / 2
+        _th = float(np.deg2rad(zone_params["angle_deg"]))
+        _c, _s_th = np.cos(_th), np.sin(_th)
+        _corners = [(-_hw, -_hh), (_hw, -_hh), (_hw, _hh), (-_hw, _hh)]
+        zone_params = {"vertices": [(_cx + x * _c - y * _s_th,
+                                     _cy + x * _s_th + y * _c)
+                                    for x, y in _corners]}
+
+    bs_xy = np.array([[float(p[0]), float(p[1])] for p in (bs_positions or [])],
+                     dtype=float).reshape(-1, 2)
+
+    def _push_to_min_bs_dist(jx, jy, nx, ny):
+        for _ in range(30):
+            if len(bs_xy) == 0:
+                break
+            if np.linalg.norm(bs_xy - np.array([jx, jy]), axis=1).min() >= min_bs_distance:
+                break
+            jx += nx * 10.0
+            jy += ny * 10.0
+        return jx, jy
+
+    def _place_outward(vertex_idx, vertices, zone_poly, cx, cy, r):
+        vx, vy = float(vertices[vertex_idx][0]), float(vertices[vertex_idx][1])
+        dx, dy = vx - cx, vy - cy
+        dist = np.hypot(dx, dy)
+        if dist < 1e-6:
+            return None
+        nx, ny = dx / dist, dy / dist
+        jx = vx + nx * standoff_distance
+        jy = vy + ny * standoff_distance
+        if zone_poly.contains(_Pt(jx, jy)):
+            jx += nx * standoff_distance
+            jy += ny * standoff_distance
+        return jx, jy, nx, ny
+
+    if "vertices" in zone_params:
+        vertices = list(zone_params["vertices"])
+        zone_poly = ShapelyPolygon(vertices)
+        cx, cy = zone_poly.centroid.x, zone_poly.centroid.y
+
+        n_v = len(vertices)
+        r = np.array([np.hypot(v[0] - cx, v[1] - cy) for v in vertices])
+
+        # ── Concave corners (local minima in radius) ──────────────────────────
+        concave_idx = [
+            i for i in range(n_v)
+            if all(r[i] < r[(i + k) % n_v] for k in range(1, concave_order + 1))
+            and all(r[i] < r[(i - k) % n_v] for k in range(1, concave_order + 1))
+        ]
+
+        def _prominence(i):
+            nbrs = [r[(i + k) % n_v]
+                    for k in range(-concave_order, concave_order + 1) if k != 0]
+            return float(np.mean(nbrs)) - float(r[i])
+
+        concave_sorted = sorted(concave_idx, key=_prominence, reverse=True)
+        concave_candidates = []
+        for i in concave_sorted:
+            pt = _place_outward(i, vertices, zone_poly, cx, cy, r)
+            if pt is not None:
+                concave_candidates.append(pt)
+
+        # ── Convex arc peaks (local maxima between consecutive concave corners) ─
+        # Walk the boundary in position order and find the highest-radius vertex
+        # on each arc between consecutive concave corners.
+        convex_candidates = []
+        if concave_idx:
+            concave_by_pos = sorted(concave_idx)
+            n_c = len(concave_by_pos)
+            for arc_i in range(n_c):
+                c_start = concave_by_pos[arc_i]
+                c_end   = concave_by_pos[(arc_i + 1) % n_c]
+                # Vertices strictly between the two concave corners (wraps if needed)
+                if c_start < c_end:
+                    arc_inner = list(range(c_start + 1, c_end))
+                else:
+                    arc_inner = list(range(c_start + 1, n_v)) + list(range(0, c_end))
+                if not arc_inner:
+                    continue
+                # Highest-radius vertex on this arc is the convex lobe peak
+                peak_idx = max(arc_inner, key=lambda i: r[i])
+                pt = _place_outward(peak_idx, vertices, zone_poly, cx, cy, r)
+                if pt is not None:
+                    convex_candidates.append(pt)
+
+            # Sort convex peaks by their peak radius (highest outward lobe first)
+            convex_candidates.sort(key=lambda t: -np.hypot(t[0] - cx, t[1] - cy))
+        else:
+            # No concavities at all: use the single highest-radius vertex as the
+            # only convex peak and pad with equally-spaced exterior points.
+            peak_idx = int(np.argmax(r))
+            pt = _place_outward(peak_idx, vertices, zone_poly, cx, cy, r)
+            if pt is not None:
+                convex_candidates.append(pt)
+
+        # Concave jammers first (by prominence), then convex arc peaks (by r).
+        all_candidates = concave_candidates + convex_candidates
+
+        # If there are still not enough, pad with equally-spaced exterior points.
+        cap = n_jammers if n_jammers is not None else len(all_candidates)
+        if len(all_candidates) < cap:
+            used_angles = {round(np.arctan2(t[1] - cy, t[0] - cx), 2)
+                           for t in all_candidates}
+            for angle in np.linspace(0, 2 * np.pi, cap * 4, endpoint=False):
+                if len(all_candidates) >= cap:
+                    break
+                if round(angle, 2) in used_angles:
+                    continue
+                ray = _LS([(cx, cy),
+                            (cx + 2000 * np.cos(angle), cy + 2000 * np.sin(angle))])
+                inter = ray.intersection(zone_poly.boundary)
+                if inter.is_empty:
+                    continue
+                bpt = (max(inter.geoms, key=lambda g: g.distance(_Pt(cx, cy)))
+                       if hasattr(inter, "geoms") else inter)
+                bx, by = float(bpt.x), float(bpt.y)
+                nx, ny = np.cos(angle), np.sin(angle)
+                all_candidates.append((bx + nx * standoff_distance,
+                                       by + ny * standoff_distance, nx, ny))
+
+    else:
+        # Box zone: distribute evenly around exterior perimeter
+        cx, cy = zone_params["center"][0], zone_params["center"][1]
+        w, h   = zone_params["width"], zone_params["height"]
+        zone_poly = ShapelyPolygon([
+            (cx - w / 2, cy - h / 2), (cx + w / 2, cy - h / 2),
+            (cx + w / 2, cy + h / 2), (cx - w / 2, cy + h / 2),
+        ])
+        cap = n_jammers if n_jammers is not None else 4
+        angles = np.linspace(0, 2 * np.pi, cap, endpoint=False)
+        all_candidates = []
+        for angle in angles:
+            ray = _LS([(cx, cy), (cx + 2000 * np.cos(angle), cy + 2000 * np.sin(angle))])
+            inter = ray.intersection(zone_poly.boundary)
+            if inter.is_empty:
+                continue
+            pt = (max(inter.geoms, key=lambda g: g.distance(_Pt(cx, cy)))
+                  if hasattr(inter, "geoms") else inter)
+            bx, by = float(pt.x), float(pt.y)
+            nx, ny = np.cos(angle), np.sin(angle)
+            all_candidates.append((bx + nx * standoff_distance,
+                                   by + ny * standoff_distance, nx, ny))
+
+    # ── Shared ray-cast helper (used by gap fill and interpolation) ──────────
+    _TWO_PI = 2 * np.pi
+
+    def _fill_ray(angle):
+        nx, ny = np.cos(angle), np.sin(angle)
+        ray = _LS([(cx, cy), (cx + 2000 * nx, cy + 2000 * ny)])
+        inter = ray.intersection(zone_poly.boundary)
+        if inter.is_empty:
+            return None
+        bpt = (max(inter.geoms, key=lambda g: g.distance(_Pt(cx, cy)))
+               if hasattr(inter, "geoms") else inter)
+        bx, by = float(bpt.x), float(bpt.y)
+        return (bx + nx * standoff_distance,
+                by + ny * standoff_distance, nx, ny)
+
+    # ── Angular gap fill ─────────────────────────────────────────────────────
+    # Iteratively subdivide any angular sector (from centroid) larger than
+    # max_gap_deg until all gaps are within the threshold.  Using midpoint
+    # bisection handles both large initial gaps (e.g. a single starting
+    # candidate on a smooth circle) and the n_cands==1 wrap-around edge case.
+    if all_candidates and max_gap_deg > 0:
+        max_gap_rad = np.deg2rad(max_gap_deg)
+
+        fill_candidates = []
+        live_angles = sorted(
+            np.arctan2(t[1] - cy, t[0] - cx) for t in all_candidates
+        )
+
+        changed = True
+        max_iters = 32  # safety cap (2^32 fills would be absurd)
+        while changed and max_iters > 0:
+            max_iters -= 1
+            changed = False
+            n_a = len(live_angles)
+            new_angles = []
+            for i in range(n_a):
+                a0 = live_angles[i]
+                a1 = live_angles[(i + 1) % n_a]
+                # Correct wrap-around: when n_a==1 the gap is the full circle
+                gap = (a1 - a0) % _TWO_PI or _TWO_PI
+                if gap > max_gap_rad:
+                    mid = a0 + gap / 2
+                    pt = _fill_ray(mid)
+                    if pt is not None:
+                        fill_candidates.append(pt)
+                        new_angles.append(mid)
+                        changed = True
+            live_angles = sorted(live_angles + new_angles)
+
+        all_candidates = all_candidates + fill_candidates
+
+    # ── Contour interpolation ────────────────────────────────────────────────
+    # Insert (interpolation_factor - 1) evenly-spaced jammers between every
+    # consecutive pair of existing jammers (in angular order around the
+    # centroid).  Each inserted point is ray-cast to the zone boundary so it
+    # follows the zone contour rather than straight-line interpolating.
+    if interpolation_factor > 1 and all_candidates:
+        n_inserts = interpolation_factor - 1
+        sorted_cands = sorted(all_candidates,
+                              key=lambda t: np.arctan2(t[1] - cy, t[0] - cx))
+        n_sc = len(sorted_cands)
+        interp_candidates = []
+        for i in range(n_sc):
+            a0 = np.arctan2(sorted_cands[i][1] - cy, sorted_cands[i][0] - cx)
+            a1 = np.arctan2(sorted_cands[(i + 1) % n_sc][1] - cy,
+                            sorted_cands[(i + 1) % n_sc][0] - cx)
+            gap = (a1 - a0) % _TWO_PI or _TWO_PI
+            for k in range(1, n_inserts + 1):
+                mid = a0 + gap * k / (n_inserts + 1)
+                pt = _fill_ray(mid)
+                if pt is not None:
+                    interp_candidates.append(pt)
+        all_candidates = sorted_cands + interp_candidates
+
+    cap = n_jammers if n_jammers is not None else len(all_candidates)
+    result = []
+    for jx, jy, nx, ny in all_candidates[:cap]:
+        jx, jy = _push_to_min_bs_dist(jx, jy, nx, ny)
+        result.append([float(jx), float(jy)])
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +962,16 @@ def _jam_param_strides(jam_configs):
     return strides, offsets
 
 
+def _push_outside_buildings(x, y, building_polygons):
+    """If (x, y) is inside any building polygon, snap it to the nearest exterior point."""
+    pt = shapely.geometry.Point(x, y)
+    for bp in building_polygons:
+        if bp.contains(pt):
+            nearest = shapely.ops.nearest_points(pt, bp.exterior)[1]
+            return nearest.x, nearest.y
+    return x, y
+
+
 def _sample_zone_points(state: dict, cfg: TxConfig, n: int,
                         sampler: str, sampling_strata: str,
                         ground_z: float) -> np.ndarray:
@@ -403,25 +1104,41 @@ def _sample_zone_points(state: dict, cfg: TxConfig, n: int,
         raise ValueError(f"Unknown sampling_strata: {sampling_strata!r}")
 
 
-def _sample_outside_zone(state: dict, n: int, ground_z: float) -> np.ndarray:
-    """Sample n points in the ring between the zone and its 2x-scaled version.
+def _sample_outside_zone(state: dict, n_inside: int, ground_z: float,
+                         outer_half_size: float = 500.0) -> np.ndarray:
+    """Sample points outside the zone, area-proportional to n_inside.
 
-    Scale the raw box polygon (no building exclusions applied yet), subtract the
-    original box, then punch out building footprints from the ring so that the
-    outer region geometry is consistent with the inside zone.
+    The sample count is scaled by (outer_ring.area / zone.area) so that the
+    spatial density of outside samples matches the inside density, giving each
+    square metre equal weight in the loss function.
+
+    The outer region is a square of ±outer_half_size metres centred on the zone
+    centroid with the zone polygon and building footprints subtracted.  Using a
+    fixed square (rather than a scaled copy of the zone) gives a consistent,
+    zone-shape-invariant outer sampling region across all simulation geometries.
     """
     from shapely import contains_xy as _cxy
     import shapely.ops
 
     box_poly = state["box_polygon"]
     centroid = box_poly.centroid
-    outer_poly = shapely_scale(box_poly, xfact=3.0, yfact=3.0, origin=centroid)
+    cx, cy = centroid.x, centroid.y
+    h = outer_half_size
+    outer_poly = ShapelyPolygon([
+        (cx - h, cy - h), (cx + h, cy - h),
+        (cx + h, cy + h), (cx - h, cy + h),
+    ])
     outer_ring = outer_poly.difference(box_poly)
 
     cached_bldgs = state.get("cached_building_polygons", [])
     if cached_bldgs:
         bldg_union = shapely.ops.unary_union(cached_bldgs)
         outer_ring = outer_ring.difference(bldg_union)
+
+    zone_area = box_poly.area
+    ring_area  = outer_ring.area
+    area_ratio = ring_area / zone_area if zone_area > 0 else 1.0
+    n = max(1, round(n_inside * area_ratio))
 
     minx, miny, maxx, maxy = outer_ring.bounds
     rng = np.random.default_rng()
@@ -708,19 +1425,24 @@ def _sir_loss_body(
     lambda_out=10.0,
     lambda_sharp=0.0,
     lambda_pwr=7.0,
+    lambda_uniform=0.0,
+    min_sinr_db=10.0,
+    soft_mean_weight=0.25,
     epsilon=1e-30,
 ):
     """Containment SIR loss with hinge penalties and boundary sharpening.
 
     Loss components (all in dB-space):
-      L_in    : squared hinge on (gamma - SINR) for inside cells
-                -> penalizes service holes
-      L_out   : squared hinge on (SINR - gamma) for outside cells
-                -> penalizes detectable leakage
-      L_sharp : Gaussian bump centered at gamma over boundary-shell cells
-                -> penalizes fuzzy threshold crossings
-      L_pwr   : L2 on jammer power scale factors
-                -> discourages spending jammer power unnecessarily
+      L_in      : squared hinge on (gamma - SINR) for inside cells
+                  -> penalizes service holes
+      L_out     : squared hinge on (SINR - gamma) for outside cells
+                  -> penalizes detectable leakage
+      L_sharp   : Gaussian bump centered at gamma over boundary-shell cells
+                  -> penalizes fuzzy threshold crossings
+      L_pwr     : L2 on jammer power scale factors
+                  -> discourages spending jammer power unnecessarily
+      L_uniform : variance of inside-cell SINR + squared hinge below min_sinr_db
+                  -> penalizes hotspot-driven coverage (non-uniform distribution)
 
     Parameters
     ----------
@@ -734,6 +1456,12 @@ def _sir_loss_body(
     lambda_in, lambda_out, lambda_sharp, lambda_pwr : float
         Loss-term weights. Sweep lambda_out / lambda_in for the
         leakage / service-hole Pareto frontier.
+    lambda_uniform : float
+        Weight for the uniformity penalty (L_uniform). Default 0 (disabled).
+    min_sinr_db : float
+        Minimum acceptable SINR inside the zone (dB). Cells below this
+        threshold contribute a squared hinge to L_uniform, on top of the
+        variance term. Default 10 dB.
     """
     deg2rad = Float(float(np.pi / 180.0))
     dr.disable_grad(deg2rad)
@@ -945,12 +1673,26 @@ def _sir_loss_body(
         # The soft mean term provides an always-active signal to push outside
         # SINR downward regardless of whether cells are above the threshold.
         excess = dr.maximum(sinr_out - gamma_f, zero_f)
-        loss_outside = dr.mean(excess * excess) + Float(0.25) * dr.mean(sinr_out)
+        loss_outside = dr.mean(excess * excess) + Float(float(soft_mean_weight)) * dr.mean(sinr_out)
     else:
         # No partition provided: treat all cells as "inside"
         deficit = dr.maximum(gamma_f - sinr_db, zero_f)
         loss_inside = dr.mean(deficit * deficit)
         loss_outside = Float(0.0); dr.disable_grad(loss_outside)
+
+    # L_uniform: variance of inside-cell SINR + squared hinge below min_sinr_db.
+    # Var = E[X²] - E[X]² avoids a scalar-broadcast subtraction across the array.
+    # Both terms fire only when inside receivers exist; disabled when lambda_uniform=0.
+    loss_uniform = Float(0.0); dr.disable_grad(loss_uniform)
+    if lambda_uniform != 0.0 and num_inside is not None and num_inside < dr.width(best_sinr):
+        n_in = int(num_inside)
+        sinr_in_u = sinr_db[:n_in]
+        mean_in    = dr.mean(sinr_in_u)
+        variance   = dr.mean(sinr_in_u * sinr_in_u) - mean_in * mean_in
+        floor_f    = Float(float(min_sinr_db)); dr.disable_grad(floor_f)
+        floor_def  = dr.maximum(floor_f - sinr_in_u, zero_f)
+        loss_floor = dr.mean(floor_def * floor_def)
+        loss_uniform = variance + loss_floor
 
     # L_sharp: Gaussian bump centered at gamma, over boundary shell cells.
     # Penalizes cells lingering near threshold => forces a sharp transition.
@@ -988,15 +1730,17 @@ def _sir_loss_body(
     # ------------------------------------------------------------------
     # Compose total loss
     # ------------------------------------------------------------------
-    lam_in    = Float(float(lambda_in));    dr.disable_grad(lam_in)
-    lam_out   = Float(float(lambda_out));   dr.disable_grad(lam_out)
-    lam_sharp = Float(float(lambda_sharp)); dr.disable_grad(lam_sharp)
-    lam_pwr   = Float(float(lambda_pwr));   dr.disable_grad(lam_pwr)
+    lam_in      = Float(float(lambda_in));      dr.disable_grad(lam_in)
+    lam_out     = Float(float(lambda_out));     dr.disable_grad(lam_out)
+    lam_sharp   = Float(float(lambda_sharp));   dr.disable_grad(lam_sharp)
+    lam_pwr     = Float(float(lambda_pwr));     dr.disable_grad(lam_pwr)
+    lam_uniform = Float(float(lambda_uniform)); dr.disable_grad(lam_uniform)
 
-    total = (lam_in    * loss_inside +
-             lam_out   * loss_outside +
-             lam_sharp * loss_sharp +
-             lam_pwr   * loss_pwr)
+    total = (lam_in      * loss_inside +
+             lam_out     * loss_outside +
+             lam_sharp   * loss_sharp +
+             lam_pwr     * loss_pwr +
+             lam_uniform * loss_uniform)
 
     # Optional debug (comment out for production training)
     if num_inside is not None and num_inside < dr.width(best_sinr):
@@ -1004,7 +1748,8 @@ def _sir_loss_body(
         print(f"  [dbg] mean SINR_dB inside : {dr.mean(sinr_db[:n_in])}")
         print(f"  [dbg] mean SINR_dB outside: {dr.mean(sinr_db[n_in:])}")
     print(f"  [dbg] L_in={dr.mean(loss_inside)}  L_out={dr.mean(loss_outside)}  "
-          f"L_sharp={dr.mean(loss_sharp)}  L_pwr={dr.mean(loss_pwr)}")
+          f"L_sharp={dr.mean(loss_sharp)}  L_pwr={dr.mean(loss_pwr)}  "
+          f"L_uniform={dr.mean(loss_uniform)}")
 
     return total
 
@@ -1021,6 +1766,9 @@ def _make_compute_sir_loss(
     lambda_out=10.0,
     lambda_sharp=0.0,
     lambda_pwr=7.0,
+    lambda_uniform=0.0,
+    min_sinr_db=10.0,
+    soft_mean_weight=0.25,
     epsilon=1e-30,
 ):
     """Build and return the @dr.wrap-decorated SIR loss function.
@@ -1062,6 +1810,9 @@ def _make_compute_sir_loss(
         f"                 lambda_out=_lambda_out,\n"
         f"                 lambda_sharp=_lambda_sharp,\n"
         f"                 lambda_pwr=_lambda_pwr,\n"
+        f"                 lambda_uniform=_lambda_uniform,\n"
+        f"                 min_sinr_db=_min_sinr_db,\n"
+        f"                 soft_mean_weight=_soft_mean_weight,\n"
         f"                 epsilon=_epsilon)\n"
     )
 
@@ -1087,7 +1838,10 @@ def _make_compute_sir_loss(
         "_lambda_out":     lambda_out,
         "_lambda_sharp":   lambda_sharp,
         "_lambda_pwr":     lambda_pwr,
-        "_epsilon":        epsilon,
+        "_lambda_uniform":   lambda_uniform,
+        "_min_sinr_db":      min_sinr_db,
+        "_soft_mean_weight": soft_mean_weight,
+        "_epsilon":          epsilon,
     }
     exec(func_code, globs)
     inner_fn = globs["_inner"]
@@ -1123,9 +1877,13 @@ def optimize_multi_tx(
     lambda_out: float = 10.0,
     lambda_sharp: float = 0.0,
     lambda_pwr: float = 7.0,
+    lambda_uniform: float = 0.0,
+    min_sinr_db: float = 10.0,
+    soft_mean_weight: float = 0.25,
     zone_mask: Optional[np.ndarray] = None,
     boundary_shell_cells: int = 5,
     freeze_bs: bool = False,
+    outside_half_size: float = 500.0,
 ) -> dict:
     """Jointly optimise N transmitters for SIR coverage.
 
@@ -1176,6 +1934,13 @@ def optimize_multi_tx(
     lambda_in, lambda_out, lambda_sharp, lambda_pwr : float
         Weights for the four loss terms. Set lambda_sharp > 0 to activate the
         boundary-sharpening Gaussian.
+    lambda_uniform : float
+        Weight for the uniformity penalty. When > 0, penalizes variance of
+        inside-cell SINR (hotspot suppression) plus a squared hinge on cells
+        below ``min_sinr_db``. Start around 0.5–2.0 relative to lambda_in.
+    min_sinr_db : float
+        Minimum acceptable SINR inside the zone in dB. Cells below this
+        contribute a squared hinge to L_uniform. Default 10 dB.
     zone_mask : np.ndarray or None
         2-D boolean/float mask from ``create_zone_mask`` (shape n_y × n_x,
         same grid as map_config). Used to compute which pre-sampled receivers
@@ -1184,6 +1949,10 @@ def optimize_multi_tx(
         Half-width of the boundary band in grid cells. A band of
         ``2 * boundary_shell_cells`` cells straddles the zone edge (half
         inside, half outside). Default 5.
+    outside_half_size : float
+        Half-side of the square outer sampling region in metres. The outside
+        sample count scales with this area, so larger values produce more
+        outside receivers. Default 500 m.
 
     Returns
     -------
@@ -1236,12 +2005,19 @@ def optimize_multi_tx(
                  for cfg in tx_configs]
 
     # ------------------------------------------------------------------
-    # 2. All BSes share the same receiver pool (global shared zone).
-    #    First num_sample_points receivers are inside the zone;
-    #    next num_sample_points are in the outer ring (2x-scaled zone minus zone).
+    # 2. Pre-sample fixed receiver positions once for the shared zone.
+    #    Outside count is area-proportional to n_inside so each m² contributes
+    #    equally to the loss (see _sample_outside_zone).
+    #    Receivers 0..n_inside-1        → inside zone
+    #    Receivers n_inside..total_rx-1 → outer ring
     # ------------------------------------------------------------------
-    n_inside  = num_sample_points
-    n_outside = num_sample_points
+    n_inside = num_sample_points
+    ground_z = float(map_config["center"][2]) if len(map_config["center"]) > 2 else 0.0
+    pts = _sample_zone_points(tx_states[0], tx_configs[0], n_inside,
+                              sampler, "full", ground_z)
+    out_pts = _sample_outside_zone(tx_states[0], n_inside, ground_z,
+                                   outer_half_size=outside_half_size)
+    n_outside = len(out_pts)
     total_rx  = n_inside + n_outside
     shared_slice = slice(0, total_rx)
     for state in tx_states:
@@ -1308,16 +2084,6 @@ def optimize_multi_tx(
         if verbose:
             print(f"Pre-created {total_rx} receivers ({n_inside} inside + {n_outside} outside) "
                 f"across {N} base stations")
-
-    # ------------------------------------------------------------------
-    # Pre-sample fixed receiver positions once for the shared zone.
-    # Receivers 0..n_inside-1   → inside zone
-    # Receivers n_inside..total_rx-1 → outer ring (2x-scaled zone minus zone)
-    # ------------------------------------------------------------------
-    ground_z = float(map_config["center"][2]) if len(map_config["center"]) > 2 else 0.0
-    pts = _sample_zone_points(tx_states[0], tx_configs[0], n_inside,
-                              sampler, "full", ground_z)
-    out_pts = _sample_outside_zone(tx_states[0], n_outside, ground_z)
     for state in tx_states:
         state["current_sample_points"] = pts
         state["outside_sample_points"] = out_pts
@@ -1391,6 +2157,9 @@ def optimize_multi_tx(
         lambda_out=lambda_out,
         lambda_sharp=lambda_sharp,
         lambda_pwr=lambda_pwr,
+        lambda_uniform=lambda_uniform,
+        min_sinr_db=min_sinr_db,
+        soft_mean_weight=soft_mean_weight,
     )
 
     # ------------------------------------------------------------------
@@ -1521,16 +2290,30 @@ def optimize_multi_tx(
                     )
                     x_t.data.fill_(proj_x)
                     y_t.data.fill_(proj_y)
+                else:
+                    # Keep free-roaming TXs outside building footprints.
+                    bldgs = state["cached_building_polygons"]
+                    if bldgs:
+                        px, py = _push_outside_buildings(x_t.item(), y_t.item(), bldgs)
+                        x_t.data.fill_(px)
+                        y_t.data.fill_(py)
 
                 # Power clamp
                 if cfg.optimize_power:
                     pow_t = params[b + 4]
                     pow_t.clamp_(*cfg.power_dbm_bounds)
 
-            # Clamp jammer power to configured bounds (mirrors TX power clamping)
+            # Clamp jammer positions outside building footprints and power to bounds.
             if jam_configs:
                 _, joff = _jam_param_strides(jam_configs)
+                bldgs = tx_states[0]["cached_building_polygons"] if tx_states else []
                 for j, jcfg in enumerate(jam_configs):
+                    if bldgs:
+                        jx = jam_params[joff[j] + 0].item()
+                        jy = jam_params[joff[j] + 1].item()
+                        jx, jy = _push_outside_buildings(jx, jy, bldgs)
+                        jam_params[joff[j] + 0].data.fill_(jx)
+                        jam_params[joff[j] + 1].data.fill_(jy)
                     jam_params[joff[j] + 2].clamp_(*jcfg.power_dbm_bounds)
 
         # Track histories
@@ -1741,10 +2524,11 @@ def compare_multi_tx_performance(
 
     def _run_radiomap():
         solver = RadioMapSolver()
+        n_bs = max(1, len(tx_configs))
         return solver(
             scene,
             max_depth=8,
-            samples_per_tx=int(1e9),
+            samples_per_tx=max(1, int(1e9) // n_bs),
             cell_size=list(map_config["cell_size"]),
             center=map_config["center"],
             orientation=[0, 0, 0],
@@ -1849,10 +2633,11 @@ def compare_multi_tx_performance(
                 jam_scene.get(jcfg.name).power_dbm = [float(jd["final_power_dbm"])]
         print("Computing RadioMap for jammer interference...")
         jam_solver = RadioMapSolver()
+        n_jam = max(1, len(jammer_configs))
         jam_rm = jam_solver(
             jam_scene,
             max_depth=8,
-            samples_per_tx=int(1e9),
+            samples_per_tx=max(1, int(1e9) // n_jam),
             cell_size=list(map_config["cell_size"]),
             center=map_config["center"],
             orientation=[0, 0, 0],
