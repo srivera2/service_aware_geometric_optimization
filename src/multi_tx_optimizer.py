@@ -2290,13 +2290,13 @@ def optimize_multi_tx(
                     )
                     x_t.data.fill_(proj_x)
                     y_t.data.fill_(proj_y)
-                else:
+                #else:
                     # Keep free-roaming TXs outside building footprints.
-                    bldgs = state["cached_building_polygons"]
-                    if bldgs:
-                        px, py = _push_outside_buildings(x_t.item(), y_t.item(), bldgs)
-                        x_t.data.fill_(px)
-                        y_t.data.fill_(py)
+                #    bldgs = state["cached_building_polygons"]
+                #    if bldgs:
+                #        px, py = _push_outside_buildings(x_t.item(), y_t.item(), bldgs)
+                #        x_t.data.fill_(px)
+                #        y_t.data.fill_(py)
 
                 # Power clamp
                 if cfg.optimize_power:
@@ -2763,28 +2763,40 @@ def compare_multi_tx_performance(
     _lw_cycle = [2.0, 1.4, 1.0, 0.7]
 
     def _draw_sinr_map(ax, sinr_field, title, show_jammers=False):
-        im = ax.imshow(np.flipud(sinr_field[::_step, ::_step]), cmap="RdBu_r",
-                       norm=norm, interpolation="nearest",
-                       aspect="equal", rasterized=True)
-        for tx_idx, cfg in enumerate(tx_configs):
-            lw = _lw_cycle[tx_idx % len(_lw_cycle)]
-            mask_ds = np.flipud(inside_masks[cfg.name][::_step, ::_step].astype(float))
-            ax.contour(mask_ds, levels=[0.5], colors=["black"],
-                       linewidths=lw, linestyles="-")
-            ax.plot([], [], color="black", linestyle="-", linewidth=lw, label=cfg.name)
         cx_m, cy_m = map_config["center"][0], map_config["center"][1]
         sx_m, sy_m = map_config["size"][0],   map_config["size"][1]
         cw, ch     = map_config["cell_size"][0], map_config["cell_size"][1]
-        H_px = int(round(sy_m / ch))
+        x_min, x_max = cx_m - sx_m / 2, cx_m + sx_m / 2
+        y_min, y_max = cy_m - sy_m / 2, cy_m + sy_m / 2
+
+        # rss and zone_mask both store row 0 = south; origin='lower' + extent
+        # puts the image in world coordinates without any manual coordinate math.
+        im = ax.imshow(sinr_field[::_step, ::_step], cmap="RdBu_r",
+                       norm=norm, interpolation="nearest",
+                       aspect="equal", rasterized=True,
+                       origin="lower",
+                       extent=[x_min, x_max, y_min, y_max])
+
+        # Zone boundary contour — pass explicit world-coordinate X/Y so the
+        # contour aligns with the extent-based imshow regardless of map center.
+        for tx_idx, cfg in enumerate(tx_configs):
+            lw = _lw_cycle[tx_idx % len(_lw_cycle)]
+            mask_ds = inside_masks[cfg.name][::_step, ::_step].astype(float)
+            H_ds, W_ds = mask_ds.shape
+            x_coords = np.linspace(x_min + _step * cw / 2, x_max - _step * cw / 2, W_ds)
+            y_coords = np.linspace(y_min + _step * ch / 2, y_max - _step * ch / 2, H_ds)
+            ax.contour(x_coords, y_coords, mask_ds, levels=[0.5],
+                       colors=["black"], linewidths=lw, linestyles="-")
+            ax.plot([], [], color="black", linestyle="-", linewidth=lw, label=cfg.name)
+
+        # BS and jammer markers plotted directly in world coordinates.
         _bs_colors = ["lime", "cyan", "orange", "hotpink"]
         for tx_idx, cfg in enumerate(tx_configs):
             r = multi_result.get(cfg.name, {})
             if "final_position" in r:
                 bx, by = r["final_position"][:2]
-                px = (bx - (cx_m - sx_m / 2)) / cw / _step
-                py = (H_px - (by - (cy_m - sy_m / 2)) / ch) / _step
                 color = _bs_colors[tx_idx % len(_bs_colors)]
-                ax.scatter(px, py, marker="*", color=color, s=160,
+                ax.scatter(bx, by, marker="*", color=color, s=160,
                            edgecolors="black", linewidths=0.6, zorder=6,
                            label=f"{cfg.name} (BS)")
         if show_jammers and jam_scene is not None and jammer_configs:
@@ -2792,12 +2804,24 @@ def compare_multi_tx_performance(
             for jcfg in jammer_configs:
                 if jcfg.name in jammers_data:
                     jx, jy = jammers_data[jcfg.name]["final_position"][:2]
-                    px = (jx - (cx_m - sx_m / 2)) / cw / _step
-                    py = (H_px - (jy - (cy_m - sy_m / 2)) / ch) / _step
-                    ax.scatter(px, py, marker="x", color="yellow", s=80,
+                    ax.scatter(jx, jy, marker="x", color="yellow", s=80,
                                linewidths=2, zorder=5, label=jcfg.name)
+
+        # Auto-zoom: tight view around the union zone with a margin sized to
+        # keep all jammers (placed ~60-150 m outside the boundary) in frame.
+        rows, cols = np.where(union_inside)
+        if len(rows) > 0:
+            x_z_min = x_min + cols.min() * cw
+            x_z_max = x_min + (cols.max() + 1) * cw
+            y_z_min = y_min + rows.min() * ch
+            y_z_max = y_min + (rows.max() + 1) * ch
+            margin = max(x_z_max - x_z_min, y_z_max - y_z_min) * 0.5
+            ax.set_xlim(max(x_min, x_z_min - margin), min(x_max, x_z_max + margin))
+            ax.set_ylim(max(y_min, y_z_min - margin), min(y_max, y_z_max + margin))
+
         ax.set_title(title, fontsize=11)
-        ax.set_xticks([]); ax.set_yticks([])
+        ax.set_xlabel("X (m)", fontsize=9)
+        ax.set_ylabel("Y (m)", fontsize=9)
         plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="SINR (dB)")
         ax.legend(fontsize=8, loc="upper right")
         return im
