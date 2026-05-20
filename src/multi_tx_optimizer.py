@@ -246,6 +246,8 @@ def seed_bs_positions(
     target_z: float = 1.5,
     seed: int = 42,
     project_to_edge: bool = False,
+    min_building_clearance: float = 40.0,
+    min_bs_separation: float = 200.0,
 ) -> list:
     """Place n_bs base stations inside the zone, maximally spread and LOS-clear.
 
@@ -282,6 +284,15 @@ def seed_bs_positions(
         If True, each selected position is projected outward from the zone
         centroid to the farthest zone boundary in that direction, pushing BSs
         into concave protrusions of the zone.  Default False.
+    min_building_clearance : float
+        Minimum distance (metres) between any candidate position and the
+        nearest building footprint.  Building polygons are buffered by this
+        amount before being subtracted from the candidate area.  Default 30 m.
+    min_bs_separation : float
+        Minimum distance (metres) between any two selected BS positions.
+        Enforced greedily during cluster selection; if no candidate in a
+        cluster satisfies the constraint a warning is printed and the nearest
+        candidate is used anyway.  Default 50 m.
 
     Returns
     -------
@@ -305,6 +316,9 @@ def seed_bs_positions(
     valid_poly = zone_poly
     if building_polygons:
         bldg_union = shapely.ops.unary_union(building_polygons)
+        clearance = min_building_clearance if min_building_clearance > 0 else 0
+        if clearance > 0:
+            bldg_union = bldg_union.buffer(clearance)
         valid_poly = zone_poly.difference(bldg_union)
 
     minx, miny, maxx, maxy = valid_poly.bounds
@@ -317,7 +331,9 @@ def seed_bs_positions(
     if len(candidates) < n_bs:
         raise ValueError(
             f"seed_bs_positions: only {len(candidates)} valid interior candidates "
-            f"for {n_bs} BSs — zone may be too small or heavily occluded by buildings."
+            f"for {n_bs} BSs — zone may be too small, heavily built-up, or the "
+            f"{min_building_clearance} m building clearance leaves too little space "
+            f"(try reducing min_building_clearance)."
         )
 
     # ── LOS filter ────────────────────────────────────────────────────────────
@@ -367,19 +383,45 @@ def seed_bs_positions(
         los_in_cluster = cluster_idx[los_ok[cluster_idx]]
         pool_idx = los_in_cluster if len(los_in_cluster) > 0 else cluster_idx
 
+        # Filter by minimum separation from already-placed BSs.
+        if result and min_bs_separation > 0:
+            placed = np.array(result)
+            pool_cands = candidates[pool_idx]
+            sep_ok = np.all(
+                np.linalg.norm(pool_cands[:, None, :] - placed[None, :, :], axis=2)
+                >= min_bs_separation,
+                axis=1,
+            )
+            if sep_ok.any():
+                pool_idx = pool_idx[sep_ok]
+            else:
+                print(
+                    f"seed_bs_positions: cluster {k} has no candidate "
+                    f">= {min_bs_separation} m from existing BSs; "
+                    f"relaxing separation constraint for this station."
+                )
+
         dists = np.linalg.norm(candidates[pool_idx] - centers[k], axis=1)
         best  = pool_idx[int(np.argmin(dists))]
         result.append(candidates[best])
         used.add(int(best))
 
-    # Safety: fill any empty-cluster gaps from remaining unused candidates
-    if len(result) < n_bs:
+    # Safety: fill any empty-cluster gaps from remaining unused candidates.
+    # Two passes: first honoring min_bs_separation, then relaxing it.
+    for strict in (True, False):
+        if len(result) >= n_bs:
+            break
         for i in range(len(candidates)):
             if len(result) >= n_bs:
                 break
-            if i not in used:
-                result.append(candidates[i])
-                used.add(i)
+            if i in used:
+                continue
+            if strict and result and min_bs_separation > 0:
+                placed = np.array(result)
+                if np.linalg.norm(candidates[i] - placed, axis=1).min() < min_bs_separation:
+                    continue
+            result.append(candidates[i])
+            used.add(i)
 
     positions = [[float(p[0]), float(p[1])] for p in result[:n_bs]]
 
@@ -954,10 +996,12 @@ def _param_strides(tx_configs):
 def _jam_param_strides(jam_configs):
     """Return (strides, offsets) for the jammer flat parameter list.
 
-    Each jammer contributes exactly 5 params: [x, y, power_dbm, azimuth_deg, elevation_deg].
+    Each jammer contributes exactly 6 params: [x, y, power_dbm, azimuth_deg, elevation_deg, gate_logit].
+    gate_logit is an unconstrained scalar; sigmoid(gate_logit) gates the jammer's field
+    contribution so the optimizer can drive it to ~0 to effectively turn the jammer off.
     """
     jam_configs = jam_configs or []
-    strides = [5] * len(jam_configs)
+    strides = [6] * len(jam_configs)
     offsets = [sum(strides[:k]) for k in range(len(strides))]
     return strides, offsets
 
@@ -1418,42 +1462,32 @@ def _sir_loss_body(
     noise_power, rx_objects,
     ref_powers_dbm, jam_configs, jam_scene, jam_rx_objects, jam_objects,
     num_inside=None,
-    boundary_mask=None,
     gamma_db=0.0,
-    sigma_db=10.0,
     lambda_in=0.0,
     lambda_out=10.0,
-    lambda_sharp=0.0,
-    lambda_pwr=7.0,
     lambda_uniform=0.0,
+    lambda_min_j=1.0,
     min_sinr_db=10.0,
     soft_mean_weight=0.25,
     epsilon=1e-30,
 ):
-    """Containment SIR loss with hinge penalties and boundary sharpening.
+    """Containment SIR loss with hinge penalties.
 
     Loss components (all in dB-space):
       L_in      : squared hinge on (gamma - SINR) for inside cells
                   -> penalizes service holes
       L_out     : squared hinge on (SINR - gamma) for outside cells
                   -> penalizes detectable leakage
-      L_sharp   : Gaussian bump centered at gamma over boundary-shell cells
-                  -> penalizes fuzzy threshold crossings
-      L_pwr     : L2 on jammer power scale factors
-                  -> discourages spending jammer power unnecessarily
       L_uniform : variance of inside-cell SINR + squared hinge below min_sinr_db
                   -> penalizes hotspot-driven coverage (non-uniform distribution)
+      L_min_j   : mean gate value across jammers
+                  -> sparsity pressure; drives unused jammers off
 
     Parameters
     ----------
-    boundary_mask : 1-D bool/int array of length total_rx, or None
-        Marks receivers lying within delta of the zone boundary. If None,
-        the sharpness term is skipped.
     gamma_db : float
         Detection / decode threshold in dB. Set from threat model.
-    sigma_db : float
-        Width of the boundary-fuzziness Gaussian, in dB.
-    lambda_in, lambda_out, lambda_sharp, lambda_pwr : float
+    lambda_in, lambda_out : float
         Loss-term weights. Sweep lambda_out / lambda_in for the
         leakage / service-hole Pareto frontier.
     lambda_uniform : float
@@ -1521,7 +1555,7 @@ def _sir_loss_body(
     paths = p_solver(
         scene,
         los=True,
-        refraction=False,
+        refraction=True,
         specular_reflection=True,
         diffuse_reflection=True,
     )
@@ -1547,7 +1581,7 @@ def _sir_loss_body(
     # Set jammer positions and build power-scale factors
     # ------------------------------------------------------------------
     jam_pow_scales = []
-    jam_pow_dbm   = []   # raw dBm tensors — used for the normalized L_pwr penalty
+    jam_gates     = []   # sigmoid(gate_logit) per jammer — 0 = off, 1 = on
     jam_power_vecs = []
     J = 0
     if jam_configs:
@@ -1558,6 +1592,9 @@ def _sir_loss_body(
             pj  = all_params[b + 2]; dr.enable_grad(pj.array)
             azj = all_params[b + 3]; dr.enable_grad(azj.array)
             elj = all_params[b + 4]; dr.enable_grad(elj.array)
+            glj = all_params[b + 5]; dr.enable_grad(glj.array)
+            gate_j = dr.rcp(Float(1.0) + dr.exp(-glj))
+            jam_gates.append(gate_j)
 
             jit_x     = Float(float(np.random.normal(0.0, 0.1)))
             jit_y     = Float(float(np.random.normal(0.0, 0.1)))
@@ -1582,7 +1619,6 @@ def _sir_loss_body(
                 (pj - Float(float(jcfg.initial_power_dbm))) / Float(10.0),
             )
             jam_pow_scales.append(scale_j)
-            jam_pow_dbm.append(pj)
 
         # ------------------------------------------------------------------
         # Jammer PathSolver call (iso pattern, jam_scene)
@@ -1599,7 +1635,7 @@ def _sir_loss_body(
         J = len(jam_configs)
         for j in range(J):
             jp_raw = _extract_per_rx_power(jh_real, jh_imag, j)
-            jam_power_vecs.append(jp_raw * jam_pow_scales[j])
+            jam_power_vecs.append(jp_raw * jam_pow_scales[j] * jam_gates[j])
 
         dr.eval(*jam_power_vecs)
         del jam_paths, jh_real, jh_imag
@@ -1646,7 +1682,6 @@ def _sir_loss_body(
     sinr_db = Float(10.0) * dr.log(sinr_floored) / log10
 
     gamma_f = Float(float(gamma_db));  dr.disable_grad(gamma_f)
-    sigma_f = Float(float(sigma_db));  dr.disable_grad(sigma_f)
     zero_f  = Float(0.0);              dr.disable_grad(zero_f)
 
     # Inside / outside split
@@ -1659,9 +1694,9 @@ def _sir_loss_body(
         # When jammers are present, shift the inside threshold down by 10 dB so
         # L_in only fires on cells that drop *well* below gamma. This prevents
         # pre-existing service holes (cells already below gamma before jamming)
-        # from creating a gradient that suppresses jammer power on every step.
+        # from creating a gradient that suppresses jammers on every step.
         # Without this offset, L_in dominates from iteration 1 and drives
-        # jammer power to 0 regardless of lambda_pwr.
+        # jammer gates to 0.
         gamma_in = (gamma_f - Float(10.0)) if J > 0 else gamma_f
         dr.disable_grad(gamma_in)
         deficit = dr.maximum(gamma_in - sinr_in, zero_f)
@@ -1694,53 +1729,26 @@ def _sir_loss_body(
         loss_floor = dr.mean(floor_def * floor_def)
         loss_uniform = variance + loss_floor
 
-    # L_sharp: Gaussian bump centered at gamma, over boundary shell cells.
-    # Penalizes cells lingering near threshold => forces a sharp transition.
-    loss_sharp = Float(0.0); dr.disable_grad(loss_sharp)
-    if boundary_mask is not None:
-        idx = np.asarray(boundary_mask)
-        if idx.dtype == bool:
-            idx = np.where(idx)[0]
-        if idx.size > 0:
-            # sinr_db is TensorXf. dr.gather and dr.slice_index both reject
-            # numpy arrays. Go through __getitem__ with a DrJIT UInt32 array —
-            # that is the supported path for fancy indexing on tensors.
-            UInt32 = dr.uint32_array_t(Float)
-            sinr_b = sinr_db[UInt32(idx.tolist())]
-            delta = (sinr_b - gamma_f) / sigma_f
-            loss_sharp = dr.mean(dr.exp(Float(-0.5) * delta * delta))
-
-    # L_pwr: quadratic penalty in normalized dBm — bounded in [0,1] across the
-    # full allowed power range so a 10 dB swing costs the same regardless of
-    # initial_power_dbm.  The old scale_j^2 form grew as 10^(2*delta/10),
-    # making any meaningful power increase exponentially expensive.
+    # L_min_j: mean gate value across jammers. Gate = sigmoid(gate_logit) ∈ (0,1).
+    # Penalizing the mean gate pushes unused jammers' logits negative → gate → 0 → off.
+    loss_min_j = Float(0.0); dr.disable_grad(loss_min_j)
     if J > 0:
-        pwr_sq_sum = None
-        for pj, jcfg in zip(jam_pow_dbm, jam_configs):
-            p_lo, p_hi = jcfg.power_dbm_bounds
-            p_mid   = Float((p_lo + p_hi) / 2.0); dr.disable_grad(p_mid)
-            p_range = Float((p_hi - p_lo) / 2.0); dr.disable_grad(p_range)
-            norm_pj = (pj - p_mid) / p_range      # ∈ [-1, 1] across allowed range
-            term = norm_pj * norm_pj
-            pwr_sq_sum = term if pwr_sq_sum is None else (pwr_sq_sum + term)
-        loss_pwr = pwr_sq_sum / Float(float(J))
-    else:
-        loss_pwr = Float(0.0); dr.disable_grad(loss_pwr)
+        for gate_j in jam_gates:
+            loss_min_j = loss_min_j + gate_j
+        loss_min_j = loss_min_j / Float(float(J))
 
     # ------------------------------------------------------------------
     # Compose total loss
     # ------------------------------------------------------------------
     lam_in      = Float(float(lambda_in));      dr.disable_grad(lam_in)
     lam_out     = Float(float(lambda_out));     dr.disable_grad(lam_out)
-    lam_sharp   = Float(float(lambda_sharp));   dr.disable_grad(lam_sharp)
-    lam_pwr     = Float(float(lambda_pwr));     dr.disable_grad(lam_pwr)
     lam_uniform = Float(float(lambda_uniform)); dr.disable_grad(lam_uniform)
+    lam_loss_min_j = Float(float(lambda_min_j)); dr.disable_grad(lam_loss_min_j)
 
-    total = (lam_in      * loss_inside +
-             lam_out     * loss_outside +
-             lam_sharp   * loss_sharp +
-             lam_pwr     * loss_pwr +
-             lam_uniform * loss_uniform)
+    total = (lam_in         * loss_inside +
+             lam_out        * loss_outside +
+             lam_uniform    * loss_uniform +
+             lam_loss_min_j * loss_min_j)
 
     # Optional debug (comment out for production training)
     if num_inside is not None and num_inside < dr.width(best_sinr):
@@ -1748,8 +1756,7 @@ def _sir_loss_body(
         print(f"  [dbg] mean SINR_dB inside : {dr.mean(sinr_db[:n_in])}")
         print(f"  [dbg] mean SINR_dB outside: {dr.mean(sinr_db[n_in:])}")
     print(f"  [dbg] L_in={dr.mean(loss_inside)}  L_out={dr.mean(loss_outside)}  "
-          f"L_sharp={dr.mean(loss_sharp)}  L_pwr={dr.mean(loss_pwr)}  "
-          f"L_uniform={dr.mean(loss_uniform)}")
+          f"L_uniform={dr.mean(loss_uniform)}  L_min_j={dr.mean(loss_min_j)}")
 
     return total
 
@@ -1759,14 +1766,11 @@ def _make_compute_sir_loss(
     noise_power, rx_objects, ref_powers_dbm,
     jam_configs, jam_scene, jam_rx_objects, jam_objects,
     num_inside=None,
-    boundary_mask=None,
     gamma_db=0.0,
-    sigma_db=10.0,
     lambda_in=1.0,
     lambda_out=10.0,
-    lambda_sharp=0.0,
-    lambda_pwr=7.0,
     lambda_uniform=0.0,
+    lambda_min_j=1.0,
     min_sinr_db=10.0,
     soft_mean_weight=0.25,
     epsilon=1e-30,
@@ -1803,14 +1807,11 @@ def _make_compute_sir_loss(
         f"                 _noise, _rxobj, _refpow,\n"
         f"                 _jam_cfgs, _jam_scene, _jam_rxobj, _jam_obj,\n"
         f"                 num_inside=_num_inside,\n"
-        f"                 boundary_mask=_boundary_mask,\n"
         f"                 gamma_db=_gamma_db,\n"
-        f"                 sigma_db=_sigma_db,\n"
         f"                 lambda_in=_lambda_in,\n"
         f"                 lambda_out=_lambda_out,\n"
-        f"                 lambda_sharp=_lambda_sharp,\n"
-        f"                 lambda_pwr=_lambda_pwr,\n"
         f"                 lambda_uniform=_lambda_uniform,\n"
+        f"                 lambda_min_j=_lambda_min_j,\n"
         f"                 min_sinr_db=_min_sinr_db,\n"
         f"                 soft_mean_weight=_soft_mean_weight,\n"
         f"                 epsilon=_epsilon)\n"
@@ -1831,14 +1832,11 @@ def _make_compute_sir_loss(
         "_jam_rxobj":      jam_rx_objects,
         "_jam_obj":        jam_objects,
         "_num_inside":     num_inside,
-        "_boundary_mask":  boundary_mask,
         "_gamma_db":       gamma_db,
-        "_sigma_db":       sigma_db,
         "_lambda_in":      lambda_in,
         "_lambda_out":     lambda_out,
-        "_lambda_sharp":   lambda_sharp,
-        "_lambda_pwr":     lambda_pwr,
         "_lambda_uniform":   lambda_uniform,
+        "_lambda_min_j":     lambda_min_j,
         "_min_sinr_db":      min_sinr_db,
         "_soft_mean_weight": soft_mean_weight,
         "_epsilon":          epsilon,
@@ -1872,16 +1870,12 @@ def optimize_multi_tx(
     on_iteration_callback: Optional[callable] = None,
     debug_viz: bool = False,
     gamma_db: float = 0.0,
-    sigma_db: float = 3.0,
     lambda_in: float = 1.0,
     lambda_out: float = 10.0,
-    lambda_sharp: float = 0.0,
-    lambda_pwr: float = 7.0,
     lambda_uniform: float = 0.0,
+    lambda_min_j: float = 1.0,
     min_sinr_db: float = 10.0,
     soft_mean_weight: float = 0.25,
-    zone_mask: Optional[np.ndarray] = None,
-    boundary_shell_cells: int = 5,
     freeze_bs: bool = False,
     outside_half_size: float = 500.0,
 ) -> dict:
@@ -1928,27 +1922,18 @@ def optimize_multi_tx(
         ready-made callback.
     gamma_db : float
         Detection threshold in dB. Cells above/below this drive the hinge losses.
-    sigma_db : float
-        Width (std-dev) of the boundary sharpness Gaussian in dB. Cells within
-        ~sigma_db of gamma incur the sharpness penalty. Default 3 dB.
-    lambda_in, lambda_out, lambda_sharp, lambda_pwr : float
-        Weights for the four loss terms. Set lambda_sharp > 0 to activate the
-        boundary-sharpening Gaussian.
+    lambda_in, lambda_out : float
+        Weights for the coverage/leakage hinge terms. Sweep their ratio for the
+        service-hole / leakage Pareto frontier.
     lambda_uniform : float
         Weight for the uniformity penalty. When > 0, penalizes variance of
         inside-cell SINR (hotspot suppression) plus a squared hinge on cells
         below ``min_sinr_db``. Start around 0.5–2.0 relative to lambda_in.
+    lambda_min_j : float
+        Weight for the jammer gate sparsity penalty. Default 1.0.
     min_sinr_db : float
         Minimum acceptable SINR inside the zone in dB. Cells below this
         contribute a squared hinge to L_uniform. Default 10 dB.
-    zone_mask : np.ndarray or None
-        2-D boolean/float mask from ``create_zone_mask`` (shape n_y × n_x,
-        same grid as map_config). Used to compute which pre-sampled receivers
-        fall in the boundary shell. Required for lambda_sharp to have any effect.
-    boundary_shell_cells : int
-        Half-width of the boundary band in grid cells. A band of
-        ``2 * boundary_shell_cells`` cells straddles the zone edge (half
-        inside, half outside). Default 5.
     outside_half_size : float
         Half-side of the square outer sampling region in metres. The outside
         sample count scales with this area, so larger values produce more
@@ -2101,44 +2086,7 @@ def optimize_multi_tx(
             jam_rx_objects[rx_name].position = p3
 
     # ------------------------------------------------------------------
-    # 4. Boundary mask: identify which pre-sampled receivers sit in the
-    #    shell straddling the zone edge (used by L_sharp).
-    # ------------------------------------------------------------------
-    boundary_mask_1d = None
-    if zone_mask is not None and lambda_sharp > 0.0:
-        from scipy.ndimage import binary_dilation, binary_erosion
-        zone_bool = np.asarray(zone_mask, dtype=bool)
-        # Band of cells within boundary_shell_cells of the zone edge, both sides.
-        shell_2d = (
-            binary_dilation(zone_bool, iterations=boundary_shell_cells)
-            & ~binary_erosion(zone_bool, iterations=boundary_shell_cells)
-        )
-        center_x, center_y = float(map_config["center"][0]), float(map_config["center"][1])
-        width_m, height_m   = map_config["size"]
-        cell_w, cell_h      = map_config["cell_size"]
-        n_x = int(width_m / cell_w)
-        n_y = int(height_m / cell_h)
-
-        def _pt_in_shell(pos):
-            col = int((pos[0] - center_x + width_m / 2) / cell_w)
-            row = int((pos[1] - center_y + height_m / 2) / cell_h)
-            if 0 <= row < n_y and 0 <= col < n_x:
-                return bool(shell_2d[row, col])
-            return False
-
-        bm = np.zeros(total_rx, dtype=bool)
-        for k, pos in enumerate(pts):
-            bm[k] = _pt_in_shell(pos)
-        for k, pos in enumerate(out_pts):
-            bm[n_inside + k] = _pt_in_shell(pos)
-
-        boundary_mask_1d = np.where(bm)[0]
-        if verbose:
-            print(f"Boundary shell: {boundary_mask_1d.size} / {total_rx} receivers "
-                  f"({boundary_shell_cells}-cell half-width)")
-
-    # ------------------------------------------------------------------
-    # 5. PathSolver + @dr.wrap closure
+    # 4. PathSolver + @dr.wrap closure
     # ------------------------------------------------------------------
     p_solver = PathSolver()
     p_solver.loop_mode = "evaluated"
@@ -2150,14 +2098,11 @@ def optimize_multi_tx(
         noise_power, rx_objects, ref_powers_dbm,
         jam_configs, jam_scene, jam_rx_objects, jam_objects,
         num_inside=n_inside,
-        boundary_mask=boundary_mask_1d,
         gamma_db=gamma_db,
-        sigma_db=sigma_db,
         lambda_in=lambda_in,
         lambda_out=lambda_out,
-        lambda_sharp=lambda_sharp,
-        lambda_pwr=lambda_pwr,
         lambda_uniform=lambda_uniform,
+        lambda_min_j=lambda_min_j,
         min_sinr_db=min_sinr_db,
         soft_mean_weight=soft_mean_weight,
     )
@@ -2193,6 +2138,10 @@ def optimize_multi_tx(
         jam_params.append(torch.tensor(jcfg.initial_azimuth_deg, device="cuda",
                                        dtype=torch.float32, requires_grad=True))
         jam_params.append(torch.tensor(jcfg.initial_elevation_deg, device="cuda",
+                                       dtype=torch.float32, requires_grad=True))
+        # Gate logit: sigmoid(4.0) ≈ 0.98 — jammer starts on; optimizer drives it
+        # negative to turn the jammer off when it isn't needed.
+        jam_params.append(torch.tensor(4.0, device="cuda",
                                        dtype=torch.float32, requires_grad=True))
 
     opt_params = jam_params if freeze_bs else params + jam_params
@@ -2441,6 +2390,8 @@ def optimize_multi_tx(
             pf  = float(jam_params[b + 2].item())
             azf = float(jam_params[b + 3].item())
             elf = float(jam_params[b + 4].item())
+            glf = float(jam_params[b + 5].item())
+            gate_f = 1.0 / (1.0 + np.exp(-glf))
             yaw_r, pitch_r = azimuth_elevation_to_yaw_pitch(azf, elf)
             jam_scene.get(jcfg.name).position    = mi.Point3f(xf, yf, 45.0)
             jam_scene.get(jcfg.name).power_dbm   = [pf]
@@ -2450,6 +2401,8 @@ def optimize_multi_tx(
                 "final_power_dbm":   pf,
                 "initial_power_dbm": jcfg.initial_power_dbm,
                 "final_angles":      [azf, elf],
+                "final_gate":        gate_f,
+                "active":            gate_f >= 0.5,
             }
         result["joint"]["jammers"] = jammers_final
 
@@ -2464,8 +2417,11 @@ def optimize_multi_tx(
         if jam_configs:
             for jcfg in jam_configs:
                 jd = result["joint"]["jammers"][jcfg.name]
-                print(f"  {jcfg.name}: pos=({jd['final_position'][0]:.1f}, "
-                      f"{jd['final_position'][1]:.1f}), pwr={jd['final_power_dbm']:.1f} dBm, "
+                status = "ON " if jd.get("active", True) else "OFF"
+                gate   = jd.get("final_gate", float("nan"))
+                print(f"  {jcfg.name} [{status} gate={gate:.3f}]: "
+                      f"pos=({jd['final_position'][0]:.1f}, {jd['final_position'][1]:.1f}), "
+                      f"pwr={jd['final_power_dbm']:.1f} dBm, "
                       f"Az={jd['final_angles'][0]:.1f}°, El={jd['final_angles'][1]:.1f}°")
         print(f"{'='*70}\n")
 
@@ -2625,33 +2581,43 @@ def compare_multi_tx_performance(
     jam_interference_map = None
     if jam_scene is not None and jammer_configs:
         jammers_data = multi_result["joint"].get("jammers", {})
-        for jcfg in jammer_configs:
-            if jcfg.name in jammers_data:
-                jd  = jammers_data[jcfg.name]
-                pos = jd["final_position"]
-                jam_scene.get(jcfg.name).position  = mi.Point3f(*[float(v) for v in pos])
+        active_indices = []
+        for j, jcfg in enumerate(jammer_configs):
+            if jcfg.name not in jammers_data:
+                continue
+            jd  = jammers_data[jcfg.name]
+            pos = jd["final_position"]
+            jam_scene.get(jcfg.name).position = mi.Point3f(*[float(v) for v in pos])
+            if jd.get("active", True):
                 jam_scene.get(jcfg.name).power_dbm = [float(jd["final_power_dbm"])]
-        print("Computing RadioMap for jammer interference...")
-        jam_solver = RadioMapSolver()
-        n_jam = max(1, len(jammer_configs))
-        jam_rm = jam_solver(
-            jam_scene,
-            max_depth=8,
-            samples_per_tx=max(1, int(1e9) // n_jam),
-            cell_size=list(map_config["cell_size"]),
-            center=map_config["center"],
-            orientation=[0, 0, 0],
-            size=map_config["size"],
-            los=True,
-            specular_reflection=True,
-            diffuse_reflection=True,
-            diffraction=True,
-            edge_diffraction=True,
-            refraction=False,
-            stop_threshold=None,
-        )
-        jam_rss = np.nan_to_num(jam_rm.rss.numpy(), nan=0.0)  # (J, H, W)
-        jam_interference_map = np.sum(jam_rss, axis=0)         # (H, W)
+                active_indices.append(j)
+            else:
+                jam_scene.get(jcfg.name).power_dbm = [-200.0]  # effectively zero
+
+        if active_indices:
+            print(f"Computing RadioMap for {len(active_indices)}/{len(jammer_configs)} active jammers...")
+            jam_solver = RadioMapSolver()
+            n_jam = max(1, len(active_indices))
+            jam_rm = jam_solver(
+                jam_scene,
+                max_depth=8,
+                samples_per_tx=max(1, int(1e9) // n_jam),
+                cell_size=list(map_config["cell_size"]),
+                center=map_config["center"],
+                orientation=[0, 0, 0],
+                size=map_config["size"],
+                los=True,
+                specular_reflection=True,
+                diffuse_reflection=True,
+                diffraction=True,
+                edge_diffraction=True,
+                refraction=False,
+                stop_threshold=None,
+            )
+            jam_rss = np.nan_to_num(jam_rm.rss.numpy(), nan=0.0)  # (J_total, H, W)
+            jam_interference_map = np.sum(jam_rss[active_indices], axis=0)  # (H, W)
+        else:
+            print("All jammers inactive — skipping jammer RadioMap.")
 
     has_jammers = jam_interference_map is not None
     sinr_bs_only = _bs_sinr_field(rss_list_2d, jam_map=None)
@@ -2803,9 +2769,14 @@ def compare_multi_tx_performance(
             jammers_data = multi_result["joint"].get("jammers", {})
             for jcfg in jammer_configs:
                 if jcfg.name in jammers_data:
-                    jx, jy = jammers_data[jcfg.name]["final_position"][:2]
-                    ax.scatter(jx, jy, marker="x", color="yellow", s=80,
-                               linewidths=2, zorder=5, label=jcfg.name)
+                    jd = jammers_data[jcfg.name]
+                    jx, jy = jd["final_position"][:2]
+                    is_active = jd.get("active", True)
+                    color  = "yellow" if is_active else "grey"
+                    label  = jcfg.name if is_active else f"{jcfg.name} (off)"
+                    alpha  = 1.0 if is_active else 0.4
+                    ax.scatter(jx, jy, marker="x", color=color, s=80,
+                               linewidths=2, zorder=5, label=label, alpha=alpha)
 
         # Auto-zoom: tight view around the union zone with a margin sized to
         # keep all jammers (placed ~60-150 m outside the boundary) in frame.
