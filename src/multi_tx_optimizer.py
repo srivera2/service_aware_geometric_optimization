@@ -120,18 +120,11 @@ class JammerConfig:
         Starting transmit power [dBm].
     power_dbm_bounds : tuple[float, float]
         (min, max) dBm clamp applied after each gradient step.
-    initial_azimuth_deg : float
-        Starting boresight azimuth [degrees].  Only relevant when the jammer
-        array uses a directional pattern (e.g. tr38901).
-    initial_elevation_deg : float
-        Starting boresight elevation [degrees].
     """
     name: str
     initial_position: Optional[list] = None   # [x, y]; None = random
     initial_power_dbm: float = 23.0
     power_dbm_bounds: tuple = (0.0, 40.0)
-    initial_azimuth_deg: float = 0.0
-    initial_elevation_deg: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -988,7 +981,7 @@ def _setup_tx_state(scene, cfg: TxConfig, scene_xml_path: str, qrand) -> dict:
 
 def _param_strides(tx_configs):
     """Return (strides, offsets) for the gNB flat parameter list."""
-    strides = [5 if cfg.optimize_power else 4 for cfg in tx_configs]
+    strides = [6 if cfg.optimize_power else 5 for cfg in tx_configs]
     offsets = [sum(strides[:k]) for k in range(len(strides))]
     return strides, offsets
 
@@ -996,12 +989,13 @@ def _param_strides(tx_configs):
 def _jam_param_strides(jam_configs):
     """Return (strides, offsets) for the jammer flat parameter list.
 
-    Each jammer contributes exactly 6 params: [x, y, power_dbm, azimuth_deg, elevation_deg, gate_logit].
+    Each jammer contributes exactly 5 params: [x, y, z, power_dbm, gate_logit].
+    Jammers are isotropic so orientation is not optimised.
     gate_logit is an unconstrained scalar; sigmoid(gate_logit) gates the jammer's field
     contribution so the optimizer can drive it to ~0 to effectively turn the jammer off.
     """
     jam_configs = jam_configs or []
-    strides = [6] * len(jam_configs)
+    strides = [5] * len(jam_configs)
     offsets = [sum(strides[:k]) for k in range(len(strides))]
     return strides, offsets
 
@@ -1508,7 +1502,7 @@ def _sir_loss_body(
     pow_scales = []
     for i, cfg in enumerate(tx_configs):
         if cfg.optimize_power:
-            pow_i = all_params[offsets[i] + 4]
+            pow_i = all_params[offsets[i] + 5]
             dr.enable_grad(pow_i.array)
             scale_i = dr.power(
                 Float(10.0),
@@ -1529,13 +1523,15 @@ def _sir_loss_body(
         el_i = all_params[b + 1]; dr.enable_grad(el_i.array)
         x_i  = all_params[b + 2]; dr.enable_grad(x_i.array)
         y_i  = all_params[b + 3]; dr.enable_grad(y_i.array)
+        z_i  = all_params[b + 4]; dr.enable_grad(z_i.array)
 
         # Independent samples per DOF (previously a single scalar reused)
         jit_yaw   = Float(float(np.random.normal(0.0, 0.5 * np.pi / 180.0)))
         jit_pitch = Float(float(np.random.normal(0.0, 0.5 * np.pi / 180.0)))
         jit_x     = Float(float(np.random.normal(0.0, 0.1)))
         jit_y     = Float(float(np.random.normal(0.0, 0.1)))
-        for j in (jit_yaw, jit_pitch, jit_x, jit_y):
+        jit_z     = Float(float(np.random.normal(0.0, 0.1)))
+        for j in (jit_yaw, jit_pitch, jit_x, jit_y, jit_z):
             dr.disable_grad(j)
 
         yaw   = az_i * deg2rad + jit_yaw
@@ -1546,7 +1542,7 @@ def _sir_loss_body(
         scene.get(cfg.name).position = [
             x_i + jit_x,
             y_i + jit_y,
-            Float(float(tx_states[i]["tx_height"])),
+            z_i + jit_z,
         ]
 
     # ------------------------------------------------------------------
@@ -1573,7 +1569,7 @@ def _sir_loss_body(
     # Compute total gNB parameter count correctly (per-config)
     # ------------------------------------------------------------------
     total_gnb_params = sum(
-        5 if cfg.optimize_power else 4 for cfg in tx_configs
+        6 if cfg.optimize_power else 5 for cfg in tx_configs
     )
     _, jam_offsets = _jam_param_strides(jam_configs)
 
@@ -1589,30 +1585,22 @@ def _sir_loss_body(
             b   = total_gnb_params + jam_offsets[j]
             xj  = all_params[b];     dr.enable_grad(xj.array)
             yj  = all_params[b + 1]; dr.enable_grad(yj.array)
-            pj  = all_params[b + 2]; dr.enable_grad(pj.array)
-            azj = all_params[b + 3]; dr.enable_grad(azj.array)
-            elj = all_params[b + 4]; dr.enable_grad(elj.array)
-            glj = all_params[b + 5]; dr.enable_grad(glj.array)
+            zj  = all_params[b + 2]; dr.enable_grad(zj.array)
+            pj  = all_params[b + 3]; dr.enable_grad(pj.array)
+            glj = all_params[b + 4]; dr.enable_grad(glj.array)
             gate_j = dr.rcp(Float(1.0) + dr.exp(-glj))
             jam_gates.append(gate_j)
 
-            jit_x     = Float(float(np.random.normal(0.0, 0.1)))
-            jit_y     = Float(float(np.random.normal(0.0, 0.1)))
-            jit_yaw   = Float(float(np.random.normal(0.0, 0.5 * np.pi / 180.0)))
-            jit_pitch = Float(float(np.random.normal(0.0, 0.5 * np.pi / 180.0)))
-            for _jv in (jit_x, jit_y, jit_yaw, jit_pitch):
+            jit_x = Float(float(np.random.normal(0.0, 0.1)))
+            jit_y = Float(float(np.random.normal(0.0, 0.1)))
+            jit_z = Float(float(np.random.normal(0.0, 0.1)))
+            for _jv in (jit_x, jit_y, jit_z):
                 dr.disable_grad(_jv)
 
             jam_scene.get(jcfg.name).position = [
                 xj + jit_x,
                 yj + jit_y,
-                Float(10.0),
-            ]
-            roll_j = Float(0.0); dr.disable_grad(roll_j)
-            jam_scene.get(jcfg.name).orientation = [
-                azj * deg2rad + jit_yaw,
-                -(elj * deg2rad) + jit_pitch,
-                roll_j,
+                zj + jit_z,
             ]
             scale_j = dr.power(
                 Float(10.0),
@@ -1780,19 +1768,20 @@ def _make_compute_sir_loss(
     Uses exec() to produce a function with a *fixed* positional signature
     matching exactly the number of scalar parameters — required by @dr.wrap.
     The flat signature is: [gNB params...] + [jammer params...]
-    where each jammer contributes [x, y, power_dbm, azimuth_deg, elevation_deg].
+    where each gNB contributes [az, el, x, y, z, power_dbm?] and
+    each jammer contributes [x, y, z, power_dbm, gate_logit].
     """
     _, gnb_offsets = _param_strides(tx_configs)
     jam_strides, jam_offsets = _jam_param_strides(jam_configs)
     total_jam_params = (jam_offsets[-1] + jam_strides[-1]) if jam_configs else 0
 
-    # gNB param names: p0, p1, ...
+    # gNB param names: p0, p1, ... layout: [az, el, x, y, z, power?]
     arg_names = []
     for i, cfg in enumerate(tx_configs):
         b = gnb_offsets[i]
-        arg_names += [f"p{b}", f"p{b+1}", f"p{b+2}", f"p{b+3}"]
+        arg_names += [f"p{b}", f"p{b+1}", f"p{b+2}", f"p{b+3}", f"p{b+4}"]
         if cfg.optimize_power:
-            arg_names.append(f"p{b+4}")
+            arg_names.append(f"p{b+5}")
 
     # Jammer param names: j0, j1, ... (appended after gNB params)
     for k in range(total_jam_params):
@@ -2121,11 +2110,13 @@ def optimize_multi_tx(
                                    dtype=torch.float32, requires_grad=True))
         params.append(torch.tensor(state["tx_position"][1],   device="cuda",
                                    dtype=torch.float32, requires_grad=True))
+        params.append(torch.tensor(float(np.clip(state["tx_position"][2], 40.0, 60.0)),
+                                   device="cuda", dtype=torch.float32, requires_grad=True))
         if cfg.optimize_power:
             params.append(torch.tensor(state["initial_power_dbm"], device="cuda",
                                        dtype=torch.float32, requires_grad=True))
 
-    # Jammer params: [x, y, power_dbm, azimuth_deg, elevation_deg] per jammer.
+    # Jammer params: [x, y, z, power_dbm, gate_logit] per jammer. Isotropic — no orientation.
     for jcfg in (jam_configs or []):
         jammer = jam_objects[jcfg.name]
         init_pos = jammer.position.numpy().flatten()
@@ -2133,11 +2124,9 @@ def optimize_multi_tx(
                                        dtype=torch.float32, requires_grad=True))
         jam_params.append(torch.tensor(float(init_pos[1]), device="cuda",
                                        dtype=torch.float32, requires_grad=True))
+        jam_params.append(torch.tensor(50.0, device="cuda",
+                                       dtype=torch.float32, requires_grad=True))
         jam_params.append(torch.tensor(jcfg.initial_power_dbm, device="cuda",
-                                       dtype=torch.float32, requires_grad=True))
-        jam_params.append(torch.tensor(jcfg.initial_azimuth_deg, device="cuda",
-                                       dtype=torch.float32, requires_grad=True))
-        jam_params.append(torch.tensor(jcfg.initial_elevation_deg, device="cuda",
                                        dtype=torch.float32, requires_grad=True))
         # Gate logit: sigmoid(4.0) ≈ 0.98 — jammer starts on; optimizer drives it
         # negative to turn the jammer off when it isn't needed.
@@ -2171,15 +2160,15 @@ def optimize_multi_tx(
         for k, (cfg_k, state_k) in enumerate(zip(tx_configs, tx_states)):
             b = offsets[k]
             az_k, el_k = pvals[b], pvals[b + 1]
-            xp_k, yp_k = pvals[b + 2], pvals[b + 3]
+            xp_k, yp_k, zp_k = pvals[b + 2], pvals[b + 3], pvals[b + 4]
             scene.get(cfg_k.name).orientation = [
                 float(np.deg2rad(az_k)), -float(np.deg2rad(el_k)), 0.0
             ]
             scene.get(cfg_k.name).position = mi.Point3f(
-                float(xp_k), float(yp_k), float(state_k["tx_height"])
+                float(xp_k), float(yp_k), float(zp_k)
             )
             if cfg_k.optimize_power:
-                scene.get(cfg_k.name).power_dbm = [float(pvals[b + 4])]
+                scene.get(cfg_k.name).power_dbm = [float(pvals[b + 5])]
 
         # Single RadioMap pass — rm.rss shape (N_tx, H, W) gives per-TX
         # cell-aggregated power, smoothing out multipath fades.
@@ -2232,6 +2221,9 @@ def optimize_multi_tx(
                 if az_t.item() >= 360.0:
                     az_t.fill_(az_t.item() % 360.0)
 
+                # Elevation: clamp to [-90, 0] (downward-facing only)
+                el_t.clamp_(-90.0, 0.0)
+
                 # Position: project to building polygon if this TX is building-mounted.
                 if cfg.on_building:
                     proj_x, proj_y = state["tx_placement"].project_to_polygon(
@@ -2239,17 +2231,19 @@ def optimize_multi_tx(
                     )
                     x_t.data.fill_(proj_x)
                     y_t.data.fill_(proj_y)
-                #else:
-                    # Keep free-roaming TXs outside building footprints.
-                #    bldgs = state["cached_building_polygons"]
-                #    if bldgs:
-                #        px, py = _push_outside_buildings(x_t.item(), y_t.item(), bldgs)
-                #        x_t.data.fill_(px)
-                #        y_t.data.fill_(py)
+                else:
+                   # Keep free-roaming TXs outside building footprints.
+                    bldgs = state["cached_building_polygons"]
+                    if bldgs:
+                        px, py = _push_outside_buildings(x_t.item(), y_t.item(), bldgs)
+                        x_t.data.fill_(px)
+                        y_t.data.fill_(py)
 
+                # Z clamp [40, 60]
+                params[b + 4].clamp_(40.0, 60.0)
                 # Power clamp
                 if cfg.optimize_power:
-                    pow_t = params[b + 4]
+                    pow_t = params[b + 5]
                     pow_t.clamp_(*cfg.power_dbm_bounds)
 
             # Clamp jammer positions outside building footprints and power to bounds.
@@ -2263,7 +2257,9 @@ def optimize_multi_tx(
                         jx, jy = _push_outside_buildings(jx, jy, bldgs)
                         jam_params[joff[j] + 0].data.fill_(jx)
                         jam_params[joff[j] + 1].data.fill_(jy)
-                    jam_params[joff[j] + 2].clamp_(*jcfg.power_dbm_bounds)
+                    # Z clamp [40, 60]
+                    jam_params[joff[j] + 2].clamp_(30.0, 60.0)
+                    jam_params[joff[j] + 3].clamp_(*jcfg.power_dbm_bounds)
 
         # Track histories
         loss_val = float(loss.item())
@@ -2276,7 +2272,7 @@ def optimize_multi_tx(
             tx_states[i]["az_history"].append(az_val)
             tx_states[i]["el_history"].append(el_val)
             if cfg.optimize_power:
-                pw_val = float(params[b + 4].item())
+                pw_val = float(params[b + 5].item())
                 tx_states[i]["power_history"].append(pw_val)
 
         # Accumulate final-window values (last 10 iters)
@@ -2287,7 +2283,7 @@ def optimize_multi_tx(
                 final_bufs[i]["az"].append(float(params[b].item()))
                 final_bufs[i]["el"].append(float(params[b + 1].item()))
                 if cfg.optimize_power:
-                    final_bufs[i]["pow"].append(float(params[b + 4].item()))
+                    final_bufs[i]["pow"].append(float(params[b + 5].item()))
 
         # Expose current TX positions for visualisation callbacks
         for i, (cfg, state) in enumerate(zip(tx_configs, tx_states)):
@@ -2295,7 +2291,7 @@ def optimize_multi_tx(
             state["current_tx_position"] = [
                 float(params[b + 2].item()),
                 float(params[b + 3].item()),
-                state["tx_height"],
+                float(params[b + 4].item()),
             ]
 
         if on_iteration_callback is not None:
@@ -2330,17 +2326,17 @@ def optimize_multi_tx(
         best_el = float(np.mean(final_bufs[i]["el"])) if final_bufs[i]["el"] else float(params[b + 1].item())
         final_x = float(params[b + 2].item())
         final_y = float(params[b + 3].item())
+        final_z = float(params[b + 4].item())
 
         yaw_r, pitch_r = azimuth_elevation_to_yaw_pitch(best_az, best_el)
         scene.get(cfg.name).orientation = mi.Point3f(float(yaw_r), float(pitch_r), 0.0)
-        scene.get(cfg.name).position    = mi.Point3f(float(final_x), float(final_y),
-                                                       float(state["tx_height"]))
+        scene.get(cfg.name).position    = mi.Point3f(float(final_x), float(final_y), float(final_z))
         if cfg.optimize_power:
-            best_pow = float(np.mean(final_bufs[i]["pow"])) if final_bufs[i]["pow"] else float(params[b + 4].item())
+            best_pow = float(np.mean(final_bufs[i]["pow"])) if final_bufs[i]["pow"] else float(params[b + 5].item())
             scene.get(cfg.name).power_dbm = [best_pow]
             state["best_power_dbm"] = best_pow
         state["best_angles"]    = [best_az, best_el]
-        state["final_position"] = [final_x, final_y, state["tx_height"]]
+        state["final_position"] = [final_x, final_y, final_z]
 
     # Remove optimization receivers
     for rx_name in list(rx_objects.keys()):
@@ -2387,20 +2383,16 @@ def optimize_multi_tx(
             b   = joff[j]
             xf  = float(jam_params[b].item())
             yf  = float(jam_params[b + 1].item())
-            pf  = float(jam_params[b + 2].item())
-            azf = float(jam_params[b + 3].item())
-            elf = float(jam_params[b + 4].item())
-            glf = float(jam_params[b + 5].item())
+            zf  = float(jam_params[b + 2].item())
+            pf  = float(jam_params[b + 3].item())
+            glf = float(jam_params[b + 4].item())
             gate_f = 1.0 / (1.0 + np.exp(-glf))
-            yaw_r, pitch_r = azimuth_elevation_to_yaw_pitch(azf, elf)
-            jam_scene.get(jcfg.name).position    = mi.Point3f(xf, yf, 45.0)
-            jam_scene.get(jcfg.name).power_dbm   = [pf]
-            jam_scene.get(jcfg.name).orientation = mi.Point3f(float(yaw_r), float(pitch_r), 0.0)
+            jam_scene.get(jcfg.name).position  = mi.Point3f(xf, yf, zf)
+            jam_scene.get(jcfg.name).power_dbm = [pf]
             jammers_final[jcfg.name] = {
-                "final_position":    [xf, yf, 45.0],
+                "final_position":    [xf, yf, zf],
                 "final_power_dbm":   pf,
                 "initial_power_dbm": jcfg.initial_power_dbm,
-                "final_angles":      [azf, elf],
                 "final_gate":        gate_f,
                 "active":            gate_f >= 0.5,
             }
@@ -2420,9 +2412,8 @@ def optimize_multi_tx(
                 status = "ON " if jd.get("active", True) else "OFF"
                 gate   = jd.get("final_gate", float("nan"))
                 print(f"  {jcfg.name} [{status} gate={gate:.3f}]: "
-                      f"pos=({jd['final_position'][0]:.1f}, {jd['final_position'][1]:.1f}), "
-                      f"pwr={jd['final_power_dbm']:.1f} dBm, "
-                      f"Az={jd['final_angles'][0]:.1f}°, El={jd['final_angles'][1]:.1f}°")
+                      f"pos=({jd['final_position'][0]:.1f}, {jd['final_position'][1]:.1f}, {jd['final_position'][2]:.1f}), "
+                      f"pwr={jd['final_power_dbm']:.1f} dBm")
         print(f"{'='*70}\n")
 
     return result, jam_scene if jam_configs else None
