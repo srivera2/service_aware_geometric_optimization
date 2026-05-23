@@ -34,6 +34,7 @@ import scipy.stats.qmc
 import shapely
 import shapely.ops
 import torch
+from torch.optim.lr_scheduler import CosineAnnealingLR
 import drjit as dr
 import random
 from drjit.auto import Float
@@ -442,8 +443,8 @@ def setup_bs_transmitters(
     name_prefix: str = "bs",
     seed: int = 42,
     project_to_edge: bool = False,
-    initial_power_dbm: float = 23.0,
-    power_dbm_bounds: tuple = (0.0, 50.0),
+    initial_power_dbm: float = 35.0,
+    power_dbm_bounds: tuple = (30.0, 40.0),
 ) -> tuple:
     """Create and place n_bs base stations in the scene, ready for optimisation.
 
@@ -526,10 +527,12 @@ def setup_bs_transmitters(
         name = f"{name_prefix}_{i}"
         existing = scene.get(name)
         if existing is None:
-            tx = Transmitter(name=name, position=[x, y, z])
+            tx = Transmitter(name=name, position=[x, y, z],
+                             power_dbm=initial_power_dbm)
             scene.add(tx)
         else:
             existing.position = mi.Point3f(float(x), float(y), float(z))
+            existing.power_dbm = [float(initial_power_dbm)]
 
         tx_configs.append(TxConfig(
             name=name,
@@ -1466,6 +1469,7 @@ def _sir_loss_body(
     epsilon=1e-30,
     lambda_spread=0.0,
     spread_min_dist=100.0,
+    inside_margin_db=0.0,
 ):
     """Containment SIR loss with hinge penalties.
 
@@ -1691,25 +1695,27 @@ def _sir_loss_body(
         sinr_in  = sinr_db[:n_in]
         sinr_out = sinr_db[n_in:]
 
-        # L_in: squared hinge + always-active soft mean term.
-        # The hinge alone is silent while inside cells stay above gamma, so
-        # jammer activation faces no resistance until inside coverage collapses.
-        # The soft mean term provides a constant gradient that opposes any factor
-        # (including friendly jammers) from lowering inside SINR, competing
-        # symmetrically against the soft_mean_weight term in L_out.
-        gamma_in = gamma_f
-        dr.disable_grad(gamma_in)
-        deficit = dr.maximum(gamma_in - sinr_in, zero_f)
-        loss_inside = (dr.mean(deficit * deficit)
+        # L_in: softplus-squared hinge at (gamma + inside_margin_db) + soft mean.
+        # Softplus = log(1 + exp(x)) approximates max(0, x) but has non-zero
+        # gradient above the threshold — gradient decays smoothly rather than
+        # cliffing to zero the instant a cell crosses gamma.  Numerically stable
+        # form: max(x,0) + log(1 + exp(-|x|)), avoids exp overflow for large x.
+        # inside_margin_db shifts the target above gamma so cells that are only
+        # barely above the containment threshold continue to receive hinge pressure.
+        margin_f = Float(float(inside_margin_db)); dr.disable_grad(margin_f)
+        deficit_x = (gamma_f + margin_f) - sinr_in
+        sp_in = (dr.maximum(deficit_x, zero_f)
+                 + dr.log(Float(1.0) + dr.exp(-dr.abs(deficit_x))))
+        loss_inside = (dr.mean(sp_in * sp_in)
                        - Float(float(soft_mean_in_weight)) * dr.mean(sinr_in))
 
-        # L_out: squared hinge + soft mean term.
-        # The hinge alone is silent when BS optimisation already pushed most
-        # outside cells below gamma, leaving no gradient to activate jammers.
-        # The soft mean term provides an always-active signal to push outside
-        # SINR downward regardless of whether cells are above the threshold.
-        excess = dr.maximum(sinr_out - gamma_f, zero_f)
-        loss_outside = dr.mean(excess * excess) + Float(float(soft_mean_weight)) * dr.mean(sinr_out)
+        # L_out: softplus-squared hinge + soft mean.
+        # Same smooth treatment on the outside so gradient is present even when
+        # cells are just below gamma, keeping continuous pressure on jammers.
+        excess_x = sinr_out - gamma_f
+        sp_out = (dr.maximum(excess_x, zero_f)
+                  + dr.log(Float(1.0) + dr.exp(-dr.abs(excess_x))))
+        loss_outside = dr.mean(sp_out * sp_out) + Float(float(soft_mean_weight)) * dr.mean(sinr_out)
     else:
         # No partition provided: treat all cells as "inside"
         deficit = dr.maximum(gamma_f - sinr_db, zero_f)
@@ -1799,6 +1805,7 @@ def _make_compute_sir_loss(
     epsilon=1e-30,
     lambda_spread=0.0,
     spread_min_dist=100.0,
+    inside_margin_db=0.0,
 ):
     """Build and return the @dr.wrap-decorated SIR loss function.
 
@@ -1841,7 +1848,8 @@ def _make_compute_sir_loss(
         f"                 soft_mean_in_weight=_soft_mean_in_weight,\n"
         f"                 epsilon=_epsilon,\n"
         f"                 lambda_spread=_lambda_spread,\n"
-        f"                 spread_min_dist=_spread_min_dist)\n"
+        f"                 spread_min_dist=_spread_min_dist,\n"
+        f"                 inside_margin_db=_inside_margin_db)\n"
     )
 
     globs = {
@@ -1870,6 +1878,7 @@ def _make_compute_sir_loss(
         "_epsilon":             epsilon,
         "_lambda_spread":    lambda_spread,
         "_spread_min_dist":  spread_min_dist,
+        "_inside_margin_db": inside_margin_db,
     }
     exec(func_code, globs)
     inner_fn = globs["_inner"]
@@ -1911,6 +1920,10 @@ def optimize_multi_tx(
     outside_half_size: float = 500.0,
     lambda_spread: float = 0.0,
     spread_min_dist: float = 100.0,
+    inside_margin_db: float = 0.0,
+    lr_position: float = None,
+    lr_power: float = None,
+    lr_scheduler: str = "cosine",
 ) -> dict:
     """Jointly optimise N transmitters for SIR coverage.
 
@@ -2141,6 +2154,7 @@ def optimize_multi_tx(
         soft_mean_in_weight=soft_mean_in_weight,
         lambda_spread=lambda_spread,
         spread_min_dist=spread_min_dist,
+        inside_margin_db=inside_margin_db,
     )
 
     # ------------------------------------------------------------------
@@ -2188,14 +2202,42 @@ def optimize_multi_tx(
                                        dtype=torch.float32, requires_grad=True))
         jam_params.append(torch.tensor(jcfg.initial_power_dbm, device="cuda",
                                        dtype=torch.float32, requires_grad=True))
-        # Gate logit: sigmoid(4.0) ≈ 0.98 — jammer starts on; optimizer drives it
-        # negative to turn the jammer off when it isn't needed.
-        jam_params.append(torch.tensor(4.0, device="cuda",
+        # Gate logit: sigmoid(0.0) = 0.5 — jammer starts at half-gate so the
+        # optimizer decides to activate or suppress based on gradient, rather
+        # than starting fully on and immediately disrupting inside coverage.
+        jam_params.append(torch.tensor(0.0, device="cuda",
                                        dtype=torch.float32, requires_grad=True))
 
-    opt_params = jam_params if freeze_bs else params + jam_params
-    optimizer = torch.optim.Adam(opt_params, lr=learning_rate, betas=(0.9, 0.999))
-    #optimizer = torch.optim.SGD(params, lr=learning_rate, momentum=0.25)
+    _lr_pos = lr_position if lr_position is not None else learning_rate
+    _lr_pow = lr_power    if lr_power    is not None else learning_rate
+
+    # Split params into groups so position/power can use independent LRs.
+    # Layout: BS params stride 6 [az, el, x, y, z, pow], jammer stride 7 [az, el, x, y, z, pow, gate].
+    angle_g, pos_g, pow_g, gate_g = [], [], [], []
+    if not freeze_bs:
+        for i in range(N):
+            b = offsets[i]
+            angle_g.extend([params[b], params[b + 1]])
+            pos_g.extend([params[b + 2], params[b + 3], params[b + 4]])
+            pow_g.append(params[b + 5])
+    for k in range(len(jam_configs or [])):
+        j = k * 7
+        angle_g.extend([jam_params[j], jam_params[j + 1]])
+        pos_g.extend([jam_params[j + 2], jam_params[j + 3], jam_params[j + 4]])
+        pow_g.append(jam_params[j + 5])
+        gate_g.append(jam_params[j + 6])
+
+    param_groups = [g for g in [
+        {'params': angle_g, 'lr': learning_rate},
+        {'params': pos_g,   'lr': _lr_pos},
+        {'params': pow_g,   'lr': _lr_pow},
+        {'params': gate_g,  'lr': learning_rate},
+    ] if g['params']]
+    optimizer = torch.optim.Adam(param_groups, betas=(0.9, 0.999))
+    scheduler = (
+        CosineAnnealingLR(optimizer, T_max=num_iterations, eta_min=0.0)
+        if lr_scheduler == "cosine" else None
+    )
 
     # ------------------------------------------------------------------
     # 6. Tracking
@@ -2266,6 +2308,8 @@ def optimize_multi_tx(
         torch.nn.utils.clip_grad_norm_(params + jam_params, max_norm=10.0)
 
         optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
         optimizer.zero_grad()
 
         # Per-TX post-step constraints
@@ -2413,8 +2457,9 @@ def optimize_multi_tx(
             "az_history":       state["az_history"],
             "el_history":       state["el_history"],
         }
-        entry["best_power_dbm"] = state["best_power_dbm"]
-        entry["power_history"]  = state["power_history"]
+        entry["best_power_dbm"]   = state["best_power_dbm"]
+        entry["initial_power_dbm"] = state["initial_power_dbm"]
+        entry["power_history"]    = state["power_history"]
         result[cfg.name] = entry
 
     result["joint"] = {
@@ -2691,22 +2736,25 @@ def compare_multi_tx_performance(
             print(f"Computing RadioMap for {len(active_indices)}/{len(jammer_configs)} active jammers...")
             jam_solver = RadioMapSolver()
             n_jam = max(1, len(active_indices))
-            jam_rm = jam_solver(
-                jam_scene,
-                max_depth=8,
-                samples_per_tx=max(1, int(1e9) // n_jam),
-                cell_size=list(map_config["cell_size"]),
-                center=map_config["center"],
-                orientation=[0, 0, 0],
-                size=map_config["size"],
-                los=True,
-                specular_reflection=True,
-                diffuse_reflection=True,
-                diffraction=True,
-                edge_diffraction=True,
-                refraction=False,
-                stop_threshold=None,
-            )
+            n_tx_scene = len(tx_configs) + len(jammer_configs)
+            _max_spt = 4_294_967_295 // max(1, n_tx_scene)
+            with dr.suspend_grad():
+                jam_rm = jam_solver(
+                    jam_scene,
+                    max_depth=8,
+                    samples_per_tx=min(max(1, int(1e9) // n_jam), _max_spt),
+                    cell_size=list(map_config["cell_size"]),
+                    center=map_config["center"],
+                    orientation=[0, 0, 0],
+                    size=map_config["size"],
+                    los=True,
+                    specular_reflection=True,
+                    diffuse_reflection=True,
+                    diffraction=True,
+                    edge_diffraction=True,
+                    refraction=False,
+                    stop_threshold=None,
+                )
             jam_rss = np.nan_to_num(jam_rm.rss.numpy(), nan=0.0)  # (J_total, H, W)
             jam_interference_map = np.sum(jam_rss[active_indices], axis=0)  # (H, W)
         else:
