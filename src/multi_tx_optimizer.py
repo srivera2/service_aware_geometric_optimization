@@ -82,10 +82,8 @@ class TxConfig:
             {'vertices': [(x1,y1), ...]}                   # polygon
     tx_height_offset : float
         Metres above the rooftop surface (default 10 m).
-    optimize_power : bool
-        If True, tx.power_dbm is an optimisable parameter.
-    initial_power_dbm : float or None
-        Override initial power (dBm). None -> read from scene TX.
+    initial_power_dbm : float
+        Starting transmit power [dBm].
     power_dbm_bounds : tuple[float, float]
         (min, max) dBm clamp range for power optimisation.
     initial_azimuth_deg : float or None
@@ -98,9 +96,8 @@ class TxConfig:
     building_id: int
     zone_params: dict
     tx_height_offset: float = 10.0
-    optimize_power: bool = False
-    initial_power_dbm: Optional[float] = None
-    power_dbm_bounds: tuple = (0.0, 50.0)
+    initial_power_dbm: float = 40.0
+    power_dbm_bounds: tuple = (40.0, 50.0)
     initial_azimuth_deg: Optional[float] = None
     initial_elevation_deg: Optional[float] = None
 
@@ -445,8 +442,7 @@ def setup_bs_transmitters(
     name_prefix: str = "bs",
     seed: int = 42,
     project_to_edge: bool = False,
-    optimize_power: bool = False,
-    initial_power_dbm: Optional[float] = None,
+    initial_power_dbm: float = 23.0,
     power_dbm_bounds: tuple = (0.0, 50.0),
 ) -> tuple:
     """Create and place n_bs base stations in the scene, ready for optimisation.
@@ -484,10 +480,8 @@ def setup_bs_transmitters(
         If True, each BS is projected outward from the zone centroid to the
         farthest zone boundary in its direction, pushing BSs into concave
         protrusions.  Default False.
-    optimize_power : bool
-        Whether transmit power is an optimisable parameter.
-    initial_power_dbm : float or None
-        Override starting power; ``None`` → read from scene.
+    initial_power_dbm : float
+        Starting transmit power [dBm].
     power_dbm_bounds : tuple[float, float]
         (min, max) dBm clamp for power optimisation.
 
@@ -542,7 +536,6 @@ def setup_bs_transmitters(
             on_building=False,
             building_id=0,
             zone_params=zone_params,
-            optimize_power=optimize_power,
             initial_power_dbm=initial_power_dbm,
             power_dbm_bounds=power_dbm_bounds,
         ))
@@ -953,7 +946,7 @@ def _setup_tx_state(scene, cfg: TxConfig, scene_xml_path: str, qrand) -> dict:
             tx_position, look_at_xyz, verbose=False
         )
 
-    initial_power_dbm = cfg.initial_power_dbm if cfg.initial_power_dbm is not None else tx_power_dbm
+    initial_power_dbm = cfg.initial_power_dbm
 
     return {
         "tx_placement":           tx_placement,
@@ -988,7 +981,7 @@ def _setup_tx_state(scene, cfg: TxConfig, scene_xml_path: str, qrand) -> dict:
 
 def _param_strides(tx_configs):
     """Return (strides, offsets) for the gNB flat parameter list."""
-    strides = [6 if cfg.optimize_power else 5 for cfg in tx_configs]
+    strides = [6] * len(tx_configs)
     offsets = [sum(strides[:k]) for k in range(len(strides))]
     return strides, offsets
 
@@ -1469,6 +1462,7 @@ def _sir_loss_body(
     lambda_min_j=1.0,
     min_sinr_db=10.0,
     soft_mean_weight=0.25,
+    soft_mean_in_weight=0.0,
     epsilon=1e-30,
     lambda_spread=0.0,
     spread_min_dist=100.0,
@@ -1509,18 +1503,13 @@ def _sir_loss_body(
     # ------------------------------------------------------------------
     pow_scales = []
     for i, cfg in enumerate(tx_configs):
-        if cfg.optimize_power:
-            pow_i = all_params[offsets[i] + 5]
-            dr.enable_grad(pow_i.array)
-            scale_i = dr.power(
-                Float(10.0),
-                (pow_i - Float(float(ref_powers_dbm[i]))) / Float(10.0),
-            )
-            pow_scales.append(scale_i)
-        else:
-            c = Float(1.0)
-            dr.disable_grad(c)
-            pow_scales.append(c)
+        pow_i = all_params[offsets[i] + 5]
+        dr.enable_grad(pow_i.array)
+        scale_i = dr.power(
+            Float(10.0),
+            (pow_i - Float(float(ref_powers_dbm[i]))) / Float(10.0),
+        )
+        pow_scales.append(scale_i)
 
     # ------------------------------------------------------------------
     # Set TX orientations and positions (independent jitter per axis)
@@ -1583,9 +1572,7 @@ def _sir_loss_body(
     # ------------------------------------------------------------------
     # Compute total gNB parameter count correctly (per-config)
     # ------------------------------------------------------------------
-    total_gnb_params = sum(
-        6 if cfg.optimize_power else 5 for cfg in tx_configs
-    )
+    total_gnb_params = 6 * len(tx_configs)
     _, jam_offsets = _jam_param_strides(jam_configs)
 
     # ------------------------------------------------------------------
@@ -1704,17 +1691,17 @@ def _sir_loss_body(
         sinr_in  = sinr_db[:n_in]
         sinr_out = sinr_db[n_in:]
 
-        # L_in: squared hinge on (gamma - SINR), only positive part.
-        # When jammers are present, shift the inside threshold down by 10 dB so
-        # L_in only fires on cells that drop *well* below gamma. This prevents
-        # pre-existing service holes (cells already below gamma before jamming)
-        # from creating a gradient that suppresses jammers on every step.
-        # Without this offset, L_in dominates from iteration 1 and drives
-        # jammer gates to 0.
-        gamma_in = (gamma_f - Float(10.0)) if J > 0 else gamma_f
+        # L_in: squared hinge + always-active soft mean term.
+        # The hinge alone is silent while inside cells stay above gamma, so
+        # jammer activation faces no resistance until inside coverage collapses.
+        # The soft mean term provides a constant gradient that opposes any factor
+        # (including friendly jammers) from lowering inside SINR, competing
+        # symmetrically against the soft_mean_weight term in L_out.
+        gamma_in = gamma_f
         dr.disable_grad(gamma_in)
         deficit = dr.maximum(gamma_in - sinr_in, zero_f)
-        loss_inside = dr.mean(deficit * deficit)
+        loss_inside = (dr.mean(deficit * deficit)
+                       - Float(float(soft_mean_in_weight)) * dr.mean(sinr_in))
 
         # L_out: squared hinge + soft mean term.
         # The hinge alone is silent when BS optimisation already pushed most
@@ -1808,6 +1795,7 @@ def _make_compute_sir_loss(
     lambda_min_j=1.0,
     min_sinr_db=10.0,
     soft_mean_weight=0.25,
+    soft_mean_in_weight=0.0,
     epsilon=1e-30,
     lambda_spread=0.0,
     spread_min_dist=100.0,
@@ -1817,20 +1805,18 @@ def _make_compute_sir_loss(
     Uses exec() to produce a function with a *fixed* positional signature
     matching exactly the number of scalar parameters — required by @dr.wrap.
     The flat signature is: [gNB params...] + [jammer params...]
-    where each gNB contributes [az, el, x, y, z, power_dbm?] and
+    where each gNB contributes [az, el, x, y, z, power_dbm] and
     each jammer contributes [x, y, z, power_dbm, gate_logit].
     """
     _, gnb_offsets = _param_strides(tx_configs)
     jam_strides, jam_offsets = _jam_param_strides(jam_configs)
     total_jam_params = (jam_offsets[-1] + jam_strides[-1]) if jam_configs else 0
 
-    # gNB param names: p0, p1, ... layout: [az, el, x, y, z, power?]
+    # gNB param names: p0, p1, ... layout: [az, el, x, y, z, power_dbm]
     arg_names = []
     for i, cfg in enumerate(tx_configs):
         b = gnb_offsets[i]
-        arg_names += [f"p{b}", f"p{b+1}", f"p{b+2}", f"p{b+3}", f"p{b+4}"]
-        if cfg.optimize_power:
-            arg_names.append(f"p{b+5}")
+        arg_names += [f"p{b}", f"p{b+1}", f"p{b+2}", f"p{b+3}", f"p{b+4}", f"p{b+5}"]
 
     # Jammer param names: j0, j1, ... (appended after gNB params)
     for k in range(total_jam_params):
@@ -1852,6 +1838,7 @@ def _make_compute_sir_loss(
         f"                 lambda_min_j=_lambda_min_j,\n"
         f"                 min_sinr_db=_min_sinr_db,\n"
         f"                 soft_mean_weight=_soft_mean_weight,\n"
+        f"                 soft_mean_in_weight=_soft_mean_in_weight,\n"
         f"                 epsilon=_epsilon,\n"
         f"                 lambda_spread=_lambda_spread,\n"
         f"                 spread_min_dist=_spread_min_dist)\n"
@@ -1878,8 +1865,9 @@ def _make_compute_sir_loss(
         "_lambda_uniform":   lambda_uniform,
         "_lambda_min_j":     lambda_min_j,
         "_min_sinr_db":      min_sinr_db,
-        "_soft_mean_weight": soft_mean_weight,
-        "_epsilon":          epsilon,
+        "_soft_mean_weight":    soft_mean_weight,
+        "_soft_mean_in_weight": soft_mean_in_weight,
+        "_epsilon":             epsilon,
         "_lambda_spread":    lambda_spread,
         "_spread_min_dist":  spread_min_dist,
     }
@@ -1918,6 +1906,7 @@ def optimize_multi_tx(
     lambda_min_j: float = 1.0,
     min_sinr_db: float = 10.0,
     soft_mean_weight: float = 0.25,
+    soft_mean_in_weight: float = 0.0,
     freeze_bs: bool = False,
     outside_half_size: float = 500.0,
     lambda_spread: float = 0.0,
@@ -1992,10 +1981,10 @@ def optimize_multi_tx(
             "final_position":   [x, y, z],
             "initial_angles":   [az_deg, el_deg],
             "initial_position": [x, y, z],
-            "best_power_dbm":   float,   # only if optimize_power=True
+            "best_power_dbm":   float,
             "az_history":       list,
             "el_history":       list,
-            "power_history":    list,    # only if optimize_power=True
+            "power_history":    list,
           },
           "joint": {
             "loss_history":   list,
@@ -2149,6 +2138,7 @@ def optimize_multi_tx(
         lambda_min_j=lambda_min_j,
         min_sinr_db=min_sinr_db,
         soft_mean_weight=soft_mean_weight,
+        soft_mean_in_weight=soft_mean_in_weight,
         lambda_spread=lambda_spread,
         spread_min_dist=spread_min_dist,
     )
@@ -2169,9 +2159,8 @@ def optimize_multi_tx(
                                    dtype=torch.float32, requires_grad=True))
         params.append(torch.tensor(float(np.clip(state["tx_position"][2], 40.0, 60.0)),
                                    device="cuda", dtype=torch.float32, requires_grad=True))
-        if cfg.optimize_power:
-            params.append(torch.tensor(state["initial_power_dbm"], device="cuda",
-                                       dtype=torch.float32, requires_grad=True))
+        params.append(torch.tensor(state["initial_power_dbm"], device="cuda",
+                                   dtype=torch.float32, requires_grad=True))
 
     # Jammer params: [az, el, x, y, z, power_dbm, gate_logit] per jammer.
     zone_centroid = tx_states[0]["box_polygon"].centroid
@@ -2238,8 +2227,7 @@ def optimize_multi_tx(
             scene.get(cfg_k.name).position = mi.Point3f(
                 float(xp_k), float(yp_k), float(zp_k)
             )
-            if cfg_k.optimize_power:
-                scene.get(cfg_k.name).power_dbm = [float(pvals[b + 5])]
+            scene.get(cfg_k.name).power_dbm = [float(pvals[b + 5])]
 
         # Single RadioMap pass — rm.rss shape (N_tx, H, W) gives per-TX
         # cell-aggregated power, smoothing out multipath fades.
@@ -2310,12 +2298,10 @@ def optimize_multi_tx(
                         x_t.data.fill_(px)
                         y_t.data.fill_(py)
 
-                # Z clamp [40, 80]
-                params[b + 4].clamp_(40.0, 80.0)
+                # Z clamp [40, 50]
+                params[b + 4].clamp_(40.0, 50.0)
                 # Power clamp
-                if cfg.optimize_power:
-                    pow_t = params[b + 5]
-                    pow_t.clamp_(*cfg.power_dbm_bounds)
+                params[b + 5].clamp_(*cfg.power_dbm_bounds)
 
             # Clamp jammer positions outside building footprints and power to bounds.
             if jam_configs:
@@ -2343,9 +2329,8 @@ def optimize_multi_tx(
             el_val = float(params[b + 1].item())
             tx_states[i]["az_history"].append(az_val)
             tx_states[i]["el_history"].append(el_val)
-            if cfg.optimize_power:
-                pw_val = float(params[b + 5].item())
-                tx_states[i]["power_history"].append(pw_val)
+            pw_val = float(params[b + 5].item())
+            tx_states[i]["power_history"].append(pw_val)
 
         # Accumulate final-window values (last 10 iters)
         window_start = max(0, num_iterations - 10)
@@ -2354,8 +2339,7 @@ def optimize_multi_tx(
                 b = offsets[i]
                 final_bufs[i]["az"].append(float(params[b].item()))
                 final_bufs[i]["el"].append(float(params[b + 1].item()))
-                if cfg.optimize_power:
-                    final_bufs[i]["pow"].append(float(params[b + 5].item()))
+                final_bufs[i]["pow"].append(float(params[b + 5].item()))
 
         # Expose current TX positions for visualisation callbacks
         for i, (cfg, state) in enumerate(zip(tx_configs, tx_states)):
@@ -2403,10 +2387,9 @@ def optimize_multi_tx(
         yaw_r, pitch_r = azimuth_elevation_to_yaw_pitch(best_az, best_el)
         scene.get(cfg.name).orientation = mi.Point3f(float(yaw_r), float(pitch_r), 0.0)
         scene.get(cfg.name).position    = mi.Point3f(float(final_x), float(final_y), float(final_z))
-        if cfg.optimize_power:
-            best_pow = float(np.mean(final_bufs[i]["pow"])) if final_bufs[i]["pow"] else float(params[b + 5].item())
-            scene.get(cfg.name).power_dbm = [best_pow]
-            state["best_power_dbm"] = best_pow
+        best_pow = float(np.mean(final_bufs[i]["pow"])) if final_bufs[i]["pow"] else float(params[b + 5].item())
+        scene.get(cfg.name).power_dbm = [best_pow]
+        state["best_power_dbm"] = best_pow
         state["best_angles"]    = [best_az, best_el]
         state["final_position"] = [final_x, final_y, final_z]
 
@@ -2430,9 +2413,8 @@ def optimize_multi_tx(
             "az_history":       state["az_history"],
             "el_history":       state["el_history"],
         }
-        if cfg.optimize_power:
-            entry["best_power_dbm"] = state["best_power_dbm"]
-            entry["power_history"]  = state["power_history"]
+        entry["best_power_dbm"] = state["best_power_dbm"]
+        entry["power_history"]  = state["power_history"]
         result[cfg.name] = entry
 
     result["joint"] = {
@@ -2515,6 +2497,7 @@ def compare_multi_tx_performance(
     jam_scene=None,
     jammer_configs: list = None,
     sinr_bs_only_ref: "np.ndarray | None" = None,
+    building_polygons: list = None,
 ) -> tuple:
     """Evaluate the optimised multi-TX configuration for coverage shaping.
 
@@ -2605,6 +2588,39 @@ def compare_multi_tx_performance(
     for cfg in tx_configs:
         union_inside |= inside_masks[cfg.name]
     outside_mask = ~union_inside
+
+    # Build a mask of grid cells that fall inside building footprints so they
+    # can be excluded from outdoor statistics.
+    _building_mask = np.zeros(grid_shape, dtype=bool)
+    if building_polygons:
+        from shapely.geometry import Point
+        from shapely.prepared import prep as shp_prep
+        cx_m, cy_m = map_config["center"][0], map_config["center"][1]
+        sx_m, sy_m = map_config["size"][0],   map_config["size"][1]
+        cw,   ch   = map_config["cell_size"][0], map_config["cell_size"][1]
+        H, W = grid_shape
+        xs = np.linspace(cx_m - sx_m / 2 + cw / 2, cx_m + sx_m / 2 - cw / 2, W)
+        ys = np.linspace(cy_m - sy_m / 2 + ch / 2, cy_m + sy_m / 2 - ch / 2, H)
+        Xg, Yg = np.meshgrid(xs, ys)
+        pts  = np.column_stack((Xg.ravel(), Yg.ravel()))
+        flat = np.zeros(H * W, dtype=bool)
+        for bp in building_polygons:
+            minx, miny, maxx, maxy = bp.bounds
+            in_bbox = (
+                (pts[:, 0] >= minx) & (pts[:, 0] <= maxx) &
+                (pts[:, 1] >= miny) & (pts[:, 1] <= maxy)
+            )
+            idxs = np.where(in_bbox)[0]
+            if len(idxs) > 0:
+                pbp = shp_prep(bp)
+                for idx in idxs:
+                    if pbp.contains(Point(pts[idx, 0], pts[idx, 1])):
+                        flat[idx] = True
+        _building_mask = flat.reshape(H, W)
+
+    # Outdoor-only masks: exclude cells inside building footprints.
+    outdoor_outside = outside_mask & ~_building_mask
+    outdoor_inside  = union_inside  & ~_building_mask
 
     # ------------------------------------------------------------------
     # Print parameter before/after table
@@ -2716,7 +2732,8 @@ def compare_multi_tx_performance(
         r       = multi_result[cfg.name]
         in_mask = inside_masks[cfg.name]
 
-        in_bs   = sinr_bs_only[in_mask];  out_bs  = sinr_bs_only[outside_mask]
+        in_bs   = sinr_bs_only[in_mask & ~_building_mask]
+        out_bs  = sinr_bs_only[outdoor_outside]
         rho_leak_bs = float(np.mean(out_bs >= gamma_db)) if out_bs.size else None
         rho_hole_bs = float(np.mean(in_bs  <  gamma_db)) if in_bs.size  else None
 
@@ -2740,7 +2757,8 @@ def compare_multi_tx_performance(
         }
 
         if has_jammers:
-            in_jam  = sinr_bs_jam[in_mask];  out_jam = sinr_bs_jam[outside_mask]
+            in_jam  = sinr_bs_jam[in_mask & ~_building_mask]
+            out_jam = sinr_bs_jam[outdoor_outside]
             rho_leak_jam = float(np.mean(out_jam >= gamma_db)) if out_jam.size else None
             rho_hole_jam = float(np.mean(in_jam  <  gamma_db)) if in_jam.size  else None
             entry["sinr_inside_jam"]  = _summarize_sinr(in_jam)
@@ -2832,6 +2850,23 @@ def compare_multi_tx_performance(
                        colors=["black"], linewidths=lw, linestyles="-")
             ax.plot([], [], color="black", linestyle="-", linewidth=lw, label=cfg.name)
 
+        # Building footprint outlines — drawn in world coordinates from the
+        # Shapely polygons, so no rasterization step is needed.
+        if building_polygons:
+            _bldg_added = False
+            for bp in building_polygons:
+                bx_poly, by_poly = bp.exterior.xy
+                kw = dict(color="dimgray", linewidth=0.7, linestyle="-",
+                          alpha=0.75, zorder=3)
+                if not _bldg_added:
+                    ax.plot(bx_poly, by_poly, label="Buildings", **kw)
+                    _bldg_added = True
+                else:
+                    ax.plot(bx_poly, by_poly, **kw)
+                for interior in bp.interiors:
+                    ix, iy = interior.xy
+                    ax.plot(ix, iy, **kw)
+
         # BS and jammer markers plotted directly in world coordinates.
         _bs_colors = ["lime", "cyan", "orange", "hotpink"]
         for tx_idx, cfg in enumerate(tx_configs):
@@ -2896,27 +2931,35 @@ def compare_multi_tx_performance(
     # ------------------------------------------------------------------
     # Figure 2: single CDF — best-SINR inside union-of-zones vs outside
     # ------------------------------------------------------------------
-    in_bs  = sinr_bs_only[union_inside]
-    out_bs = sinr_bs_only[outside_mask]
+    in_bs  = sinr_bs_only[outdoor_inside]
+    out_bs = sinr_bs_only[outdoor_outside]
     ls_bs  = "--" if has_jammers else "-"
 
     fig_cdf, ax_cdf = plt.subplots(1, 1, figsize=(6, 4))
 
     def _plot_cdf(ax, vals, color, ls, label):
         arr = np.sort(vals)
+        med = float(np.median(arr))
         ax.plot(arr, np.arange(1, len(arr) + 1) / len(arr),
                 color=color, linewidth=1.8, linestyle=ls, label=label)
+        ax.scatter([med], [0.5], color=color, s=50, zorder=5, clip_on=False)
+        ax.annotate(f"{med:+.1f}", xy=(med, 0.5), xytext=(med, 0.55),
+                    color=color, fontsize=7, ha="center", va="bottom")
+        return med
 
-    _plot_cdf(ax_cdf, in_bs,  "steelblue", ls_bs,
+    # Horizontal reference at the 50th percentile (median)
+    ax_cdf.axhline(0.5, color="gray", linestyle=":", linewidth=0.8, alpha=0.45)
+
+    _plot_cdf(ax_cdf, in_bs,  "blue", ls_bs,
               f"BS-only Inside  (N={in_bs.size})"  if has_jammers else f"Inside  (N={in_bs.size})")
-    _plot_cdf(ax_cdf, out_bs, "coral",     ls_bs,
+    _plot_cdf(ax_cdf, out_bs, "red",     ls_bs,
               f"BS-only Outside (N={out_bs.size})" if has_jammers else f"Outside (N={out_bs.size})")
 
     if has_jammers:
-        in_jam  = sinr_bs_jam[union_inside]
-        out_jam = sinr_bs_jam[outside_mask]
-        _plot_cdf(ax_cdf, in_jam,  "steelblue", "-", f"BS+Jam Inside  (N={in_jam.size})")
-        _plot_cdf(ax_cdf, out_jam, "coral",     "-", f"BS+Jam Outside (N={out_jam.size})")
+        in_jam  = sinr_bs_jam[outdoor_inside]
+        out_jam = sinr_bs_jam[outdoor_outside]
+        _plot_cdf(ax_cdf, in_jam,  "blue", "-", f"BS+Jam Inside  (N={in_jam.size})")
+        _plot_cdf(ax_cdf, out_jam, "red",     "-", f"BS+Jam Outside (N={out_jam.size})")
 
     ax_cdf.axvline(gamma_db, color="black", linestyle="--", linewidth=1.0, alpha=0.7,
                    label=f"γ = {gamma_db:+.1f} dB")
