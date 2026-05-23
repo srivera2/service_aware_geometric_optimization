@@ -120,11 +120,18 @@ class JammerConfig:
         Starting transmit power [dBm].
     power_dbm_bounds : tuple[float, float]
         (min, max) dBm clamp applied after each gradient step.
+    initial_azimuth_deg : float or None
+        Override initial azimuth; None -> auto-compute from jammer -> zone centroid.
+    initial_elevation_deg : float or None
+        Override initial elevation; None -> auto-compute.
     """
     name: str
     initial_position: Optional[list] = None   # [x, y]; None = random
     initial_power_dbm: float = 23.0
     power_dbm_bounds: tuple = (0.0, 40.0)
+    elevation_bounds: tuple = (0.0, -90.0)
+    initial_azimuth_deg: Optional[float] = None
+    initial_elevation_deg: Optional[float] = None
 
 
 # ---------------------------------------------------------------------------
@@ -240,7 +247,7 @@ def seed_bs_positions(
     seed: int = 42,
     project_to_edge: bool = False,
     min_building_clearance: float = 40.0,
-    min_bs_separation: float = 200.0,
+    min_bs_separation: float = 300.0,
 ) -> list:
     """Place n_bs base stations inside the zone, maximally spread and LOS-clear.
 
@@ -989,13 +996,12 @@ def _param_strides(tx_configs):
 def _jam_param_strides(jam_configs):
     """Return (strides, offsets) for the jammer flat parameter list.
 
-    Each jammer contributes exactly 5 params: [x, y, z, power_dbm, gate_logit].
-    Jammers are isotropic so orientation is not optimised.
+    Each jammer contributes 7 params: [az, el, x, y, z, power_dbm, gate_logit].
     gate_logit is an unconstrained scalar; sigmoid(gate_logit) gates the jammer's field
     contribution so the optimizer can drive it to ~0 to effectively turn the jammer off.
     """
     jam_configs = jam_configs or []
-    strides = [5] * len(jam_configs)
+    strides = [7] * len(jam_configs)
     offsets = [sum(strides[:k]) for k in range(len(strides))]
     return strides, offsets
 
@@ -1464,6 +1470,8 @@ def _sir_loss_body(
     min_sinr_db=10.0,
     soft_mean_weight=0.25,
     epsilon=1e-30,
+    lambda_spread=0.0,
+    spread_min_dist=100.0,
 ):
     """Containment SIR loss with hinge penalties.
 
@@ -1526,11 +1534,18 @@ def _sir_loss_body(
         z_i  = all_params[b + 4]; dr.enable_grad(z_i.array)
 
         # Independent samples per DOF (previously a single scalar reused)
-        jit_yaw   = Float(float(np.random.normal(0.0, 0.5 * np.pi / 180.0)))
-        jit_pitch = Float(float(np.random.normal(0.0, 0.5 * np.pi / 180.0)))
-        jit_x     = Float(float(np.random.normal(0.0, 0.1)))
-        jit_y     = Float(float(np.random.normal(0.0, 0.1)))
-        jit_z     = Float(float(np.random.normal(0.0, 0.1)))
+        # jit_yaw   = Float(float(np.random.normal(0.0, 0.5 * np.pi / 180.0)))
+        # jit_pitch = Float(float(np.random.normal(0.0, 0.5 * np.pi / 180.0)))
+        # jit_x     = Float(float(np.random.normal(0.0, 0.1)))
+        # jit_y     = Float(float(np.random.normal(0.0, 0.1)))
+        # jit_z     = Float(float(np.random.normal(0.0, 0.1)))
+
+        jit_yaw   = Float(float(0.0))
+        jit_pitch = Float(float(0.0))
+        jit_x     = Float(float(0.0))
+        jit_y     = Float(float(0.0))
+        jit_z     = Float(float(0.0))
+
         for j in (jit_yaw, jit_pitch, jit_x, jit_y, jit_z):
             dr.disable_grad(j)
 
@@ -1579,24 +1594,35 @@ def _sir_loss_body(
     jam_pow_scales = []
     jam_gates     = []   # sigmoid(gate_logit) per jammer — 0 = off, 1 = on
     jam_power_vecs = []
+    jam_xy_positions = []  # (xj, yj) DrJIT Floats for spread penalty
     J = 0
     if jam_configs:
         for j, jcfg in enumerate(jam_configs):
-            b   = total_gnb_params + jam_offsets[j]
-            xj  = all_params[b];     dr.enable_grad(xj.array)
-            yj  = all_params[b + 1]; dr.enable_grad(yj.array)
-            zj  = all_params[b + 2]; dr.enable_grad(zj.array)
-            pj  = all_params[b + 3]; dr.enable_grad(pj.array)
-            glj = all_params[b + 4]; dr.enable_grad(glj.array)
+            b    = total_gnb_params + jam_offsets[j]
+            azj  = all_params[b];     dr.enable_grad(azj.array)
+            elj  = all_params[b + 1]; dr.enable_grad(elj.array)
+            xj   = all_params[b + 2]; dr.enable_grad(xj.array)
+            yj   = all_params[b + 3]; dr.enable_grad(yj.array)
+            zj   = all_params[b + 4]; dr.enable_grad(zj.array)
+            pj   = all_params[b + 5]; dr.enable_grad(pj.array)
+            glj  = all_params[b + 6]; dr.enable_grad(glj.array)
             gate_j = dr.rcp(Float(1.0) + dr.exp(-glj))
             jam_gates.append(gate_j)
+            jam_xy_positions.append((xj, yj))
 
-            jit_x = Float(float(np.random.normal(0.0, 0.1)))
-            jit_y = Float(float(np.random.normal(0.0, 0.1)))
+            jit_yaw   = Float(float(np.random.normal(0.0, 0.5 * np.pi / 180.0)))
+            jit_pitch = Float(float(np.random.normal(0.0, 0.5 * np.pi / 180.0)))
+            jit_x = Float(float(np.random.normal(0.0, 2.0)))
+            jit_y = Float(float(np.random.normal(0.0, 2.0)))
             jit_z = Float(float(np.random.normal(0.0, 0.1)))
-            for _jv in (jit_x, jit_y, jit_z):
+            for _jv in (jit_yaw, jit_pitch, jit_x, jit_y, jit_z):
                 dr.disable_grad(_jv)
 
+            yaw_j   = azj * deg2rad + jit_yaw
+            pitch_j = -(elj * deg2rad) + jit_pitch
+            roll_j  = Float(0.0); dr.disable_grad(roll_j)
+
+            jam_scene.get(jcfg.name).orientation = [yaw_j, pitch_j, roll_j]
             jam_scene.get(jcfg.name).position = [
                 xj + jit_x,
                 yj + jit_y,
@@ -1725,6 +1751,24 @@ def _sir_loss_body(
             loss_min_j = loss_min_j + gate_j
         loss_min_j = loss_min_j / Float(float(J))
 
+    # L_spread: penalize pairwise proximity of jammer XY positions.
+    # Uses a soft inverse: spread_ref² / (dist² + spread_ref²), which equals 1.0
+    # at zero separation and 0.5 at spread_min_dist metres. Minimising this term
+    # pushes jammers apart, giving each one a distinct sector to cover.
+    if J > 1 and lambda_spread != 0.0:
+        n_pairs = J * (J - 1) // 2
+        spread_ref_sq = Float(float(spread_min_dist * spread_min_dist))
+        spread_sum = Float(0.0); dr.disable_grad(spread_sum)
+        for ji in range(J):
+            for jk in range(ji + 1, J):
+                dx = jam_xy_positions[ji][0] - jam_xy_positions[jk][0]
+                dy = jam_xy_positions[ji][1] - jam_xy_positions[jk][1]
+                dist_sq = dx * dx + dy * dy
+                spread_sum = spread_sum + spread_ref_sq / (dist_sq + spread_ref_sq)
+        loss_spread = spread_sum / Float(float(n_pairs))
+    else:
+        loss_spread = Float(0.0); dr.disable_grad(loss_spread)
+
     # ------------------------------------------------------------------
     # Compose total loss
     # ------------------------------------------------------------------
@@ -1732,11 +1776,13 @@ def _sir_loss_body(
     lam_out     = Float(float(lambda_out));     dr.disable_grad(lam_out)
     lam_uniform = Float(float(lambda_uniform)); dr.disable_grad(lam_uniform)
     lam_loss_min_j = Float(float(lambda_min_j)); dr.disable_grad(lam_loss_min_j)
+    lam_spread  = Float(float(lambda_spread));  dr.disable_grad(lam_spread)
 
     total = (lam_in         * loss_inside +
              lam_out        * loss_outside +
              lam_uniform    * loss_uniform +
-             lam_loss_min_j * loss_min_j)
+             lam_loss_min_j * loss_min_j +
+             lam_spread     * loss_spread)
 
     # Optional debug (comment out for production training)
     if num_inside is not None and num_inside < dr.width(best_sinr):
@@ -1744,7 +1790,8 @@ def _sir_loss_body(
         print(f"  [dbg] mean SINR_dB inside : {dr.mean(sinr_db[:n_in])}")
         print(f"  [dbg] mean SINR_dB outside: {dr.mean(sinr_db[n_in:])}")
     print(f"  [dbg] L_in={dr.mean(loss_inside)}  L_out={dr.mean(loss_outside)}  "
-          f"L_uniform={dr.mean(loss_uniform)}  L_min_j={dr.mean(loss_min_j)}")
+          f"L_uniform={dr.mean(loss_uniform)}  L_min_j={dr.mean(loss_min_j)}  "
+          f"L_spread={dr.mean(loss_spread)}")
 
     return total
 
@@ -1762,6 +1809,8 @@ def _make_compute_sir_loss(
     min_sinr_db=10.0,
     soft_mean_weight=0.25,
     epsilon=1e-30,
+    lambda_spread=0.0,
+    spread_min_dist=100.0,
 ):
     """Build and return the @dr.wrap-decorated SIR loss function.
 
@@ -1803,7 +1852,9 @@ def _make_compute_sir_loss(
         f"                 lambda_min_j=_lambda_min_j,\n"
         f"                 min_sinr_db=_min_sinr_db,\n"
         f"                 soft_mean_weight=_soft_mean_weight,\n"
-        f"                 epsilon=_epsilon)\n"
+        f"                 epsilon=_epsilon,\n"
+        f"                 lambda_spread=_lambda_spread,\n"
+        f"                 spread_min_dist=_spread_min_dist)\n"
     )
 
     globs = {
@@ -1829,6 +1880,8 @@ def _make_compute_sir_loss(
         "_min_sinr_db":      min_sinr_db,
         "_soft_mean_weight": soft_mean_weight,
         "_epsilon":          epsilon,
+        "_lambda_spread":    lambda_spread,
+        "_spread_min_dist":  spread_min_dist,
     }
     exec(func_code, globs)
     inner_fn = globs["_inner"]
@@ -1867,6 +1920,8 @@ def optimize_multi_tx(
     soft_mean_weight: float = 0.25,
     freeze_bs: bool = False,
     outside_half_size: float = 500.0,
+    lambda_spread: float = 0.0,
+    spread_min_dist: float = 100.0,
 ) -> dict:
     """Jointly optimise N transmitters for SIR coverage.
 
@@ -2094,6 +2149,8 @@ def optimize_multi_tx(
         lambda_min_j=lambda_min_j,
         min_sinr_db=min_sinr_db,
         soft_mean_weight=soft_mean_weight,
+        lambda_spread=lambda_spread,
+        spread_min_dist=spread_min_dist,
     )
 
     # ------------------------------------------------------------------
@@ -2116,10 +2173,24 @@ def optimize_multi_tx(
             params.append(torch.tensor(state["initial_power_dbm"], device="cuda",
                                        dtype=torch.float32, requires_grad=True))
 
-    # Jammer params: [x, y, z, power_dbm, gate_logit] per jammer. Isotropic — no orientation.
+    # Jammer params: [az, el, x, y, z, power_dbm, gate_logit] per jammer.
+    zone_centroid = tx_states[0]["box_polygon"].centroid
+    look_at_xyz   = [zone_centroid.x, zone_centroid.y, 1.5]
     for jcfg in (jam_configs or []):
         jammer = jam_objects[jcfg.name]
         init_pos = jammer.position.numpy().flatten()
+        init_pos_3d = [float(init_pos[0]), float(init_pos[1]), 50.0]
+        if jcfg.initial_azimuth_deg is not None and jcfg.initial_elevation_deg is not None:
+            init_az = jcfg.initial_azimuth_deg
+            init_el = jcfg.initial_elevation_deg
+        else:
+            init_az, init_el = compute_initial_angles_from_position(
+                init_pos_3d, look_at_xyz, verbose=False
+            )
+        jam_params.append(torch.tensor(init_az, device="cuda",
+                                       dtype=torch.float32, requires_grad=True))
+        jam_params.append(torch.tensor(init_el, device="cuda",
+                                       dtype=torch.float32, requires_grad=True))
         jam_params.append(torch.tensor(float(init_pos[0]), device="cuda",
                                        dtype=torch.float32, requires_grad=True))
         jam_params.append(torch.tensor(float(init_pos[1]), device="cuda",
@@ -2239,8 +2310,8 @@ def optimize_multi_tx(
                         x_t.data.fill_(px)
                         y_t.data.fill_(py)
 
-                # Z clamp [40, 60]
-                params[b + 4].clamp_(40.0, 60.0)
+                # Z clamp [40, 80]
+                params[b + 4].clamp_(40.0, 80.0)
                 # Power clamp
                 if cfg.optimize_power:
                     pow_t = params[b + 5]
@@ -2252,14 +2323,15 @@ def optimize_multi_tx(
                 bldgs = tx_states[0]["cached_building_polygons"] if tx_states else []
                 for j, jcfg in enumerate(jam_configs):
                     if bldgs:
-                        jx = jam_params[joff[j] + 0].item()
-                        jy = jam_params[joff[j] + 1].item()
+                        jx = jam_params[joff[j] + 2].item()
+                        jy = jam_params[joff[j] + 3].item()
                         jx, jy = _push_outside_buildings(jx, jy, bldgs)
-                        jam_params[joff[j] + 0].data.fill_(jx)
-                        jam_params[joff[j] + 1].data.fill_(jy)
-                    # Z clamp [40, 60]
-                    jam_params[joff[j] + 2].clamp_(30.0, 60.0)
-                    jam_params[joff[j] + 3].clamp_(*jcfg.power_dbm_bounds)
+                        jam_params[joff[j] + 2].data.fill_(jx)
+                        jam_params[joff[j] + 3].data.fill_(jy)
+                    # Z clamp [30, 60]
+                    jam_params[joff[j] + 4].clamp_(5.0, 50.0)
+                    jam_params[joff[j] + 5].clamp_(*jcfg.power_dbm_bounds)
+                    jam_params[joff[j] + 1].clamp_(*jcfg.elevation_bounds)
 
         # Track histories
         loss_val = float(loss.item())
@@ -2298,8 +2370,8 @@ def optimize_multi_tx(
             if jam_configs:
                 _, joff = _jam_param_strides(jam_configs)
                 jam_positions = [
-                    [float(jam_params[joff[j]].item()),
-                     float(jam_params[joff[j] + 1].item())]
+                    [float(jam_params[joff[j] + 2].item()),
+                     float(jam_params[joff[j] + 3].item())]
                     for j in range(len(jam_configs))
                 ]
             else:
@@ -2380,21 +2452,28 @@ def optimize_multi_tx(
         _, joff = _jam_param_strides(jam_configs)
         jammers_final = {}
         for j, jcfg in enumerate(jam_configs):
-            b   = joff[j]
-            xf  = float(jam_params[b].item())
-            yf  = float(jam_params[b + 1].item())
-            zf  = float(jam_params[b + 2].item())
-            pf  = float(jam_params[b + 3].item())
-            glf = float(jam_params[b + 4].item())
+            b    = joff[j]
+            azf  = float(jam_params[b].item())
+            elf  = float(jam_params[b + 1].item())
+            xf   = float(jam_params[b + 2].item())
+            yf   = float(jam_params[b + 3].item())
+            zf   = float(jam_params[b + 4].item())
+            pf   = float(jam_params[b + 5].item())
+            glf  = float(jam_params[b + 6].item())
             gate_f = 1.0 / (1.0 + np.exp(-glf))
+            jam_scene.get(jcfg.name).orientation = [
+                float(np.deg2rad(azf)), -float(np.deg2rad(elf)), 0.0
+            ]
             jam_scene.get(jcfg.name).position  = mi.Point3f(xf, yf, zf)
             jam_scene.get(jcfg.name).power_dbm = [pf]
             jammers_final[jcfg.name] = {
-                "final_position":    [xf, yf, zf],
-                "final_power_dbm":   pf,
-                "initial_power_dbm": jcfg.initial_power_dbm,
-                "final_gate":        gate_f,
-                "active":            gate_f >= 0.5,
+                "final_azimuth_deg":   azf,
+                "final_elevation_deg": elf,
+                "final_position":      [xf, yf, zf],
+                "final_power_dbm":     pf,
+                "initial_power_dbm":   jcfg.initial_power_dbm,
+                "final_gate":          gate_f,
+                "active":              gate_f >= 0.5,
             }
         result["joint"]["jammers"] = jammers_final
 
@@ -2412,6 +2491,7 @@ def optimize_multi_tx(
                 status = "ON " if jd.get("active", True) else "OFF"
                 gate   = jd.get("final_gate", float("nan"))
                 print(f"  {jcfg.name} [{status} gate={gate:.3f}]: "
+                      f"Az={jd['final_azimuth_deg']:.1f}°, El={jd['final_elevation_deg']:.1f}°, "
                       f"pos=({jd['final_position'][0]:.1f}, {jd['final_position'][1]:.1f}, {jd['final_position'][2]:.1f}), "
                       f"pwr={jd['final_power_dbm']:.1f} dBm")
         print(f"{'='*70}\n")
@@ -2578,6 +2658,12 @@ def compare_multi_tx_performance(
                 continue
             jd  = jammers_data[jcfg.name]
             pos = jd["final_position"]
+            if "final_azimuth_deg" in jd and "final_elevation_deg" in jd:
+                jam_scene.get(jcfg.name).orientation = [
+                    float(np.deg2rad(jd["final_azimuth_deg"])),
+                    -float(np.deg2rad(jd["final_elevation_deg"])),
+                    0.0,
+                ]
             jam_scene.get(jcfg.name).position = mi.Point3f(*[float(v) for v in pos])
             if jd.get("active", True):
                 jam_scene.get(jcfg.name).power_dbm = [float(jd["final_power_dbm"])]
