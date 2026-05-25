@@ -244,8 +244,8 @@ def seed_bs_positions(
     target_z: float = 1.5,
     seed: int = 42,
     project_to_edge: bool = False,
-    min_building_clearance: float = 40.0,
-    min_bs_separation: float = 300.0,
+    min_building_clearance: float = 10.0,
+    min_bs_separation: float = 250.0,
 ) -> list:
     """Place n_bs base stations inside the zone, maximally spread and LOS-clear.
 
@@ -346,7 +346,10 @@ def seed_bs_positions(
             verts = info.get("vertices", [])
             z_h   = info.get("z_height", 0.0)
             if len(verts) >= 3:
-                bldg_polys_2d.append(ShapelyPolygon([(v[0], v[1]) for v in verts]))
+                _bp = ShapelyPolygon([(v[0], v[1]) for v in verts])
+                if not _bp.is_valid:
+                    _bp = _bp.buffer(0)
+                bldg_polys_2d.append(_bp)
                 bldg_heights.append(float(z_h))
 
         los_ok = np.array([
@@ -2543,6 +2546,7 @@ def compare_multi_tx_performance(
     jammer_configs: list = None,
     sinr_bs_only_ref: "np.ndarray | None" = None,
     building_polygons: list = None,
+    outside_half_size: float = None,
 ) -> tuple:
     """Evaluate the optimised multi-TX configuration for coverage shaping.
 
@@ -2633,6 +2637,24 @@ def compare_multi_tx_performance(
     for cfg in tx_configs:
         union_inside |= inside_masks[cfg.name]
     outside_mask = ~union_inside
+
+    # Restrict outside region to the same bounding box used during optimisation.
+    # Without this, the full grid complement (~99% of cells far from the zone)
+    # dilutes outside SINR stats with naturally low-power distant cells.
+    if outside_half_size is not None:
+        cx_m, cy_m = map_config["center"][0], map_config["center"][1]
+        sx_m, sy_m = map_config["size"][0],   map_config["size"][1]
+        cw,   ch   = map_config["cell_size"][0], map_config["cell_size"][1]
+        H, W = grid_shape
+        xs = np.linspace(cx_m - sx_m / 2 + cw / 2, cx_m + sx_m / 2 - cw / 2, W)
+        ys = np.linspace(cy_m - sy_m / 2 + ch / 2, cy_m + sy_m / 2 - ch / 2, H)
+        Xg, Yg = np.meshgrid(xs, ys)
+        h = float(outside_half_size)
+        bbox_mask = (
+            (np.abs(Xg - cx_m) <= h) &
+            (np.abs(Yg - cy_m) <= h)
+        )
+        outside_mask = outside_mask & bbox_mask
 
     # Build a mask of grid cells that fall inside building footprints so they
     # can be excluded from outdoor statistics.
