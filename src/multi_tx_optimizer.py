@@ -16,6 +16,7 @@ seed_jammer_positions()        : concave-edge jammer placement outside zone
 setup_bs_transmitters()        : seed + place + configure n BSs in one call
 optimize_multi_tx()            : run the joint optimization
 compare_multi_tx_performance() : evaluate optimised BS-only SINR containment within target zone
+plot_results_from_file()       : load saved .npy arrays + JSON and reproduce the SINR plots
 """
 
 from __future__ import annotations
@@ -126,7 +127,7 @@ class JammerConfig:
     name: str
     initial_position: Optional[list] = None   # [x, y]; None = random
     initial_power_dbm: float = 23.0
-    power_dbm_bounds: tuple = (0.0, 40.0)
+    power_dbm_bounds: tuple = (0.0, 50.0)
     elevation_bounds: tuple = (0.0, -90.0)
     initial_azimuth_deg: Optional[float] = None
     initial_elevation_deg: Optional[float] = None
@@ -1473,6 +1474,7 @@ def _sir_loss_body(
     lambda_spread=0.0,
     spread_min_dist=100.0,
     inside_margin_db=0.0,
+    use_gate_logits=True,
 ):
     """Containment SIR loss with hinge penalties.
 
@@ -1600,7 +1602,10 @@ def _sir_loss_body(
             zj   = all_params[b + 4]; dr.enable_grad(zj.array)
             pj   = all_params[b + 5]; dr.enable_grad(pj.array)
             glj  = all_params[b + 6]; dr.enable_grad(glj.array)
-            gate_j = dr.rcp(Float(1.0) + dr.exp(-glj))
+            if use_gate_logits:
+                gate_j = dr.rcp(Float(1.0) + dr.exp(-glj))
+            else:
+                gate_j = Float(1.0); dr.disable_grad(gate_j)
             jam_gates.append(gate_j)
             jam_xy_positions.append((xj, yj))
 
@@ -1809,6 +1814,7 @@ def _make_compute_sir_loss(
     lambda_spread=0.0,
     spread_min_dist=100.0,
     inside_margin_db=0.0,
+    use_gate_logits=True,
 ):
     """Build and return the @dr.wrap-decorated SIR loss function.
 
@@ -1852,7 +1858,8 @@ def _make_compute_sir_loss(
         f"                 epsilon=_epsilon,\n"
         f"                 lambda_spread=_lambda_spread,\n"
         f"                 spread_min_dist=_spread_min_dist,\n"
-        f"                 inside_margin_db=_inside_margin_db)\n"
+        f"                 inside_margin_db=_inside_margin_db,\n"
+        f"                 use_gate_logits=_use_gate_logits)\n"
     )
 
     globs = {
@@ -1882,6 +1889,7 @@ def _make_compute_sir_loss(
         "_lambda_spread":    lambda_spread,
         "_spread_min_dist":  spread_min_dist,
         "_inside_margin_db": inside_margin_db,
+        "_use_gate_logits":  use_gate_logits,
     }
     exec(func_code, globs)
     inner_fn = globs["_inner"]
@@ -1924,6 +1932,7 @@ def optimize_multi_tx(
     lambda_spread: float = 0.0,
     spread_min_dist: float = 100.0,
     inside_margin_db: float = 0.0,
+    use_gate_logits: bool = True,
     lr_position: float = None,
     lr_power: float = None,
     lr_scheduler: str = "cosine",
@@ -2158,6 +2167,7 @@ def optimize_multi_tx(
         lambda_spread=lambda_spread,
         spread_min_dist=spread_min_dist,
         inside_margin_db=inside_margin_db,
+        use_gate_logits=use_gate_logits,
     )
 
     # ------------------------------------------------------------------
@@ -2182,6 +2192,7 @@ def optimize_multi_tx(
     # Jammer params: [az, el, x, y, z, power_dbm, gate_logit] per jammer.
     zone_centroid = tx_states[0]["box_polygon"].centroid
     look_at_xyz   = [zone_centroid.x, zone_centroid.y, 1.5]
+    jam_initial_states = []   # snapshot before optimization for result reporting
     for jcfg in (jam_configs or []):
         jammer = jam_objects[jcfg.name]
         init_pos = jammer.position.numpy().flatten()
@@ -2193,6 +2204,12 @@ def optimize_multi_tx(
             init_az, init_el = compute_initial_angles_from_position(
                 init_pos_3d, look_at_xyz, verbose=False
             )
+        jam_initial_states.append({
+            "initial_azimuth_deg":   init_az,
+            "initial_elevation_deg": init_el,
+            "initial_position":      init_pos_3d,
+            "initial_power_dbm":     jcfg.initial_power_dbm,
+        })
         jam_params.append(torch.tensor(init_az, device="cuda",
                                        dtype=torch.float32, requires_grad=True))
         jam_params.append(torch.tensor(init_el, device="cuda",
@@ -2354,17 +2371,32 @@ def optimize_multi_tx(
             if jam_configs:
                 _, joff = _jam_param_strides(jam_configs)
                 bldgs = tx_states[0]["cached_building_polygons"] if tx_states else []
+                zone_poly = tx_states[0].get("zone_polygon") if tx_states else None
                 for j, jcfg in enumerate(jam_configs):
+                    jx = jam_params[joff[j] + 2].item()
+                    jy = jam_params[joff[j] + 3].item()
                     if bldgs:
-                        jx = jam_params[joff[j] + 2].item()
-                        jy = jam_params[joff[j] + 3].item()
                         jx, jy = _push_outside_buildings(jx, jy, bldgs)
-                        jam_params[joff[j] + 2].data.fill_(jx)
-                        jam_params[joff[j] + 3].data.fill_(jy)
+                    # Keep jammers outside the coverage zone so they can't
+                    # degrade inside SINR, which would starve gate gradients
+                    # and cause sigmoid saturation on the logit.
+                    if zone_poly is not None and zone_poly.contains(
+                        shapely.geometry.Point(jx, jy)
+                    ):
+                        nearest = shapely.ops.nearest_points(
+                            shapely.geometry.Point(jx, jy), zone_poly.boundary
+                        )[1]
+                        jx, jy = nearest.x, nearest.y
+                    jam_params[joff[j] + 2].data.fill_(jx)
+                    jam_params[joff[j] + 3].data.fill_(jy)
                     # Z clamp [30, 60]
                     jam_params[joff[j] + 4].clamp_(5.0, 50.0)
                     jam_params[joff[j] + 5].clamp_(*jcfg.power_dbm_bounds)
                     jam_params[joff[j] + 1].clamp_(*jcfg.elevation_bounds)
+                    # Clamp gate logit to prevent sigmoid saturation: a logit of
+                    # -4 gives gate≈0.018 (effectively off) while preserving
+                    # enough gradient to reopen if the loss landscape shifts.
+                    jam_params[joff[j] + 6].clamp_(-4.0, 6.0)
 
         # Track histories
         loss_val = float(loss.item())
@@ -2473,6 +2505,7 @@ def optimize_multi_tx(
         "sampler":         sampler,
         "sampling_strata": sampling_strata,
         "lds":             lds,
+        "use_gate_logits": use_gate_logits,
     }
 
     # ------------------------------------------------------------------
@@ -2489,21 +2522,25 @@ def optimize_multi_tx(
             yf   = float(jam_params[b + 3].item())
             zf   = float(jam_params[b + 4].item())
             pf   = float(jam_params[b + 5].item())
-            glf  = float(jam_params[b + 6].item())
-            gate_f = 1.0 / (1.0 + np.exp(-glf))
+            glf    = float(jam_params[b + 6].item())
+            gate_f = 1.0 / (1.0 + np.exp(-glf)) if use_gate_logits else 1.0
             jam_scene.get(jcfg.name).orientation = [
                 float(np.deg2rad(azf)), -float(np.deg2rad(elf)), 0.0
             ]
             jam_scene.get(jcfg.name).position  = mi.Point3f(xf, yf, zf)
             jam_scene.get(jcfg.name).power_dbm = [pf]
+            init_snap = jam_initial_states[j]
             jammers_final[jcfg.name] = {
-                "final_azimuth_deg":   azf,
-                "final_elevation_deg": elf,
-                "final_position":      [xf, yf, zf],
-                "final_power_dbm":     pf,
-                "initial_power_dbm":   jcfg.initial_power_dbm,
-                "final_gate":          gate_f,
-                "active":              gate_f >= 0.5,
+                "initial_azimuth_deg":   init_snap["initial_azimuth_deg"],
+                "initial_elevation_deg": init_snap["initial_elevation_deg"],
+                "initial_position":      init_snap["initial_position"],
+                "initial_power_dbm":     init_snap["initial_power_dbm"],
+                "final_azimuth_deg":     azf,
+                "final_elevation_deg":   elf,
+                "final_position":        [xf, yf, zf],
+                "final_power_dbm":       pf,
+                "final_gate":            gate_f,
+                "active":                gate_f >= 0.5,
             }
         result["joint"]["jammers"] = jammers_final
 
@@ -2547,6 +2584,7 @@ def compare_multi_tx_performance(
     sinr_bs_only_ref: "np.ndarray | None" = None,
     building_polygons: list = None,
     outside_half_size: float = None,
+    save_arrays_to: str = None,
 ) -> tuple:
     """Evaluate the optimised multi-TX configuration for coverage shaping.
 
@@ -2780,7 +2818,11 @@ def compare_multi_tx_performance(
             jam_rss = np.nan_to_num(jam_rm.rss.numpy(), nan=0.0)  # (J_total, H, W)
             jam_interference_map = np.sum(jam_rss[active_indices], axis=0)  # (H, W)
         else:
-            print("All jammers inactive — skipping jammer RadioMap.")
+            # All gates closed — use a zero interference map so the BS+Jammer
+            # panel still renders and greyed-out jammer positions remain visible.
+            print("All jammers inactive — rendering positions only (zero interference).")
+            H, W = grid_shape
+            jam_interference_map = np.zeros((H, W), dtype=np.float32)
 
     has_jammers = jam_interference_map is not None
     sinr_bs_only = _bs_sinr_field(rss_list_2d, jam_map=None)
@@ -2791,6 +2833,21 @@ def compare_multi_tx_performance(
         mean_delta  = float(np.mean(sinr_bs_only - sinr_bs_jam))
         print(f"[verify] jam_interference_map: mean={mean_jam_W:.3e} W  "
               f"| mean SINR shift (BS-only − BS+Jam) = {mean_delta:+.3f} dB")
+
+    # ------------------------------------------------------------------
+    # Optional: persist raw SINR fields + masks for post-processing
+    # ------------------------------------------------------------------
+    if save_arrays_to is not None:
+        import pathlib as _pl
+        _out = _pl.Path(save_arrays_to)
+        _out.mkdir(parents=True, exist_ok=True)
+        np.save(_out / "sinr_bs_only.npy",  sinr_bs_only.astype(np.float32))
+        np.save(_out / "building_mask.npy", _building_mask)
+        np.save(_out / "outside_mask.npy",  outdoor_outside)
+        # union_inside covers all TX zones combined
+        np.save(_out / "zone_union_mask.npy", (union_inside & ~_building_mask))
+        if sinr_bs_jam is not None:
+            np.save(_out / "sinr_bs_jam.npy", sinr_bs_jam.astype(np.float32))
 
     # ------------------------------------------------------------------
     # Per-TX containment metrics — always report BS-only; add jam when present
@@ -3012,7 +3069,7 @@ def compare_multi_tx_performance(
         med = float(np.median(arr))
         ax.plot(arr, np.arange(1, len(arr) + 1) / len(arr),
                 color=color, linewidth=1.8, linestyle=ls, label=label)
-        ax.scatter([med], [0.5], color=color, s=50, zorder=5, clip_on=False)
+        ax.axvline(med, color=color, linewidth=1.0, linestyle=":", alpha=0.8, zorder=5)
         ax.annotate(f"{med:+.1f}", xy=(med, 0.5), xytext=(med, 0.55),
                     color=color, fontsize=7, ha="center", va="bottom")
         return med
@@ -3040,3 +3097,698 @@ def compare_multi_tx_performance(
     ax_cdf.legend(fontsize=8, loc="lower right"); ax_cdf.grid(True, alpha=0.3)
     fig_cdf.tight_layout()
     return fig_map, fig_cdf, stats
+
+
+def plot_results_from_file(
+    run_dir: str,
+    gamma_db: float = 0.0,
+    standoff_m: float = 200.0,
+    fig: bool = True,
+    save_pdf: str = None,
+) -> tuple:
+    """Load saved experiment arrays and reproduce the SINR plots.
+
+    Expected layout under *run_dir*::
+
+        run_dir/
+          sinr_bs_only.npy      (H, W) float32 — BS-only best-SINR field in dB
+          sinr_bs_jam.npy       (H, W) float32 — BS+Jammer field in dB  [optional]
+          zone_union_mask.npy   (H, W) bool    — cells inside any coverage zone
+          building_mask.npy     (H, W) bool    — cells inside building footprints
+          results.json                         — pre-computed statistics
+        run_dir/../
+          map_config.json                      — grid geometry (center/size/cell_size)
+
+    Parameters
+    ----------
+    run_dir   : path to one experiment run (e.g. ``results/exp/boulder/circle_large_n1000``)
+    gamma_db  : SINR threshold in dB for containment metrics
+    standoff_m: distance (metres) beyond the zone's furthest XY extent that defines
+                the outer edge of the outside-region bounding square
+    fig       : if False, skip plotting and return (None, None, stats)
+    save_pdf  : if given, write both figures to a multi-page PDF at this path
+
+    Returns
+    -------
+    fig_map, fig_cdf, stats
+        Matplotlib figures and a dict with computed containment statistics.
+        When *fig* is False both figures are None.
+    """
+    import json
+    import pathlib
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
+    from matplotlib.colors import TwoSlopeNorm, CenteredNorm
+
+    run_path = pathlib.Path(run_dir)
+
+    # ------------------------------------------------------------------
+    # Load arrays
+    # ------------------------------------------------------------------
+    sinr_bs_only = np.load(run_path / "sinr_bs_only.npy")
+    zone_mask    = np.load(run_path / "zone_union_mask.npy")
+    bldg_mask    = np.load(run_path / "building_mask.npy")
+
+    jam_path = run_path / "sinr_bs_jam.npy"
+    sinr_bs_jam = np.load(jam_path) if jam_path.exists() else None
+    has_jammers = sinr_bs_jam is not None
+
+    # map_config lives one level up (scene directory)
+    map_cfg_path = run_path.parent / "map_config.json"
+    if not map_cfg_path.exists():
+        map_cfg_path = run_path / "map_config.json"
+    with open(map_cfg_path) as f:
+        map_config = json.load(f)
+
+    cx_m, cy_m = map_config["center"][0], map_config["center"][1]
+    sx_m, sy_m = map_config["size"][0],   map_config["size"][1]
+    cw,   ch   = map_config["cell_size"][0], map_config["cell_size"][1]
+    H, W = sinr_bs_only.shape
+    x_min, x_max = cx_m - sx_m / 2, cx_m + sx_m / 2
+    y_min, y_max = cy_m - sy_m / 2, cy_m + sy_m / 2
+    xs = np.linspace(x_min + cw / 2, x_max - cw / 2, W)
+    ys = np.linspace(y_min + ch / 2, y_max - ch / 2, H)
+
+    # ------------------------------------------------------------------
+    # Outside region: square whose half-size = (max zone XY extent from
+    # center) + standoff_m.  This means standoff_m is the gap between
+    # the zone's furthest point and the edge of the evaluated region.
+    # ------------------------------------------------------------------
+    Xg, Yg = np.meshgrid(xs, ys)
+    zone_bool = zone_mask.astype(bool)
+    rows, cols = np.where(zone_bool)
+    if len(rows) > 0:
+        max_extent = max(
+            float(np.abs(xs[cols] - cx_m).max()),
+            float(np.abs(ys[rows] - cy_m).max()),
+        )
+    else:
+        max_extent = 0.0
+    half_size = max_extent + standoff_m
+    bbox_mask = (np.abs(Xg - cx_m) <= half_size) & (np.abs(Yg - cy_m) <= half_size)
+
+    outdoor_inside  = zone_bool & ~bldg_mask
+    outdoor_outside = ~zone_bool & ~bldg_mask & bbox_mask
+
+    # ------------------------------------------------------------------
+    # Compute containment statistics
+    # ------------------------------------------------------------------
+    gamma = float(gamma_db)
+
+    def _stats(field_db, mask):
+        vals = field_db[mask]
+        if vals.size == 0:
+            return None
+        return {
+            "mean_db":   float(np.mean(vals)),
+            "median_db": float(np.median(vals)),
+            "p10_db":    float(np.percentile(vals, 10)),
+            "p90_db":    float(np.percentile(vals, 90)),
+        }
+
+    def _uniformity(field_db, mask):
+        """IQR-based uniformity: lower is more uniform."""
+        vals = field_db[mask]
+        if vals.size < 2:
+            return None
+        return float(np.percentile(vals, 75) - np.percentile(vals, 25))
+
+    def _containment(field_db):
+        out_vals = field_db[outdoor_outside]
+        in_vals  = field_db[outdoor_inside]
+        rho_leak = float(np.mean(out_vals >= gamma)) if out_vals.size else None
+        rho_hole = float(np.mean(in_vals  <  gamma)) if in_vals.size  else None
+        return rho_leak, rho_hole
+
+    rho_leak_bs, rho_hole_bs = _containment(sinr_bs_only)
+
+    stats = {
+        "gamma_db": gamma,
+        "standoff_m": standoff_m,
+        "bs_only": {
+            "sinr_inside":   _stats(sinr_bs_only, outdoor_inside),
+            "sinr_outside":  _stats(sinr_bs_only, outdoor_outside),
+            "rho_leak":      rho_leak_bs,
+            "rho_hole":      rho_hole_bs,
+            "uniformity_iqr_inside": _uniformity(sinr_bs_only, outdoor_inside),
+        },
+    }
+
+    if has_jammers:
+        rho_leak_jam, rho_hole_jam = _containment(sinr_bs_jam)
+        stats["with_jammers"] = {
+            "sinr_inside":   _stats(sinr_bs_jam, outdoor_inside),
+            "sinr_outside":  _stats(sinr_bs_jam, outdoor_outside),
+            "rho_leak":      rho_leak_jam,
+            "rho_hole":      rho_hole_jam,
+            "uniformity_iqr_inside": _uniformity(sinr_bs_jam, outdoor_inside),
+        }
+
+    # ------------------------------------------------------------------
+    # Print summary
+    # ------------------------------------------------------------------
+    def _fmt(v):
+        return f"{100 * v:5.1f}%" if v is not None else "  n/a "
+
+    print(f"\n{'='*65}")
+    print(f"SINR CONTAINMENT  (gamma = {gamma:+.1f} dB, standoff = {standoff_m:.0f} m)")
+    print(f"{'='*65}")
+    for label, key in [("BS-only", "bs_only"), ("BS+Jammer", "with_jammers")]:
+        if key not in stats:
+            continue
+        s = stats[key]
+        si, so = s["sinr_inside"], s["sinr_outside"]
+        print(f"  {label}:")
+        print(f"    rho_leak  (outside >= gamma): {_fmt(s['rho_leak'])}")
+        print(f"    rho_hole  (inside  <  gamma): {_fmt(s['rho_hole'])}")
+        if si:
+            print(f"    SINR inside  mean / p10 / p90: "
+                  f"{si['mean_db']:+.1f} / {si['p10_db']:+.1f} / {si['p90_db']:+.1f} dB")
+        if so:
+            print(f"    SINR outside mean / p10 / p90: "
+                  f"{so['mean_db']:+.1f} / {so['p10_db']:+.1f} / {so['p90_db']:+.1f} dB")
+        if s.get("uniformity_iqr_inside") is not None:
+            print(f"    Uniformity IQR (inside):  {s['uniformity_iqr_inside']:.2f} dB")
+        print()
+    print(f"{'='*65}\n")
+
+    if not fig:
+        return None, None, stats
+
+    # ------------------------------------------------------------------
+    # Load BS / jammer positions from results.json (opt_params key)
+    # ------------------------------------------------------------------
+    results_json_path = run_path / "results.json"
+    _bs_positions      = []   # list of [x, y]
+    _jammer_positions  = []   # list of (x, y, active:bool)
+    if results_json_path.exists():
+        with open(results_json_path) as _f:
+            _rj = json.load(_f)
+        opt = _rj.get("opt_params", {})
+        for _bd in opt.get("bs", {}).values():
+            _p = _bd.get("final_position", _bd.get("initial_position"))
+            if _p:
+                _bs_positions.append([float(_p[0]), float(_p[1])])
+        for _jd in opt.get("jammers", {}).values():
+            _p = _jd.get("final_position")
+            if _p:
+                _jammer_positions.append(
+                    (float(_p[0]), float(_p[1]), bool(_jd.get("active", True)))
+                )
+
+    # ------------------------------------------------------------------
+    # Plotting helpers
+    # ------------------------------------------------------------------
+    _step = 8
+    vmin, vmax = gamma - 20, gamma + 20
+    norm  = TwoSlopeNorm(vmin=vmin, vcenter=gamma, vmax=vmax)
+
+    def _draw_map(ax, sinr_field, title, show_jammers=False):
+        im = ax.imshow(
+            sinr_field[::_step, ::_step],
+            cmap="viridis", norm=norm,
+            interpolation="nearest", aspect="equal", rasterized=True,
+            origin="lower", extent=[x_min, x_max, y_min, y_max],
+        )
+
+        # Downsampled coordinate axes shared by contour layers
+        zone_ds = zone_mask[::_step, ::_step].astype(float)
+        H_ds, W_ds = zone_ds.shape
+        xc = np.linspace(x_min + _step * cw / 2, x_max - _step * cw / 2, W_ds)
+        yc = np.linspace(y_min + _step * ch / 2, y_max - _step * ch / 2, H_ds)
+
+        # Zone boundary — white dashed line so it reads over the red/blue field
+        ax.contour(xc, yc, zone_ds, levels=[0.5],
+                   colors=["black"], linewidths=2.0, linestyles="-", zorder=6)
+
+        # Buildings: solid black fill + crisp outline
+        bldg_ds = bldg_mask[::_step, ::_step].astype(float)
+        ax.contourf(xc, yc, bldg_ds, levels=[0.5, 1.5],
+                    colors=["#797878"], alpha=1.0, zorder=4)
+        ax.contour(xc, yc, bldg_ds, levels=[0.5],
+                   colors=["black"], linewidths=2.0, linestyles="-", zorder=5)
+
+        # BS markers: white star with black outline
+        for bx, by in _bs_positions:
+            ax.scatter(bx, by, marker="*", s=420,
+                       color="white", edgecolors="white", linewidths=3.0,
+                       zorder=7)
+            ax.scatter(bx, by, marker="*", s=300,
+                       color="#0DD525", edgecolors="black", linewidths=1.2,
+                       zorder=8)
+
+        # Jammer markers: active = bright yellow "+" ; inactive = grey "x"
+        if show_jammers:
+            for jx, jy, active in _jammer_positions:
+                if active:
+                    ax.scatter(jx, jy, marker="+", s=200,
+                               color="white", linewidths=4.0, zorder=6)
+                    ax.scatter(jx, jy, marker="+", s=120,
+                               color="#FF0000", linewidths=2.2, zorder=7)
+                else:
+                    ax.scatter(jx, jy, marker="x", s=160,
+                               color="white", linewidths=3.5, zorder=6,
+                               alpha=0.6)
+                    ax.scatter(jx, jy, marker="x", s=80,
+                               color="#888888", linewidths=1.5, zorder=7,
+                               alpha=0.6)
+
+        # Auto-zoom around zone
+        rows, cols = np.where(zone_mask)
+        if len(rows) > 0:
+            x_z_min = x_min + cols.min() * cw
+            x_z_max = x_min + (cols.max() + 1) * cw
+            y_z_min = y_min + rows.min() * ch
+            y_z_max = y_min + (rows.max() + 1) * ch
+            margin = max(x_z_max - x_z_min, y_z_max - y_z_min) * 0.5
+            ax.set_xlim(max(x_min, x_z_min - margin), min(x_max, x_z_max + margin))
+            ax.set_ylim(max(y_min, y_z_min - margin), min(y_max, y_z_max + margin))
+
+        ax.set_title(title, fontsize=11)
+        ax.set_xlabel("X (m)", fontsize=9)
+        ax.set_ylabel("Y (m)", fontsize=9)
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="SINR (dB)")
+
+    def _draw_diff_map(ax, diff_field, title):
+        abs_max = float(np.nanpercentile(np.abs(diff_field), 98))
+        abs_max = max(abs_max, 1.0)
+        diff_norm = CenteredNorm(vcenter=0.0, halfrange=abs_max)
+
+        im = ax.imshow(
+            diff_field[::_step, ::_step],
+            cmap="RdBu", norm=diff_norm,
+            interpolation="nearest", aspect="equal", rasterized=True,
+            origin="lower", extent=[x_min, x_max, y_min, y_max],
+        )
+
+        zone_ds = zone_mask[::_step, ::_step].astype(float)
+        H_ds, W_ds = zone_ds.shape
+        xc = np.linspace(x_min + _step * cw / 2, x_max - _step * cw / 2, W_ds)
+        yc = np.linspace(y_min + _step * ch / 2, y_max - _step * ch / 2, H_ds)
+
+        ax.contour(xc, yc, zone_ds, levels=[0.5],
+                   colors=["black"], linewidths=2.0, linestyles="-", zorder=6)
+        bldg_ds = bldg_mask[::_step, ::_step].astype(float)
+        ax.contourf(xc, yc, bldg_ds, levels=[0.5, 1.5],
+                    colors=["#797878"], alpha=1.0, zorder=4)
+        ax.contour(xc, yc, bldg_ds, levels=[0.5],
+                   colors=["black"], linewidths=2.0, linestyles="-", zorder=5)
+
+        for bx, by in _bs_positions:
+            ax.scatter(bx, by, marker="*", s=420,
+                       color="white", edgecolors="white", linewidths=3.0, zorder=7)
+            ax.scatter(bx, by, marker="*", s=300,
+                       color="#0DD525", edgecolors="black", linewidths=1.2, zorder=8)
+
+        for jx, jy, active in _jammer_positions:
+            if active:
+                ax.scatter(jx, jy, marker="+", s=200,
+                           color="white", linewidths=4.0, zorder=6)
+                ax.scatter(jx, jy, marker="+", s=120,
+                           color="#FF0000", linewidths=2.2, zorder=7)
+            else:
+                ax.scatter(jx, jy, marker="x", s=160,
+                           color="white", linewidths=3.5, zorder=6, alpha=0.6)
+                ax.scatter(jx, jy, marker="x", s=80,
+                           color="#888888", linewidths=1.5, zorder=7, alpha=0.6)
+
+        rows, cols = np.where(zone_mask)
+        if len(rows) > 0:
+            x_z_min = x_min + cols.min() * cw
+            x_z_max = x_min + (cols.max() + 1) * cw
+            y_z_min = y_min + rows.min() * ch
+            y_z_max = y_min + (rows.max() + 1) * ch
+            margin = max(x_z_max - x_z_min, y_z_max - y_z_min) * 0.5
+            ax.set_xlim(max(x_min, x_z_min - margin), min(x_max, x_z_max + margin))
+            ax.set_ylim(max(y_min, y_z_min - margin), min(y_max, y_z_max + margin))
+
+        ax.set_title(title, fontsize=11)
+        ax.set_xlabel("X (m)", fontsize=9)
+        ax.set_ylabel("Y (m)", fontsize=9)
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="ΔSINR (dB)")
+
+    # ------------------------------------------------------------------
+    # Figure 1: SINR map(s)
+    # ------------------------------------------------------------------
+    n_cols = 3 if has_jammers else 1
+    fig_map, axes = plt.subplots(1, n_cols, figsize=(7 * n_cols, 6), squeeze=False)
+    _draw_map(axes[0, 0],
+              sinr_bs_only,
+              f"BS-only SINR  —  γ = {gamma:+.1f} dB",
+              show_jammers=False)
+    if has_jammers:
+        _draw_map(axes[0, 1],
+                  sinr_bs_jam,
+                  f"BS+Jammer SINR  —  γ = {gamma:+.1f} dB",
+                  show_jammers=True)
+        _draw_diff_map(axes[0, 2],
+                       sinr_bs_jam - sinr_bs_only,
+                       "Jammer degradation  (BS+Jam − BS-only)")
+    fig_map.suptitle(run_path.name, fontsize=12, y=1.01)
+    fig_map.tight_layout()
+
+    # ------------------------------------------------------------------
+    # Figure 2: CDF
+    # ------------------------------------------------------------------
+    in_bs  = sinr_bs_only[outdoor_inside]
+    out_bs = sinr_bs_only[outdoor_outside]
+    ls_bs  = "--" if has_jammers else "-"
+
+    fig_cdf, ax_cdf = plt.subplots(1, 1, figsize=(6, 4))
+
+    def _plot_cdf(ax, vals, color, ls, label):
+        arr = np.sort(vals)
+        med = float(np.median(arr))
+        ax.plot(arr, np.arange(1, len(arr) + 1) / len(arr),
+                color=color, linewidth=1.8, linestyle=ls, label=label)
+        ax.axvline(med, color=color, linewidth=1.0, linestyle=":", alpha=0.8)
+        ax.annotate(f"{med:+.1f}", xy=(med, 0.5), xytext=(med, 0.55),
+                    color=color, fontsize=7, ha="center", va="bottom")
+
+    ax_cdf.axhline(0.5, color="gray", linestyle=":", linewidth=0.8, alpha=0.45)
+    _plot_cdf(ax_cdf, in_bs,  "blue", ls_bs,
+              f"BS-only Inside  (N={in_bs.size})"  if has_jammers else f"Inside  (N={in_bs.size})")
+    _plot_cdf(ax_cdf, out_bs, "red",  ls_bs,
+              f"BS-only Outside (N={out_bs.size})" if has_jammers else f"Outside (N={out_bs.size})")
+
+    if has_jammers:
+        in_jam  = sinr_bs_jam[outdoor_inside]
+        out_jam = sinr_bs_jam[outdoor_outside]
+        _plot_cdf(ax_cdf, in_jam,  "blue", "-", f"BS+Jam Inside  (N={in_jam.size})")
+        _plot_cdf(ax_cdf, out_jam, "red",  "-", f"BS+Jam Outside (N={out_jam.size})")
+
+    ax_cdf.axvline(gamma, color="black", linestyle="--", linewidth=1.0, alpha=0.7,
+                   label=f"γ = {gamma:+.1f} dB")
+    cdf_title = "BS-only vs BS+Jammer SINR CDF" if has_jammers else "BS-only SINR CDF"
+    ax_cdf.set_title(f"{cdf_title}  (γ = {gamma:+.1f} dB)", fontsize=11)
+    ax_cdf.set_xlabel("Best-cell SINR (dB)")
+    ax_cdf.set_ylabel("CDF")
+    ax_cdf.set_xlim(gamma - 30, gamma + 30)
+    ax_cdf.legend(fontsize=8, loc="lower right")
+    ax_cdf.grid(True, alpha=0.3)
+    fig_cdf.tight_layout()
+
+    if save_pdf is not None:
+        with PdfPages(save_pdf) as pdf:
+            pdf.savefig(fig_map, bbox_inches="tight")
+            pdf.savefig(fig_cdf, bbox_inches="tight")
+        print(f"Saved plots to {save_pdf}")
+
+    return fig_map, fig_cdf, stats
+
+
+def plot_multi_shape_grid(
+    scene_dir: str,
+    gamma_db: float = 0.0,
+    standoff_m: float = 200.0,
+    save_pdf: str = None,
+    col0_col1_extra_pad: float = 0.0,
+    hspace: float = 0.06,
+    wspace: float = 0.35,
+    sinr_zone: float = 0.35,
+    bottom: float = 0.10,
+    left: float = 0.12,
+    n_ticks: int = 3,
+):
+    """
+    Build an N×3 publication figure from all shape runs under *scene_dir*.
+
+    Auto-discovers subdirectories that contain ``sinr_bs_only.npy`` and sorts
+    them alphabetically — one row per shape.
+
+    Columns: BS-only SINR (viridis) | BS+Jammer SINR (viridis) | ΔSINR (RdBu)
+    One shared viridis colorbar per row (right of col 1); one RdBu colorbar
+    per row (right of col 2).
+
+    Parameters
+    ----------
+    scene_dir  : directory containing shape subdirs + map_config.json
+    gamma_db   : SINR threshold (dB) — norm centre for viridis panels
+    standoff_m : outer-region standoff (m) — for autozoom margin
+    save_pdf   : write to PDF at this path when given
+    hspace     : row gap as a fraction of image height (not figure height).
+                 Figure height is auto-computed so each row cell == image
+                 height, preventing aspect='equal' stretching at small values.
+    wspace     : column gap as a fraction of column width. Reduce to tighten
+                 all column pairs (image↔colorbar and colorbar↔image gaps).
+    sinr_zone  : width of the SINR colorbar zone as a fraction of one image
+                 column.  Increasing this widens the gap between the first and
+                 second image (more white space around the colorbar label);
+                 decreasing it tightens that gap.  Default 0.35.
+    bottom     : figure fraction reserved below the plot area for the X tick
+                 labels and the "X (m)" supxlabel.  Reduce to pull the X label
+                 closer to the graphs; increase to push it away.  Default 0.10.
+    left       : figure fraction reserved left of the plot area for the Y tick
+                 labels and the "Y (m)" supylabel.  Same semantics as bottom.
+                 Default 0.12.
+    n_ticks    : maximum number of tick intervals on each axis.  Reduce to 2
+                 when plots are small and labels crowd; increase for larger
+                 figures.  Edge ticks are always pruned automatically.
+                 Default 3.
+    col0_col1_extra_pad : legacy parameter, no longer applied.
+
+    Returns
+    -------
+    fig : matplotlib Figure
+    """
+    import json, pathlib
+    import matplotlib.pyplot as plt
+    import matplotlib.gridspec as gridspec
+    import matplotlib.ticker as mticker
+    from matplotlib.backends.backend_pdf import PdfPages
+    from matplotlib.colors import TwoSlopeNorm, CenteredNorm
+
+    FS = 9   # axis / colorbar labels (~10 pt in IEEE two-column)
+    FS_T = 8 # tick labels
+
+    # Serif font matches typical LaTeX document fonts (Times/Computer Modern).
+    # Thin spines and ticks keep the figure light at small print sizes.
+    plt.rcParams.update({
+        "font.family":        "sans-serif",
+        "font.sans-serif":    ["Arial", "Helvetica", "DejaVu Sans"],
+        "axes.linewidth":     0.5,
+        "xtick.major.width":  0.5,
+        "ytick.major.width":  0.5,
+        "xtick.major.size":   2.5,
+        "ytick.major.size":   2.5,
+        "xtick.direction":    "in",
+        "ytick.direction":    "in",
+        "pdf.fonttype":       42,
+        "ps.fonttype":        42,
+    })
+
+    scene_path = pathlib.Path(scene_dir)
+
+    run_dirs = sorted([
+        d for d in scene_path.iterdir()
+        if d.is_dir() and (d / "sinr_bs_only.npy").exists()
+    ])
+    if not run_dirs:
+        raise FileNotFoundError(f"No run subdirs with sinr_bs_only.npy under {scene_dir}")
+
+    map_cfg_path = scene_path / "map_config.json"
+    with open(map_cfg_path) as f:
+        mc = json.load(f)
+    cx_m, cy_m = mc["center"][0], mc["center"][1]
+    sx_m, sy_m = mc["size"][0],   mc["size"][1]
+    cw,   ch   = mc["cell_size"][0], mc["cell_size"][1]
+    x_min = cx_m - sx_m / 2;  x_max = cx_m + sx_m / 2
+    y_min = cy_m - sy_m / 2;  y_max = cy_m + sy_m / 2
+
+    rows = []
+    for rd in run_dirs:
+        sinr_bs   = np.load(rd / "sinr_bs_only.npy")
+        jam_path  = rd / "sinr_bs_jam.npy"
+        sinr_jam  = np.load(jam_path) if jam_path.exists() else None
+        zone_mask = np.load(rd / "zone_union_mask.npy")
+        bldg_mask = np.load(rd / "building_mask.npy")
+
+        bs_pos, jam_pos = [], []
+        rj_path = rd / "results.json"
+        if rj_path.exists():
+            with open(rj_path) as f:
+                rj = json.load(f)
+            opt = rj.get("opt_params", {})
+            for bd in opt.get("bs", {}).values():
+                p = bd.get("final_position", bd.get("initial_position"))
+                if p:
+                    bs_pos.append((float(p[0]), float(p[1])))
+            for jd in opt.get("jammers", {}).values():
+                p = jd.get("final_position")
+                if p:
+                    jam_pos.append((float(p[0]), float(p[1]), bool(jd.get("active", True))))
+
+        rows.append(dict(
+            sinr_bs=sinr_bs, sinr_jam=sinr_jam,
+            zone_mask=zone_mask, bldg_mask=bldg_mask,
+            bs_pos=bs_pos, jam_pos=jam_pos,
+        ))
+
+    N = len(rows)
+    gamma = float(gamma_db)
+    sinr_norm = TwoSlopeNorm(vmin=gamma - 20, vcenter=gamma, vmax=gamma + 20)
+    _step = 8
+
+    # Layout: 5-column GridSpec per row — [img0 | sinr_zone | img1 | img2 | cb_delta]
+    #
+    # sinr_zone holds the shared SINR colorbar.  It is intentionally wider than
+    # a bare colorbar strip so the ticks and label have genuine white space and
+    # never bleed into either image.  The zone is subdivided with a nested
+    # GridSpecFromSubplotSpec: the left fraction (_CB_BAR) is the gradient strip;
+    # the right fraction is empty white space where ticks and label overflow into.
+    # This makes the img0→img1 gap visibly larger than the img1→img2 gap (which
+    # is just wspace), matching the visual weight of the annotation.
+    #
+    # cb_delta (right-most column) is narrower; its ticks overflow into the right
+    # figure margin which is already 8 % of the figure width.
+    _CB_ZONE = sinr_zone  # SINR zone width ratio relative to one image column
+    _CB_BAR  = 0.25  # fraction of _CB_ZONE used for the actual gradient strip
+    _CB_DELT = 0.08  # delta colorbar column ratio
+
+    _FW, _L, _R, _T, _B = 7.16, left, 0.92, 0.98, bottom
+    _sum_r = 3 + _CB_ZONE + _CB_DELT
+    # GridSpec col width: unit = inner_w / (sum_ratios * (1 + (ncols-1)*wspace/ncols))
+    _img_col_w_in = (_R - _L) * _FW / (_sum_r * (1 + 4 * wspace / 5))
+    _fig_h = _img_col_w_in * (N + (N - 1) * hspace) / (_T - _B)
+
+    fig = plt.figure(figsize=(_FW, _fig_h))
+    gs = gridspec.GridSpec(
+        N, 5,
+        width_ratios=[1, _CB_ZONE, 1, 1, _CB_DELT],
+        left=_L, right=_R, top=_T, bottom=_B,
+        hspace=hspace, wspace=wspace,
+    )
+
+    def _imshow(ax, field, norm, cmap):
+        return ax.imshow(
+            field[::_step, ::_step],
+            cmap=cmap, norm=norm, interpolation="nearest",
+            aspect="equal", rasterized=True, origin="lower",
+            extent=[x_min, x_max, y_min, y_max],
+        )
+
+    def _overlays(ax, zone_mask, bldg_mask, bs_pos, jam_pos, xc, yc, show_j):
+        zone_ds = zone_mask[::_step, ::_step].astype(float)
+        bldg_ds = bldg_mask[::_step, ::_step].astype(float)
+        ax.contour(xc, yc, zone_ds, levels=[0.5],
+                   colors=["black"], linewidths=1.0, linestyles="-", zorder=6)
+        ax.contourf(xc, yc, bldg_ds, levels=[0.5, 1.5],
+                    colors=["#797878"], alpha=1.0, zorder=4)
+        ax.contour(xc, yc, bldg_ds, levels=[0.5],
+                   colors=["black"], linewidths=1.0, linestyles="-", zorder=5)
+        for bx, by in bs_pos:
+            ax.scatter(bx, by, marker="*", s=100, color="white",
+                       edgecolors="white", linewidths=2.0, zorder=7)
+            ax.scatter(bx, by, marker="*", s=60, color="#0DD525",
+                       edgecolors="black", linewidths=0.6, zorder=8)
+        if show_j:
+            for jx, jy, active in jam_pos:
+                if active:
+                    ax.scatter(jx, jy, marker="+", s=60, color="white",
+                               linewidths=2.2, zorder=6)
+                    ax.scatter(jx, jy, marker="+", s=35, color="#FF0000",
+                               linewidths=1.4, zorder=7)
+                else:
+                    ax.scatter(jx, jy, marker="x", s=50, color="white",
+                               linewidths=2.0, zorder=6, alpha=0.6)
+                    ax.scatter(jx, jy, marker="x", s=28, color="#888888",
+                               linewidths=1.0, zorder=7, alpha=0.6)
+
+    def _autozoom(ax, zone_mask):
+        r, c = np.where(zone_mask.astype(bool))
+        if len(r) == 0:
+            return
+        x_z0 = x_min + c.min() * cw;  x_z1 = x_min + (c.max() + 1) * cw
+        y_z0 = y_min + r.min() * ch;  y_z1 = y_min + (r.max() + 1) * ch
+        margin = max(x_z1 - x_z0, y_z1 - y_z0) * 0.5
+        ax.set_xlim(max(x_min, x_z0 - margin), min(x_max, x_z1 + margin))
+        ax.set_ylim(max(y_min, y_z0 - margin), min(y_max, y_z1 + margin))
+
+    for ri, row in enumerate(rows):
+        ds = row["sinr_bs"][::_step, ::_step]
+        H_ds, W_ds = ds.shape
+        xc = np.linspace(x_min + _step * cw / 2, x_max - _step * cw / 2, W_ds)
+        yc = np.linspace(y_min + _step * ch / 2, y_max - _step * ch / 2, H_ds)
+
+        ax0 = fig.add_subplot(gs[ri, 0])
+        # Narrow bar on the left of the SINR zone; right portion stays empty
+        # white space so ticks and label never overlap img0 or img1.
+        _sinr_inner = gridspec.GridSpecFromSubplotSpec(
+            1, 2,
+            subplot_spec=gs[ri, 1],
+            width_ratios=[_CB_BAR, 1 - _CB_BAR],
+            wspace=0,
+        )
+        cax_sinr = fig.add_subplot(_sinr_inner[0, 0])
+        ax1      = fig.add_subplot(gs[ri, 2])
+        ax2      = fig.add_subplot(gs[ri, 3])
+        cax_delt = fig.add_subplot(gs[ri, 4])
+
+        im0 = _imshow(ax0, row["sinr_bs"], sinr_norm, "viridis")
+        _overlays(ax0, row["zone_mask"], row["bldg_mask"],
+                  row["bs_pos"], row["jam_pos"], xc, yc, show_j=False)
+        _autozoom(ax0, row["zone_mask"])
+
+        if row["sinr_jam"] is not None:
+            im1 = _imshow(ax1, row["sinr_jam"], sinr_norm, "viridis")
+            _overlays(ax1, row["zone_mask"], row["bldg_mask"],
+                      row["bs_pos"], row["jam_pos"], xc, yc, show_j=True)
+            _autozoom(ax1, row["zone_mask"])
+        else:
+            ax1.axis("off")
+            im1 = None
+
+        if row["sinr_jam"] is not None:
+            diff = row["sinr_jam"] - row["sinr_bs"]
+            abs_max = max(float(np.nanpercentile(np.abs(diff), 98)), 1.0)
+            im2 = _imshow(ax2, diff,
+                          CenteredNorm(vcenter=0.0, halfrange=abs_max), "RdBu")
+            _overlays(ax2, row["zone_mask"], row["bldg_mask"],
+                      row["bs_pos"], row["jam_pos"], xc, yc, show_j=True)
+            _autozoom(ax2, row["zone_mask"])
+        else:
+            ax2.axis("off")
+            im2 = None
+
+        # Shared SINR colorbar — ticks and label on the right, flowing into the
+        # empty white-space half of the SINR zone (never touching either image).
+        def _cb(cax, im, label):
+            cb = fig.colorbar(im, cax=cax)
+            cb.set_label(label, fontsize=FS_T)
+            cb.ax.tick_params(labelsize=FS_T)
+            cb.locator = mticker.MaxNLocator(nbins=5)
+            cb.update_ticks()
+            return cb
+
+        _cb(cax_sinr, im1 if im1 is not None else im0, "SINR (dB)")
+        if im2 is not None:
+            _cb(cax_delt, im2, "ΔSINR (dB)")
+        else:
+            cax_delt.set_visible(False)
+
+        _loc = mticker.MaxNLocator(n_ticks, integer=False, prune="both")
+
+        # Y-axis ticks on col 0 only (no per-row label — handled by supylabel)
+        ax0.tick_params(axis="y", labelsize=FS_T, length=3)
+        ax0.yaxis.set_major_locator(_loc)
+        for ax in [ax1, ax2]:
+            ax.tick_params(axis="y", labelleft=False, length=3)
+            ax.yaxis.set_major_locator(mticker.MaxNLocator(n_ticks, integer=False, prune="both"))
+
+        # X-axis ticks on bottom row only (no per-col label — handled by supxlabel)
+        for ax in [ax0, ax1, ax2]:
+            ax.xaxis.set_major_locator(mticker.MaxNLocator(n_ticks, integer=False, prune="both"))
+            if ri == N - 1:
+                ax.tick_params(axis="x", labelsize=FS_T, length=3)
+            else:
+                ax.tick_params(axis="x", labelbottom=False, length=3)
+
+    fig.supxlabel("X (m)", fontsize=FS)
+    fig.supylabel("Y (m)", fontsize=FS)
+
+    if save_pdf:
+        with PdfPages(save_pdf) as pdf:
+            pdf.savefig(fig, bbox_inches="tight", dpi=300)
+        print(f"Saved to {save_pdf}")
+
+    return fig

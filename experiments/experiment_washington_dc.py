@@ -160,6 +160,7 @@ _base_hparams = dict(
     lambda_out=6.0,
     lambda_uniform=0.5,
     lambda_min_j=4.0,
+    use_gate_logits=True,     # False = all jammers always fully on (useful for debugging coverage)
     lambda_spread=0.0,
     spread_min_dist=0.0,
     soft_mean_weight=4.0,
@@ -171,7 +172,11 @@ _base_hparams = dict(
     lr_scheduler="cosine",
 )
 
-OUTSIDE_MARGIN_M = 150.0  # metres beyond the zone's max X/Y extent to sample outside
+OUTSIDE_MARGIN_M      = 150.0   # metres beyond the zone's max X/Y extent to sample outside
+BS_HEIGHT_M           = 50.0
+BS_TARGET_Z_M         = 1.5
+BS_PROJECT_EDGE       = True
+JAM_MIN_BS_DISTANCE_M = 75.0
 
 total_runs = len(SHAPES) * len(SIZE_CONFIGS) * len(SAMPLE_COUNTS)
 print(f"Experiment: {SCENE_NAME}  |  {total_runs} total runs")
@@ -204,7 +209,8 @@ def _remove_existing_bs(scene, max_n_bs=4):
 
 
 def _seed_jammers_uniform(zone_params, shape, n_jammers=8,
-                          standoff_distance=100.0, bs_positions=None):
+                          standoff_distance=100.0, bs_positions=None,
+                          min_bs_distance_m=75.0):
     """Shape-aware jammer seeding.
 
     square  : n_jammers//4 jammers per side, spaced at equal intervals along
@@ -258,7 +264,7 @@ def _seed_jammers_uniform(zone_params, shape, n_jammers=8,
         n_jammers=n_jammers,
         bs_positions=_bs,
         standoff_distance=standoff_distance,
-        min_bs_distance=75.0,
+        min_bs_distance=min_bs_distance_m,
         concave_order=8,
         max_gap_deg=90.0,
         interpolation_factor=2,
@@ -347,9 +353,9 @@ for shape in SHAPES:
                 zone_params=zone_params,
                 n_bs=n_bs,
                 scene_xml_path=SCENE_XML,
-                bs_height=50.0,
-                target_z=1.5,
-                project_to_edge=True,
+                bs_height=BS_HEIGHT_M,
+                target_z=BS_TARGET_Z_M,
+                project_to_edge=BS_PROJECT_EDGE,
                 name_prefix="bs",
                 seed=44,
             )
@@ -359,6 +365,7 @@ for shape in SHAPES:
                 zone_params, shape=shape, n_jammers=N_JAMMERS,
                 standoff_distance=standoff_m,
                 bs_positions=bs_positions_xyz,
+                min_bs_distance_m=JAM_MIN_BS_DISTANCE_M,
             )
             jam_configs = [
                 JammerConfig(name=f"jam_{k+1}", initial_power_dbm=20.0,
@@ -467,8 +474,47 @@ for shape in SHAPES:
                     "joint_avg_iter_s":  elapsed_joint / n_iter_joint,
                     "total_elapsed_s":   elapsed_warmup + elapsed_joint,
                 },
+                "params": {
+                    **_base_hparams,
+                    "outside_half_size_m":      outside_half,
+                    "num_iterations_warmup":    100,
+                    "num_iterations_joint":     100,
+                    "warmup_lambda_in":         10.0,
+                    "warmup_lambda_out":        0.0,
+                    "warmup_soft_mean_weight":  0.0,
+                    "bs_height_m":              BS_HEIGHT_M,
+                    "bs_target_ue_height_m":    BS_TARGET_Z_M,
+                    "bs_project_to_edge":       BS_PROJECT_EDGE,
+                    "bs_seed":                  44,
+                    "jammer_seed":              22,
+                },
+                "constraints": {
+                    "bs_initial_power_dbm":  tx_configs[0].initial_power_dbm,
+                    "bs_power_min_dbm":      tx_configs[0].power_dbm_bounds[0],
+                    "bs_power_max_dbm":      tx_configs[0].power_dbm_bounds[1],
+                    "jam_initial_power_dbm": jam_configs[0].initial_power_dbm,
+                    "jam_power_min_dbm":     jam_configs[0].power_dbm_bounds[0],
+                    "jam_power_max_dbm":     jam_configs[0].power_dbm_bounds[1],
+                    "jam_elevation_bounds":  list(jam_configs[0].elevation_bounds),
+                    "jam_standoff_m":        standoff_m,
+                    "jam_min_bs_distance_m": JAM_MIN_BS_DISTANCE_M,
+                },
                 "bs_only":      _extract_stats(stats_combined, tx_configs, use_jam=False),
                 "with_jammers": _extract_stats(stats_combined, tx_configs, use_jam=True),
+                "opt_params": {
+                    "bs": {
+                        cfg.name: {
+                            "initial_position":  result_jam[cfg.name]["initial_position"],
+                            "initial_angles":    result_jam[cfg.name]["initial_angles"],
+                            "initial_power_dbm": result_jam[cfg.name]["initial_power_dbm"],
+                            "final_position":    result_jam[cfg.name]["final_position"],
+                            "final_angles":      result_jam[cfg.name]["best_angles"],
+                            "final_power_dbm":   result_jam[cfg.name]["best_power_dbm"],
+                        }
+                        for cfg in tx_configs
+                    },
+                    "jammers": result_jam["joint"].get("jammers", {}),
+                },
             }
             with open(run_dir / "results.json", "w") as f:
                 json.dump(results, f, indent=2, default=float)

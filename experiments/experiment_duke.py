@@ -94,7 +94,7 @@ def make_zone_params(shape: str, size_m: float) -> dict:
         return {"center": [0.0, 0.0], "vertices": vertices}
 
     if shape == "splat":
-        rng   = np.random.default_rng(seed=42)
+        rng   = np.random.default_rng(seed=46)
         n_pts = 120
         theta = np.linspace(0, 2 * np.pi, n_pts, endpoint=False)
         r     = np.full(n_pts, size_m, dtype=float)
@@ -131,10 +131,10 @@ SHAPES = ["square", "circle", "splat", "l_shape"]
 # Zone half-size chosen so a square zone has 100 m of side per BS:
 #   small  → side 200 m (2 BS),  medium → side 300 m (3 BS),  large → side 400 m (4 BS)
 SIZE_CONFIGS = [
-    {"name": "large",  "size_m": 400.0, "n_bs": 4, "standoff_m": 200.0},
+    {"name": "medium",  "size_m": 200.0, "n_bs": 2, "standoff_m": 100.0}
 ]
 
-SAMPLE_COUNTS = [300, 500, 700, 1000]
+SAMPLE_COUNTS = [500]
 
 OUTPUT_ROOT = pathlib.Path(f"../results/{SCENE_NAME}")
 OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
@@ -152,16 +152,17 @@ _base_hparams = dict(
     sampler="rejection",
     sampling_strata="full",
     gamma_db=0.0,
-    inside_margin_db=22.0,
-    min_sinr_db=22.0,
-    lambda_in=8.0,
-    lambda_out=10.0,
+    inside_margin_db=10.0,
+    min_sinr_db=10.0,
+    lambda_in=2.0,
+    lambda_out=8.0,
     lambda_uniform=0.1,
-    lambda_min_j=0.0,
+    lambda_min_j=9.0,
+    use_gate_logits=False,     # False = all jammers always fully on (useful for debugging coverage)
     lambda_spread=0.0,
     spread_min_dist=0.0,
-    soft_mean_weight=7.0,
-    soft_mean_in_weight=7.0,
+    soft_mean_weight=3.0,
+    soft_mean_in_weight=3.0,
     learning_rate=0.1,
     lr_position=4.0,
     lr_power=0.1,
@@ -169,7 +170,34 @@ _base_hparams = dict(
     lr_scheduler="cosine",
 )
 
-OUTSIDE_MARGIN_M = 200.0  # metres beyond the zone's max X/Y extent to sample outside
+# Old
+# _base_hparams = dict(
+#     lds="Halton",
+#     sampler="rejection",
+#     sampling_strata="full",
+#     gamma_db=0.0,
+#     inside_margin_db=22.0,
+#     min_sinr_db=22.0,
+#     lambda_in=8.0,
+#     lambda_out=10.0,
+#     lambda_uniform=0.1,
+#     lambda_min_j=0.0,
+#     lambda_spread=0.0,
+#     spread_min_dist=0.0,
+#     soft_mean_weight=7.0,
+#     soft_mean_in_weight=7.0,
+#     learning_rate=0.1,
+#     lr_position=4.0,
+#     lr_power=0.1,
+#     noise_power=1e-10,
+#     lr_scheduler="cosine",
+# )
+
+OUTSIDE_MARGIN_M      = 200.0   # metres beyond the zone's max X/Y extent to sample outside
+BS_HEIGHT_M           = 50.0
+BS_TARGET_Z_M         = 1.5
+BS_PROJECT_EDGE       = True
+JAM_MIN_BS_DISTANCE_M = 75.0
 
 total_runs = len(SHAPES) * len(SIZE_CONFIGS) * len(SAMPLE_COUNTS)
 print(f"Experiment: {SCENE_NAME}  |  {total_runs} total runs")
@@ -201,67 +229,23 @@ def _remove_existing_bs(scene, max_n_bs=4):
             pass
 
 
-def _seed_jammers_uniform(zone_params, shape, n_jammers=8,
-                          standoff_distance=100.0, bs_positions=None):
-    """Shape-aware jammer seeding.
-
-    square  : n_jammers//4 jammers per side, spaced at equal intervals along
-              each edge and pushed straight outward by standoff_distance — every
-              jammer is at exactly standoff_distance from its nearest edge.
-    circle  : equal arc-length interpolation on the round-buffered perimeter
-              (equivalent to equal angular spacing).
-    splat /
-    l_shape : seed_jammer_positions() — concave-corner + convex-arc-peak feature
-              seeding with angular gap fill, matching multi_tx_optimization.ipynb.
-    """
+def _seed_jammers_uniform(zone_params, shape=None, n_jammers=8, **_):
+    """Place n_jammers equally spaced along the perimeter of the zone scaled to 1.25x."""
+    from shapely.geometry import Polygon as ShapelyPolygon
     cx, cy = zone_params.get("center", [0.0, 0.0])
-
-    if shape == "square":
-        verts = zone_params["vertices"]
-        s = max(abs(float(v[0]) - cx) for v in verts)  # half-side length
-        n_per_side = max(1, n_jammers // 4)
-        fracs = [(k + 0.5) / n_per_side for k in range(n_per_side)]
-        sides = [
-            ((cx - s, cy - s), (cx + s, cy - s), ( 0.0, -1.0)),  # south
-            ((cx + s, cy - s), (cx + s, cy + s), ( 1.0,  0.0)),  # east
-            ((cx + s, cy + s), (cx - s, cy + s), ( 0.0,  1.0)),  # north
-            ((cx - s, cy + s), (cx - s, cy - s), (-1.0,  0.0)),  # west
-        ]
-        positions = []
-        for (x0, y0), (x1, y1), (nx, ny) in sides:
-            for f in fracs:
-                bx = x0 + f * (x1 - x0)
-                by = y0 + f * (y1 - y0)
-                positions.append([bx + nx * standoff_distance,
-                                   by + ny * standoff_distance])
-        return positions
-
-    if shape == "circle":
-        from shapely.geometry import Polygon as ShapelyPolygon
-        verts = [(float(v[0]) + cx, float(v[1]) + cy) for v in zone_params["vertices"]]
-        poly  = ShapelyPolygon(verts)
-        outer = poly.buffer(standoff_distance, join_style="round", resolution=64)
-        ring  = outer.exterior
-        total = ring.length
-        return [
-            [ring.interpolate((i + 0.5) / n_jammers * total).x,
-             ring.interpolate((i + 0.5) / n_jammers * total).y]
-            for i in range(n_jammers)
-        ]
-
-    # splat / l_shape: feature-based seeding (concave corners + convex arc peaks + gap fill)
-    _bs = [[float(p[0]), float(p[1])] for p in bs_positions] if bs_positions else None
-    return seed_jammer_positions(
-        zone_params,
-        n_jammers=n_jammers,
-        bs_positions=_bs,
-        standoff_distance=standoff_distance,
-        min_bs_distance=75.0,
-        concave_order=8,
-        max_gap_deg=90.0,
-        interpolation_factor=2,
-        seed=22,
-    )
+    verts = [(float(v[0]) + cx, float(v[1]) + cy) for v in zone_params["vertices"]]
+    poly = ShapelyPolygon(verts)
+    scaled = ShapelyPolygon([
+        (cx + (x - cx) * 1.25, cy + (y - cy) * 1.25)
+        for x, y in poly.exterior.coords
+    ])
+    ring = scaled.exterior
+    total = ring.length
+    return [
+        [ring.interpolate((i + 0.5) / n_jammers * total).x,
+         ring.interpolate((i + 0.5) / n_jammers * total).y]
+        for i in range(n_jammers)
+    ]
 
 
 def _extract_stats(stats_dict, tx_configs, use_jam=True):
@@ -302,7 +286,11 @@ def _extract_stats(stats_dict, tx_configs, use_jam=True):
     return out
 
 
-N_JAMMERS = 8
+N_JAMMERS = 12
+
+# Save map config once — needed to interpret saved numpy arrays (cell→world coords)
+with open(OUTPUT_ROOT / "map_config.json", "w") as _f:
+    json.dump(MAP_CONFIG, _f, indent=2)
 
 run_index = 0
 for shape in SHAPES:
@@ -339,15 +327,18 @@ for shape in SHAPES:
             )
             print(f"  Zone cells: {zone_stats['num_cells']}")
 
+            # Save zone mask now — same for all sample counts of this shape+size
+            np.save(run_dir / "zone_mask.npy", zone_mask.astype(np.float32))
+
             # ── Base stations ─────────────────────────────────────────────────
             tx_configs, bs_positions_xyz = setup_bs_transmitters(
                 scene=scene,
                 zone_params=zone_params,
                 n_bs=n_bs,
                 scene_xml_path=SCENE_XML,
-                bs_height=50.0,
-                target_z=1.5,
-                project_to_edge=True,
+                bs_height=BS_HEIGHT_M,
+                target_z=BS_TARGET_Z_M,
+                project_to_edge=BS_PROJECT_EDGE,
                 name_prefix="bs",
                 seed=44,
             )
@@ -357,6 +348,7 @@ for shape in SHAPES:
                 zone_params, shape=shape, n_jammers=N_JAMMERS,
                 standoff_distance=standoff_m,
                 bs_positions=bs_positions_xyz,
+                min_bs_distance_m=JAM_MIN_BS_DISTANCE_M,
             )
             jam_configs = [
                 JammerConfig(name=f"jam_{k+1}", initial_power_dbm=20.0,
@@ -442,6 +434,7 @@ for shape in SHAPES:
                 jammer_configs=jam_configs,
                 building_polygons=BUILDING_POLYGONS,
                 outside_half_size=outside_half,
+                save_arrays_to=run_dir,
             )
             fig_map.savefig(run_dir / "radiomap.png", dpi=150, bbox_inches="tight")
             fig_cdf.savefig(run_dir / "cdf_sinr.png",  dpi=150, bbox_inches="tight")
@@ -465,8 +458,47 @@ for shape in SHAPES:
                     "joint_avg_iter_s":  elapsed_joint / n_iter_joint,
                     "total_elapsed_s":   elapsed_warmup + elapsed_joint,
                 },
+                "params": {
+                    **_base_hparams,
+                    "outside_half_size_m":      outside_half,
+                    "num_iterations_warmup":    100,
+                    "num_iterations_joint":     100,
+                    "warmup_lambda_in":         10.0,
+                    "warmup_lambda_out":        0.0,
+                    "warmup_soft_mean_weight":  0.0,
+                    "bs_height_m":              BS_HEIGHT_M,
+                    "bs_target_ue_height_m":    BS_TARGET_Z_M,
+                    "bs_project_to_edge":       BS_PROJECT_EDGE,
+                    "bs_seed":                  44,
+                    "jammer_seed":              22,
+                },
+                "constraints": {
+                    "bs_initial_power_dbm":  tx_configs[0].initial_power_dbm,
+                    "bs_power_min_dbm":      tx_configs[0].power_dbm_bounds[0],
+                    "bs_power_max_dbm":      tx_configs[0].power_dbm_bounds[1],
+                    "jam_initial_power_dbm": jam_configs[0].initial_power_dbm,
+                    "jam_power_min_dbm":     jam_configs[0].power_dbm_bounds[0],
+                    "jam_power_max_dbm":     jam_configs[0].power_dbm_bounds[1],
+                    "jam_elevation_bounds":  list(jam_configs[0].elevation_bounds),
+                    "jam_standoff_m":        standoff_m,
+                    "jam_min_bs_distance_m": JAM_MIN_BS_DISTANCE_M,
+                },
                 "bs_only":      _extract_stats(stats_combined, tx_configs, use_jam=False),
                 "with_jammers": _extract_stats(stats_combined, tx_configs, use_jam=True),
+                "opt_params": {
+                    "bs": {
+                        cfg.name: {
+                            "initial_position":  result_jam[cfg.name]["initial_position"],
+                            "initial_angles":    result_jam[cfg.name]["initial_angles"],
+                            "initial_power_dbm": result_jam[cfg.name]["initial_power_dbm"],
+                            "final_position":    result_jam[cfg.name]["final_position"],
+                            "final_angles":      result_jam[cfg.name]["best_angles"],
+                            "final_power_dbm":   result_jam[cfg.name]["best_power_dbm"],
+                        }
+                        for cfg in tx_configs
+                    },
+                    "jammers": result_jam["joint"].get("jammers", {}),
+                },
             }
             with open(run_dir / "results.json", "w") as f:
                 json.dump(results, f, indent=2, default=float)

@@ -1,7 +1,7 @@
 # ── Scene Configuration (only cell that differs per notebook) ─────────────────
 # TODO: Replace the SCENE_XML path below with the Boulder scene once it is available.
 SCENE_NAME = "boulder"
-SCENE_XML  = "../scene/scenes/BOULDER_PLACEHOLDER/scene.xml"  # <-- update this path
+SCENE_XML  = "../scene/scenes/boulder_open/scene.xml"  # <-- update this path
 
 
 import sys
@@ -31,18 +31,18 @@ import warnings
 warnings.filterwarnings("ignore", message="invalid value encountered in multiply")
 warnings.filterwarnings("ignore", category=UserWarning, module="jupyter_client")
 
-from sionna.rt import load_scene, Receiver, Camera, PathSolver, AntennaArray
+from sionna.rt import load_scene, Receiver, Camera, PathSolver, AntennaArray, Transmitter
 from sionna.rt.antenna_pattern import antenna_pattern_registry
 
 from boresight_pathsolver import create_zone_mask
 from multi_tx_optimizer import (
-    optimize_multi_tx, setup_bs_transmitters, seed_jammer_positions, JammerConfig, compare_multi_tx_performance
+    optimize_multi_tx, TxConfig, seed_jammer_positions, JammerConfig, compare_multi_tx_performance
 )
 
 scene = load_scene(SCENE_XML)
 scene.frequency = 3.7e9
 
-gnb_pattern      = antenna_pattern_registry.get("tr38901")(polarization="V")
+gnb_pattern      = antenna_pattern_registry.get("iso")(polarization="V")
 friendly_pattern = antenna_pattern_registry.get("iso")(polarization="V")
 ue_pattern       = antenna_pattern_registry.get("iso")(polarization="V")
 
@@ -95,7 +95,7 @@ def make_zone_params(shape: str, size_m: float) -> dict:
         return {"center": [0.0, 0.0], "vertices": vertices}
 
     if shape == "splat":
-        rng   = np.random.default_rng(seed=42)
+        rng   = np.random.default_rng(seed=47)
         n_pts = 120
         theta = np.linspace(0, 2 * np.pi, n_pts, endpoint=False)
         r     = np.full(n_pts, size_m, dtype=float)
@@ -126,18 +126,15 @@ for _sh in ["square", "circle", "splat", "l_shape"]:
     assert "vertices" in _p, f"{_sh} missing vertices!"
     print(f"{_sh:10s}: {len(_p['vertices'])} vertices, center={_p['center']}")
 
-
 SHAPES = ["square", "circle", "splat", "l_shape"]
 
 # Zone half-size chosen so a square zone has 100 m of side per BS:
 #   small  → side 200 m (2 BS),  medium → side 300 m (3 BS),  large → side 400 m (4 BS)
 SIZE_CONFIGS = [
-    {"name": "small",  "size_m": 100.0, "n_bs": 1, "standoff_m": 75.0},
-    {"name": "medium", "size_m": 150.0, "n_bs": 2, "standoff_m": 75.0},
-    {"name": "large",  "size_m": 200.0, "n_bs": 3, "standoff_m": 75.0},
+    {"name": "medium",  "size_m": 100.0, "n_bs": 1, "standoff_m": 25.0},
 ]
 
-SAMPLE_COUNTS = [300, 500, 700, 1000]
+SAMPLE_COUNTS = [250, 500, 750, 1000]
 
 OUTPUT_ROOT = pathlib.Path(f"../results/{SCENE_NAME}")
 OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
@@ -155,16 +152,17 @@ _base_hparams = dict(
     sampler="rejection",
     sampling_strata="full",
     gamma_db=0.0,
-    inside_margin_db=12.0,
-    min_sinr_db=12.0,
-    lambda_in=3.0,
-    lambda_out=6.0,
-    lambda_uniform=0.5,
-    lambda_min_j=4.0,
+    inside_margin_db=10.0,
+    min_sinr_db=10.0,
+    lambda_in=10.0,
+    lambda_out=10.0,
+    lambda_uniform=0.0,
+    lambda_min_j=0.0,         # 0 = no sparsity pressure; >0 penalises gates being HIGH (fewer active jammers)
+    use_gate_logits=True,     # False = all jammers always fully on (useful for debugging coverage)
     lambda_spread=0.0,
     spread_min_dist=0.0,
-    soft_mean_weight=4.0,
-    soft_mean_in_weight=4.0,
+    soft_mean_weight=3.0,     # provides continuous d(loss)/d(gate) from outside mean SINR — key for gate opening
+    soft_mean_in_weight=0.0,
     learning_rate=0.1,
     lr_position=4.0,
     lr_power=0.1,
@@ -172,7 +170,12 @@ _base_hparams = dict(
     lr_scheduler="cosine",
 )
 
-OUTSIDE_MARGIN_M = 150.0  # metres beyond the zone's max X/Y extent to sample outside
+OUTSIDE_MARGIN_M      = 200.0   # metres beyond the zone's max X/Y extent to sample outside
+BS_FIXED_POSITION     = [0.0, 0.0, 50.0]   # single isotropic TX fixed at scene origin
+BS_HEIGHT_M           = BS_FIXED_POSITION[2]
+BS_TARGET_Z_M         = 1.5
+BS_PROJECT_EDGE       = False               # not applicable for fixed-position TX
+JAM_MIN_BS_DISTANCE_M = 75.0
 
 total_runs = len(SHAPES) * len(SIZE_CONFIGS) * len(SAMPLE_COUNTS)
 print(f"Experiment: {SCENE_NAME}  |  {total_runs} total runs")
@@ -205,7 +208,8 @@ def _remove_existing_bs(scene, max_n_bs=4):
 
 
 def _seed_jammers_uniform(zone_params, shape, n_jammers=8,
-                          standoff_distance=100.0, bs_positions=None):
+                          standoff_distance=100.0, bs_positions=None,
+                          min_bs_distance_m=75.0):
     """Shape-aware jammer seeding.
 
     square  : n_jammers//4 jammers per side, spaced at equal intervals along
@@ -259,7 +263,7 @@ def _seed_jammers_uniform(zone_params, shape, n_jammers=8,
         n_jammers=n_jammers,
         bs_positions=_bs,
         standoff_distance=standoff_distance,
-        min_bs_distance=75.0,
+        min_bs_distance=min_bs_distance_m,
         concave_order=8,
         max_gap_deg=90.0,
         interpolation_factor=2,
@@ -305,7 +309,11 @@ def _extract_stats(stats_dict, tx_configs, use_jam=True):
     return out
 
 
-N_JAMMERS = 8
+N_JAMMERS = 12
+
+# Save map config once — needed to interpret saved numpy arrays
+with open(OUTPUT_ROOT / "map_config.json", "w") as _f:
+    json.dump(MAP_CONFIG, _f, indent=2)
 
 run_index = 0
 for shape in SHAPES:
@@ -342,24 +350,30 @@ for shape in SHAPES:
             )
             print(f"  Zone cells: {zone_stats['num_cells']}")
 
-            # ── Base stations ─────────────────────────────────────────────────
-            tx_configs, bs_positions_xyz = setup_bs_transmitters(
-                scene=scene,
+            # Save zone mask — same for all sample counts of this shape+size
+            np.save(run_dir / "zone_mask.npy", zone_mask.astype(np.float32))
+
+            # ── Fixed isotropic transmitter at scene origin ───────────────────
+            # Boulder is an open scene with a single isotropic BS at (0, 0, 50).
+            # Position and boresight are frozen for both optimization phases.
+            scene.add(Transmitter(name="bs_0", position=BS_FIXED_POSITION))
+            tx_configs = [TxConfig(
+                name="bs_0",
+                on_building=False,
+                building_id=-1,
                 zone_params=zone_params,
-                n_bs=n_bs,
-                scene_xml_path=SCENE_XML,
-                bs_height=50.0,
-                target_z=1.5,
-                project_to_edge=True,
-                name_prefix="bs",
-                seed=44,
-            )
+                initial_power_dbm=25.0,
+                power_dbm_bounds=(30.0, 40.0),
+            )]
+            bs_positions_xyz = [BS_FIXED_POSITION]
+            print(f"  TX: bs_0 fixed at {BS_FIXED_POSITION} (isotropic)")
 
             # ── Jammers: 8 evenly spaced on expanded zone perimeter ───────────
             jam_positions = _seed_jammers_uniform(
                 zone_params, shape=shape, n_jammers=N_JAMMERS,
                 standoff_distance=standoff_m,
                 bs_positions=bs_positions_xyz,
+                min_bs_distance_m=JAM_MIN_BS_DISTANCE_M,
             )
             jam_configs = [
                 JammerConfig(name=f"jam_{k+1}", initial_power_dbm=20.0,
@@ -383,37 +397,10 @@ for shape in SHAPES:
                 **_base_hparams,
             )
 
-            # ── Run 1: BS-only warm-up (50 iter) — inside coverage only ─────────
-            # No outside penalty: goal is uniform high-SINR coverage inside the
-            # zone. Leakage containment is handled in Run 2 once jammers are added.
-            print("  Run 1: BS warm-up (50 iter, inside coverage only)")
-            _warmup_kwargs = {**_shared, "lambda_out": 0.0, "soft_mean_weight": 0.0}
-            result_bs, _ = optimize_multi_tx(
-                scene=scene,
-                jam_configs=None,
-                num_iterations=50,
-                **_warmup_kwargs,
-            )
-            elapsed_warmup = result_bs["joint"]["elapsed_time_s"]
-            n_iter_warmup  = result_bs["joint"]["num_iterations"]
-            print(f"  Warm-up: {elapsed_warmup:.1f}s total, "
-                  f"{elapsed_warmup/n_iter_warmup:.2f}s/iter")
-
-            # ── Warm-start Run 2 from Run 1 ───────────────────────────────────
-            for cfg in tx_configs:
-                r   = result_bs[cfg.name]
-                pos = r["final_position"]
-                scene.get(cfg.name).position = mi.Point3f(
-                    float(pos[0]), float(pos[1]), float(pos[2])
-                )
-                cfg.initial_azimuth_deg, cfg.initial_elevation_deg = (
-                    float(a) for a in r["best_angles"]
-                )
-
-            # ── Run 2: Joint BS + jammers (100 iter) — BS positions frozen ──────
-            # BS positions are fixed at the warm-up solution; only jammer
-            # positions/powers and BS boresight angles are optimised.
-            print("  Run 2: Joint optimization (100 iter, BS positions frozen)")
+            # ── Joint optimization: jammers only (100 iter, BS frozen) ──────────
+            # Isotropic TX is fixed — no warmup needed. BS position and power are
+            # frozen; only jammer positions, powers, and gating are optimised.
+            print("  Joint optimization (100 iter, BS frozen at origin)")
             result_jam, jam_scene = optimize_multi_tx(
                 scene=scene,
                 jammer_array=jammer_array,
@@ -424,8 +411,8 @@ for shape in SHAPES:
             )
             elapsed_joint = result_jam["joint"]["elapsed_time_s"]
             n_iter_joint  = result_jam["joint"]["num_iterations"]
-            print(f"  Joint:   {elapsed_joint:.1f}s total, "
-                  f"{elapsed_joint/n_iter_joint:.2f}s/iter")
+            print(f"  Joint:   {elapsed_joint:.1f}s  "
+                  f"({elapsed_joint/n_iter_joint:.2f}s/iter)")
 
             # ── Evaluate: single call with jammers ────────────────────────────
             # compare_multi_tx_performance returns (fig_map, fig_cdf, stats).
@@ -445,6 +432,7 @@ for shape in SHAPES:
                 jammer_configs=jam_configs,
                 building_polygons=BUILDING_POLYGONS,
                 outside_half_size=outside_half,
+                save_arrays_to=run_dir,
             )
             fig_map.savefig(run_dir / "radiomap.png", dpi=150, bbox_inches="tight")
             fig_cdf.savefig(run_dir / "cdf_sinr.png",  dpi=150, bbox_inches="tight")
@@ -460,16 +448,47 @@ for shape in SHAPES:
                 "n_samples": n_samples,
                 "n_jammers": len(jam_configs),
                 "timing": {
-                    "warmup_elapsed_s":  elapsed_warmup,
-                    "warmup_n_iter":     n_iter_warmup,
-                    "warmup_avg_iter_s": elapsed_warmup / n_iter_warmup,
                     "joint_elapsed_s":   elapsed_joint,
                     "joint_n_iter":      n_iter_joint,
                     "joint_avg_iter_s":  elapsed_joint / n_iter_joint,
-                    "total_elapsed_s":   elapsed_warmup + elapsed_joint,
+                    "total_elapsed_s":   elapsed_joint,
+                },
+                "params": {
+                    **_base_hparams,
+                    "outside_half_size_m":   outside_half,
+                    "num_iterations_joint":  100,
+                    "bs_fixed_position":     BS_FIXED_POSITION,
+                    "bs_height_m":           BS_HEIGHT_M,
+                    "bs_target_ue_height_m": BS_TARGET_Z_M,
+                    "jammer_seed":           22,
+                },
+                "constraints": {
+                    "bs_initial_power_dbm":  tx_configs[0].initial_power_dbm,
+                    "bs_power_min_dbm":      tx_configs[0].power_dbm_bounds[0],
+                    "bs_power_max_dbm":      tx_configs[0].power_dbm_bounds[1],
+                    "jam_initial_power_dbm": jam_configs[0].initial_power_dbm,
+                    "jam_power_min_dbm":     jam_configs[0].power_dbm_bounds[0],
+                    "jam_power_max_dbm":     jam_configs[0].power_dbm_bounds[1],
+                    "jam_elevation_bounds":  list(jam_configs[0].elevation_bounds),
+                    "jam_standoff_m":        standoff_m,
+                    "jam_min_bs_distance_m": JAM_MIN_BS_DISTANCE_M,
                 },
                 "bs_only":      _extract_stats(stats_combined, tx_configs, use_jam=False),
                 "with_jammers": _extract_stats(stats_combined, tx_configs, use_jam=True),
+                "opt_params": {
+                    "bs": {
+                        cfg.name: {
+                            "initial_position":  result_jam[cfg.name]["initial_position"],
+                            "initial_angles":    result_jam[cfg.name]["initial_angles"],
+                            "initial_power_dbm": result_jam[cfg.name]["initial_power_dbm"],
+                            "final_position":    result_jam[cfg.name]["final_position"],
+                            "final_angles":      result_jam[cfg.name]["best_angles"],
+                            "final_power_dbm":   result_jam[cfg.name]["best_power_dbm"],
+                        }
+                        for cfg in tx_configs
+                    },
+                    "jammers": result_jam["joint"].get("jammers", {}),
+                },
             }
             with open(run_dir / "results.json", "w") as f:
                 json.dump(results, f, indent=2, default=float)
@@ -479,7 +498,7 @@ for shape in SHAPES:
             # ── Per-run GPU/DrJIT cleanup ─────────────────────────────────────
             # DrJIT accumulates JIT kernels across iterations; flushing here
             # prevents memory exhaustion (core dump) on long experiment runs.
-            del result_bs, result_jam, jam_scene, fig_map, fig_cdf, stats_combined
+            del result_jam, jam_scene, fig_map, fig_cdf, stats_combined
             gc.collect()
             torch.cuda.empty_cache()
             dr.flush_kernel_cache()
@@ -621,31 +640,26 @@ fig.savefig(analysis_dir / "containment_metrics.png", dpi=150, bbox_inches="tigh
 plt.show()
 
 # ── 5. Timing: avg iteration time by shape ───────────────────────────────────
-fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-for ax, phase, key, title in [
-    (axes[0], "warmup", "warmup_avg_iter_s", "Warm-up Avg Iter Time (s)"),
-    (axes[1], "joint",  "joint_avg_iter_s",  "Joint Avg Iter Time (s)"),
-]:
-    by_shape = {sh: [] for sh in SHAPES}
-    for r in all_results:
-        v = r.get("timing", {}).get(key)
-        if v is not None:
-            by_shape[r["shape"]].append(v)
-    means = [np.nanmean(by_shape[sh]) if by_shape[sh] else float("nan") for sh in SHAPES]
-    stds  = [np.nanstd(by_shape[sh])  if by_shape[sh] else 0.0            for sh in SHAPES]
-    ax.bar(SHAPES, means, yerr=stds, capsize=4, color="mediumseagreen", alpha=0.8)
-    ax.set_xlabel("Zone Shape"); ax.set_ylabel("Avg Iter Time (s)"); ax.set_title(title)
-    ax.grid(axis="y", alpha=0.3)
-plt.suptitle(f"{SCENE_NAME.title()} — Iteration Time by Shape", fontsize=13)
+fig, ax = plt.subplots(figsize=(8, 4))
+by_shape = {sh: [] for sh in SHAPES}
+for r in all_results:
+    v = r.get("timing", {}).get("joint_avg_iter_s")
+    if v is not None:
+        by_shape[r["shape"]].append(v)
+means = [np.nanmean(by_shape[sh]) if by_shape[sh] else float("nan") for sh in SHAPES]
+stds  = [np.nanstd(by_shape[sh])  if by_shape[sh] else 0.0            for sh in SHAPES]
+ax.bar(SHAPES, means, yerr=stds, capsize=4, color="mediumseagreen", alpha=0.8)
+ax.set_xlabel("Zone Shape"); ax.set_ylabel("Avg Iter Time (s)")
+ax.set_title(f"{SCENE_NAME.title()} — Joint Avg Iter Time by Shape")
+ax.grid(axis="y", alpha=0.3)
 plt.tight_layout()
 fig.savefig(analysis_dir / "timing_by_shape.png", dpi=150, bbox_inches="tight")
 plt.show()
 
 # ── 6. Timing: avg iteration time vs. sample count ───────────────────────────
-fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+fig, ax = plt.subplots(figsize=(8, 4))
 for ax, key, title in [
-    (axes[0], "warmup_avg_iter_s", "Warm-up Avg Iter Time (s)"),
-    (axes[1], "joint_avg_iter_s",  "Joint Avg Iter Time (s)"),
+    (ax, "joint_avg_iter_s",  "Joint Avg Iter Time (s)"),
 ]:
     for shape in SHAPES:
         by_n = {}
@@ -666,8 +680,8 @@ plt.show()
 
 # ── 7. Summary table ─────────────────────────────────────────────────────────
 print(f"\n{'Run':<35} {'In μ':>7} {'In p10':>7} {'In p90':>7} "
-      f"{'Out μ':>7} {'leak':>7} {'hole':>7} {'wu s/it':>8} {'jt s/it':>8} {'tot s':>7}")
-print("-" * 110)
+      f"{'Out μ':>7} {'leak':>7} {'hole':>7} {'jt s/it':>8} {'tot s':>7}")
+print("-" * 100)
 for r in sorted(all_results, key=lambda x: (x["shape"], x["size_name"], x["n_samples"])):
     tag = f"{r['shape']}_{r['size_name']}_n{r['n_samples']}"
     t   = r.get("timing", {})
@@ -679,9 +693,8 @@ for r in sorted(all_results, key=lambda x: (x["shape"], x["size_name"], x["n_sam
         f"{_mean_sinr(r, region='sinr_outside', stat='mean_db'):>7.2f} "
         f"{_mean_rho(r, metric='rho_leak'):>7.4f} "
         f"{_mean_rho(r, metric='rho_hole'):>7.4f} "
-        f"{t.get('warmup_avg_iter_s', float('nan')):>8.2f} "
-        f"{t.get('joint_avg_iter_s',  float('nan')):>8.2f} "
-        f"{t.get('total_elapsed_s',   float('nan')):>7.1f}"
+        f"{t.get('joint_avg_iter_s', float('nan')):>8.2f} "
+        f"{t.get('total_elapsed_s',  float('nan')):>7.1f}"
     )
 
 print(f"\nAnalysis plots saved to: {analysis_dir.resolve()}")
