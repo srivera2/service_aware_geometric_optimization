@@ -3603,7 +3603,8 @@ def plot_multi_shape_grid(
         zone_mask = np.load(rd / "zone_union_mask.npy")
         bldg_mask = np.load(rd / "building_mask.npy")
 
-        bs_pos, jam_pos = [], []
+        bs_pos, jam_pos, initial_bs_pos = [], [], []
+        bs_azimuths, initial_bs_azimuths = [], []
         rj_path = rd / "results.json"
         if rj_path.exists():
             with open(rj_path) as f:
@@ -3613,15 +3614,29 @@ def plot_multi_shape_grid(
                 p = bd.get("final_position", bd.get("initial_position"))
                 if p:
                     bs_pos.append((float(p[0]), float(p[1])))
+                    fa = bd.get("final_angles", bd.get("initial_angles", [0.0, 0.0]))
+                    bs_azimuths.append(float(fa[0]))
+                p0 = bd.get("initial_position")
+                if p0:
+                    initial_bs_pos.append((float(p0[0]), float(p0[1])))
+                    ia = bd.get("initial_angles", [0.0, 0.0])
+                    initial_bs_azimuths.append(float(ia[0]))
             for jd in opt.get("jammers", {}).values():
                 p = jd.get("final_position")
                 if p:
                     jam_pos.append((float(p[0]), float(p[1]), bool(jd.get("active", True))))
 
+        init_path = rd / "sinr_initial.npy"
+        sinr_initial = np.load(init_path) if init_path.exists() else None
+
         rows.append(dict(
+            sinr_initial=sinr_initial,
             sinr_bs=sinr_bs, sinr_jam=sinr_jam,
             zone_mask=zone_mask, bldg_mask=bldg_mask,
             bs_pos=bs_pos, jam_pos=jam_pos,
+            initial_bs_pos=initial_bs_pos,
+            bs_azimuths=bs_azimuths,
+            initial_bs_azimuths=initial_bs_azimuths,
         ))
 
     N = len(rows)
@@ -3629,32 +3644,36 @@ def plot_multi_shape_grid(
     sinr_norm = TwoSlopeNorm(vmin=gamma - 20, vcenter=gamma, vmax=gamma + 20)
     _step = 8
 
-    # Layout: 5-column GridSpec per row — [img0 | sinr_zone | img1 | img2 | cb_delta]
+    # Layout: 6-column GridSpec per row —
+    #   [img_init | img0 | img1 | sinr_zone | img2 | cb_delta]
     #
-    # sinr_zone holds the shared SINR colorbar.  It is intentionally wider than
-    # a bare colorbar strip so the ticks and label have genuine white space and
-    # never bleed into either image.  The zone is subdivided with a nested
-    # GridSpecFromSubplotSpec: the left fraction (_CB_BAR) is the gradient strip;
-    # the right fraction is empty white space where ticks and label overflow into.
-    # This makes the img0→img1 gap visibly larger than the img1→img2 gap (which
-    # is just wspace), matching the visual weight of the annotation.
-    #
-    # cb_delta (right-most column) is narrower; its ticks overflow into the right
-    # figure margin which is already 8 % of the figure width.
+    # img_init: initial (pre-optimization) BS-only SINR
+    # img0:     optimized BS-only SINR
+    # img1:     optimized BS+Jammer SINR
+    # sinr_zone: shared SINR colorbar for first 3 panels (wider than bare strip
+    #            so ticks/label never bleed into images; subdivided via nested
+    #            GridSpec)
+    # img2:     ΔSINR (jam − bs_only)
+    # cb_delta: delta colorbar (narrow, ticks overflow into right margin)
     _CB_ZONE = sinr_zone  # SINR zone width ratio relative to one image column
     _CB_BAR  = 0.25  # fraction of _CB_ZONE used for the actual gradient strip
     _CB_DELT = 0.08  # delta colorbar column ratio
 
     _FW, _L, _R, _T, _B = 7.16, left, 0.92, 0.98, bottom
-    _sum_r = 3 + _CB_ZONE + _CB_DELT
+    _sum_r = 4 + _CB_ZONE + _CB_DELT
     # GridSpec col width: unit = inner_w / (sum_ratios * (1 + (ncols-1)*wspace/ncols))
-    _img_col_w_in = (_R - _L) * _FW / (_sum_r * (1 + 4 * wspace / 5))
+    _img_col_w_in = (_R - _L) * _FW / (_sum_r * (1 + 5 * wspace / 6))
     _fig_h = _img_col_w_in * (N + (N - 1) * hspace) / (_T - _B)
+    # Pre-compute a fixed label x-coord (in axes fraction) for the delta colorbar
+    # so all rows align regardless of per-row tick label widths.  Uses the
+    # worst-case 3-character tick label (e.g. "-10") as the reference width.
+    _delt_cbar_w_pt = _img_col_w_in * _CB_DELT * 72          # colorbar width in pt
+    _delt_label_x   = 1.0 + (1.8 * FS_T + 8.0) / _delt_cbar_w_pt
 
     fig = plt.figure(figsize=(_FW, _fig_h))
     gs = gridspec.GridSpec(
-        N, 5,
-        width_ratios=[1, _CB_ZONE, 1, 1, _CB_DELT],
+        N, 6,
+        width_ratios=[1, 1, 1, _CB_ZONE, 1, _CB_DELT],
         left=_L, right=_R, top=_T, bottom=_B,
         hspace=hspace, wspace=wspace,
     )
@@ -3667,7 +3686,10 @@ def plot_multi_shape_grid(
             extent=[x_min, x_max, y_min, y_max],
         )
 
-    def _overlays(ax, zone_mask, bldg_mask, bs_pos, jam_pos, xc, yc, show_j):
+    _arrow_len = min(sx_m, sy_m) * 0.12  # azimuth arrow length in map units
+
+    def _overlays(ax, zone_mask, bldg_mask, bs_pos, jam_pos, xc, yc, show_j,
+                  bs_azimuths=None, show_inactive_j=True):
         zone_ds = zone_mask[::_step, ::_step].astype(float)
         bldg_ds = bldg_mask[::_step, ::_step].astype(float)
         ax.contour(xc, yc, zone_ds, levels=[0.5],
@@ -3676,11 +3698,19 @@ def plot_multi_shape_grid(
                     colors=["#797878"], alpha=1.0, zorder=4)
         ax.contour(xc, yc, bldg_ds, levels=[0.5],
                    colors=["black"], linewidths=1.0, linestyles="-", zorder=5)
-        for bx, by in bs_pos:
+        _az = bs_azimuths if bs_azimuths is not None else [None] * len(bs_pos)
+        for (bx, by), az_deg in zip(bs_pos, _az):
             ax.scatter(bx, by, marker="*", s=100, color="white",
                        edgecolors="white", linewidths=2.0, zorder=7)
             ax.scatter(bx, by, marker="*", s=60, color="#0DD525",
                        edgecolors="black", linewidths=0.6, zorder=8)
+            if az_deg is not None:
+                az_rad = np.radians(az_deg)
+                dx = np.cos(az_rad) * _arrow_len
+                dy = np.sin(az_rad) * _arrow_len
+                ax.annotate("", xy=(bx + dx, by + dy), xytext=(bx, by),
+                            arrowprops=dict(arrowstyle="-|>", mutation_scale=8,
+                                           lw=1.5, color="black"), zorder=9)
         if show_j:
             for jx, jy, active in jam_pos:
                 if active:
@@ -3688,7 +3718,7 @@ def plot_multi_shape_grid(
                                linewidths=2.2, zorder=6)
                     ax.scatter(jx, jy, marker="+", s=35, color="#FF0000",
                                linewidths=1.4, zorder=7)
-                else:
+                elif show_inactive_j:
                     ax.scatter(jx, jy, marker="x", s=50, color="white",
                                linewidths=2.0, zorder=6, alpha=0.6)
                     ax.scatter(jx, jy, marker="x", s=28, color="#888888",
@@ -3710,29 +3740,41 @@ def plot_multi_shape_grid(
         xc = np.linspace(x_min + _step * cw / 2, x_max - _step * cw / 2, W_ds)
         yc = np.linspace(y_min + _step * ch / 2, y_max - _step * ch / 2, H_ds)
 
-        ax0 = fig.add_subplot(gs[ri, 0])
+        ax_init = fig.add_subplot(gs[ri, 0])
+        ax0     = fig.add_subplot(gs[ri, 1])
+        ax1     = fig.add_subplot(gs[ri, 2])
         # Narrow bar on the left of the SINR zone; right portion stays empty
-        # white space so ticks and label never overlap img0 or img1.
+        # white space so ticks and label never overlap ax1 or ax2.
         _sinr_inner = gridspec.GridSpecFromSubplotSpec(
             1, 2,
-            subplot_spec=gs[ri, 1],
+            subplot_spec=gs[ri, 3],
             width_ratios=[_CB_BAR, 1 - _CB_BAR],
             wspace=0,
         )
         cax_sinr = fig.add_subplot(_sinr_inner[0, 0])
-        ax1      = fig.add_subplot(gs[ri, 2])
-        ax2      = fig.add_subplot(gs[ri, 3])
-        cax_delt = fig.add_subplot(gs[ri, 4])
+        ax2      = fig.add_subplot(gs[ri, 4])
+        cax_delt = fig.add_subplot(gs[ri, 5])
+
+        if row["sinr_initial"] is not None:
+            _imshow(ax_init, row["sinr_initial"], sinr_norm, "viridis")
+            _overlays(ax_init, row["zone_mask"], row["bldg_mask"],
+                      row["initial_bs_pos"], [], xc, yc, show_j=False,
+                      bs_azimuths=row["initial_bs_azimuths"])
+            _autozoom(ax_init, row["zone_mask"])
+        else:
+            ax_init.axis("off")
 
         im0 = _imshow(ax0, row["sinr_bs"], sinr_norm, "viridis")
         _overlays(ax0, row["zone_mask"], row["bldg_mask"],
-                  row["bs_pos"], row["jam_pos"], xc, yc, show_j=False)
+                  row["bs_pos"], row["jam_pos"], xc, yc, show_j=False,
+                  bs_azimuths=row["bs_azimuths"])
         _autozoom(ax0, row["zone_mask"])
 
         if row["sinr_jam"] is not None:
             im1 = _imshow(ax1, row["sinr_jam"], sinr_norm, "viridis")
             _overlays(ax1, row["zone_mask"], row["bldg_mask"],
-                      row["bs_pos"], row["jam_pos"], xc, yc, show_j=True)
+                      row["bs_pos"], row["jam_pos"], xc, yc, show_j=True,
+                      bs_azimuths=row["bs_azimuths"])
             _autozoom(ax1, row["zone_mask"])
         else:
             ax1.axis("off")
@@ -3744,7 +3786,8 @@ def plot_multi_shape_grid(
             im2 = _imshow(ax2, diff,
                           CenteredNorm(vcenter=0.0, halfrange=abs_max), "RdBu")
             _overlays(ax2, row["zone_mask"], row["bldg_mask"],
-                      row["bs_pos"], row["jam_pos"], xc, yc, show_j=True)
+                      row["bs_pos"], row["jam_pos"], xc, yc, show_j=True,
+                      bs_azimuths=row["bs_azimuths"], show_inactive_j=False)
             _autozoom(ax2, row["zone_mask"])
         else:
             ax2.axis("off")
@@ -3762,21 +3805,21 @@ def plot_multi_shape_grid(
 
         _cb(cax_sinr, im1 if im1 is not None else im0, "SINR (dB)")
         if im2 is not None:
-            _cb(cax_delt, im2, "ΔSINR (dB)")
+            _cb(cax_delt, im2, "ΔSINR (dB)").ax.yaxis.set_label_coords(_delt_label_x, 0.5)
         else:
             cax_delt.set_visible(False)
 
         _loc = mticker.MaxNLocator(n_ticks, integer=False, prune="both")
 
-        # Y-axis ticks on col 0 only (no per-row label — handled by supylabel)
-        ax0.tick_params(axis="y", labelsize=FS_T, length=3)
-        ax0.yaxis.set_major_locator(_loc)
-        for ax in [ax1, ax2]:
+        # Y-axis ticks on leftmost column only (no per-row label — handled by supylabel)
+        ax_init.tick_params(axis="y", labelsize=FS_T, length=3)
+        ax_init.yaxis.set_major_locator(_loc)
+        for ax in [ax0, ax1, ax2]:
             ax.tick_params(axis="y", labelleft=False, length=3)
             ax.yaxis.set_major_locator(mticker.MaxNLocator(n_ticks, integer=False, prune="both"))
 
         # X-axis ticks on bottom row only (no per-col label — handled by supxlabel)
-        for ax in [ax0, ax1, ax2]:
+        for ax in [ax_init, ax0, ax1, ax2]:
             ax.xaxis.set_major_locator(mticker.MaxNLocator(n_ticks, integer=False, prune="both"))
             if ri == N - 1:
                 ax.tick_params(axis="x", labelsize=FS_T, length=3)

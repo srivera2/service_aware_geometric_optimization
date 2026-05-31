@@ -30,7 +30,7 @@ import warnings
 warnings.filterwarnings("ignore", message="invalid value encountered in multiply")
 warnings.filterwarnings("ignore", category=UserWarning, module="jupyter_client")
 
-from sionna.rt import load_scene, Receiver, Camera, PathSolver, AntennaArray
+from sionna.rt import load_scene, Receiver, Camera, PathSolver, AntennaArray, RadioMapSolver
 from sionna.rt.antenna_pattern import antenna_pattern_registry
 
 from boresight_pathsolver import create_zone_mask
@@ -94,7 +94,7 @@ def make_zone_params(shape: str, size_m: float) -> dict:
         return {"center": [0.0, 0.0], "vertices": vertices}
 
     if shape == "splat":
-        rng   = np.random.default_rng(seed=46)
+        rng   = np.random.default_rng(seed=35)
         n_pts = 120
         theta = np.linspace(0, 2 * np.pi, n_pts, endpoint=False)
         r     = np.full(n_pts, size_m, dtype=float)
@@ -126,7 +126,7 @@ for _sh in ["square", "circle", "splat", "l_shape"]:
     print(f"{_sh:10s}: {len(_p['vertices'])} vertices, center={_p['center']}")
 
 
-SHAPES = ["square", "circle", "splat", "l_shape"]
+SHAPES = ["square", "circle", "l_shape"]
 
 # Zone half-size chosen so a square zone has 100 m of side per BS:
 #   small  → side 200 m (2 BS),  medium → side 300 m (3 BS),  large → side 400 m (4 BS)
@@ -157,8 +157,8 @@ _base_hparams = dict(
     lambda_in=2.0,
     lambda_out=8.0,
     lambda_uniform=0.1,
-    lambda_min_j=9.0,
-    use_gate_logits=False,     # False = all jammers always fully on (useful for debugging coverage)
+    lambda_min_j=3.0,
+    use_gate_logits=True,     # False = all jammers always fully on (useful for debugging coverage)
     lambda_spread=0.0,
     spread_min_dist=0.0,
     soft_mean_weight=3.0,
@@ -342,6 +342,41 @@ for shape in SHAPES:
                 name_prefix="bs",
                 seed=44,
             )
+
+            # ── Initial radiomap (pre-optimization baseline) ──────────────────
+            # Captures the network state with seed BS positions/orientations,
+            # no jammers, before any gradient-based tuning.
+            print("  Computing initial radiomap...")
+            _init_solver = RadioMapSolver()
+            _init_rm = _init_solver(
+                scene,
+                max_depth=8,
+                samples_per_tx=max(1, int(1e9) // max(1, len(tx_configs))),
+                cell_size=list(MAP_CONFIG["cell_size"]),
+                center=MAP_CONFIG["center"],
+                orientation=[0, 0, 0],
+                size=MAP_CONFIG["size"],
+                los=True,
+                specular_reflection=True,
+                diffuse_reflection=True,
+                diffraction=True,
+                edge_diffraction=True,
+                refraction=False,
+                stop_threshold=None,
+            )
+            _n_bs     = len(tx_configs)
+            _init_rss = [np.nan_to_num(_init_rm.rss.numpy()[i], nan=0.0)
+                         for i in range(_n_bs)]
+            _noise    = _base_hparams["noise_power"]
+            _best     = None
+            for _i, _sig in enumerate(_init_rss):
+                _p_int = sum(_init_rss[_j] for _j in range(_n_bs) if _j != _i)
+                _sinr_i = _sig / (_p_int + _noise)
+                _best = _sinr_i if _best is None else np.maximum(_best, _sinr_i)
+            np.save(run_dir / "sinr_initial.npy",
+                    (10.0 * np.log10(np.maximum(_best, 1e-18))).astype(np.float32))
+            del _init_solver, _init_rm, _init_rss, _best
+            print("  Initial radiomap saved.")
 
             # ── Jammers: 8 evenly spaced on expanded zone perimeter ───────────
             jam_positions = _seed_jammers_uniform(
