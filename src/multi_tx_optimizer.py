@@ -98,8 +98,8 @@ class TxConfig:
     building_id: int
     zone_params: dict
     tx_height_offset: float = 10.0
-    initial_power_dbm: float = 40.0
-    power_dbm_bounds: tuple = (40.0, 50.0)
+    initial_power_dbm: float = 10.0
+    power_dbm_bounds: tuple = (0.0, 30.0)
     initial_azimuth_deg: Optional[float] = None
     initial_elevation_deg: Optional[float] = None
 
@@ -126,8 +126,8 @@ class JammerConfig:
     """
     name: str
     initial_position: Optional[list] = None   # [x, y]; None = random
-    initial_power_dbm: float = 23.0
-    power_dbm_bounds: tuple = (0.0, 50.0)
+    initial_power_dbm: float = 10.0
+    power_dbm_bounds: tuple = (0.0, 30.0)
     elevation_bounds: tuple = (0.0, -90.0)
     initial_azimuth_deg: Optional[float] = None
     initial_elevation_deg: Optional[float] = None
@@ -447,8 +447,8 @@ def setup_bs_transmitters(
     name_prefix: str = "bs",
     seed: int = 42,
     project_to_edge: bool = False,
-    initial_power_dbm: float = 35.0,
-    power_dbm_bounds: tuple = (30.0, 40.0),
+    initial_power_dbm: float = 10.0,
+    power_dbm_bounds: tuple = (0.0, 35.0),
 ) -> tuple:
     """Create and place n_bs base stations in the scene, ready for optimisation.
 
@@ -1149,7 +1149,8 @@ def _sample_zone_points(state: dict, cfg: TxConfig, n: int,
 
 
 def _sample_outside_zone(state: dict, n_inside: int, ground_z: float,
-                         outer_half_size: float = 500.0) -> np.ndarray:
+                         outer_half_size: float = 500.0,
+                         qrand=None) -> np.ndarray:
     """Sample points outside the zone, area-proportional to n_inside.
 
     The sample count is scaled by (outer_ring.area / zone.area) so that the
@@ -1160,6 +1161,10 @@ def _sample_outside_zone(state: dict, n_inside: int, ground_z: float,
     centroid with the zone polygon and building footprints subtracted.  Using a
     fixed square (rather than a scaled copy of the zone) gives a consistent,
     zone-shape-invariant outer sampling region across all simulation geometries.
+
+    When qrand is provided (a scipy QMC sampler), points are drawn using the
+    same LDS rejection scheme as the inside zone; otherwise falls back to
+    uniform random.
     """
     from shapely import contains_xy as _cxy
     import shapely.ops
@@ -1181,8 +1186,16 @@ def _sample_outside_zone(state: dict, n_inside: int, ground_z: float,
 
     zone_area = box_poly.area
     ring_area  = outer_ring.area
+    if outer_ring.is_empty or ring_area < 1.0:
+        return np.zeros((0, 3), dtype=np.float32)
     area_ratio = ring_area / zone_area if zone_area > 0 else 1.0
-    n = max(1, round(n_inside * area_ratio))
+    n = round(n_inside * area_ratio)
+    if n == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+
+    if qrand is not None:
+        pts_arr, *_ = sample_grid_points(outer_ring, n, qrand, ground_z=ground_z)
+        return pts_arr.astype(np.float32)
 
     minx, miny, maxx, maxy = outer_ring.bounds
     rng = np.random.default_rng()
@@ -2059,7 +2072,8 @@ def optimize_multi_tx(
     pts = _sample_zone_points(tx_states[0], tx_configs[0], n_inside,
                               sampler, "full", ground_z)
     out_pts = _sample_outside_zone(tx_states[0], n_inside, ground_z,
-                                   outer_half_size=outside_half_size)
+                                   outer_half_size=outside_half_size,
+                                   qrand=tx_states[0].get("qrand"))
     n_outside = len(out_pts)
     total_rx  = n_inside + n_outside
     shared_slice = slice(0, total_rx)
@@ -2196,7 +2210,7 @@ def optimize_multi_tx(
     for jcfg in (jam_configs or []):
         jammer = jam_objects[jcfg.name]
         init_pos = jammer.position.numpy().flatten()
-        init_pos_3d = [float(init_pos[0]), float(init_pos[1]), 50.0]
+        init_pos_3d = [float(init_pos[0]), float(init_pos[1]), 40.0]
         if jcfg.initial_azimuth_deg is not None and jcfg.initial_elevation_deg is not None:
             init_az = jcfg.initial_azimuth_deg
             init_el = jcfg.initial_elevation_deg
@@ -2218,7 +2232,7 @@ def optimize_multi_tx(
                                        dtype=torch.float32, requires_grad=True))
         jam_params.append(torch.tensor(float(init_pos[1]), device="cuda",
                                        dtype=torch.float32, requires_grad=True))
-        jam_params.append(torch.tensor(50.0, device="cuda",
+        jam_params.append(torch.tensor(40.0, device="cuda",
                                        dtype=torch.float32, requires_grad=True))
         jam_params.append(torch.tensor(jcfg.initial_power_dbm, device="cuda",
                                        dtype=torch.float32, requires_grad=True))
@@ -2390,7 +2404,7 @@ def optimize_multi_tx(
                     jam_params[joff[j] + 2].data.fill_(jx)
                     jam_params[joff[j] + 3].data.fill_(jy)
                     # Z clamp [30, 60]
-                    jam_params[joff[j] + 4].clamp_(5.0, 50.0)
+                    jam_params[joff[j] + 4].clamp_(30.0, 50.0)
                     jam_params[joff[j] + 5].clamp_(*jcfg.power_dbm_bounds)
                     jam_params[joff[j] + 1].clamp_(*jcfg.elevation_bounds)
                     # Clamp gate logit to prevent sigmoid saturation: a logit of
@@ -3496,19 +3510,25 @@ def plot_results_from_file(
 
     return fig_map, fig_cdf, stats
 
+import matplotlib.colors as mcolors
 
 def plot_multi_shape_grid(
     scene_dir: str,
     gamma_db: float = 0.0,
     standoff_m: float = 200.0,
-    save_pdf: str = None,
+    save_svg: str = None,
+    save_svg_dir: str = None,
+    panel_width: float = 2.5,
     col0_col1_extra_pad: float = 0.0,
     hspace: float = 0.06,
     wspace: float = 0.35,
-    sinr_zone: float = 0.35,
+    cb_zone: float = 0.65,
+    fig_width: float = 7.16,
     bottom: float = 0.10,
     left: float = 0.12,
     n_ticks: int = 3,
+    crop_half_m: float = None,
+    tick_half_m: float = None,
 ):
     """
     Build an N×3 publication figure from all shape runs under *scene_dir*.
@@ -3525,7 +3545,12 @@ def plot_multi_shape_grid(
     scene_dir  : directory containing shape subdirs + map_config.json
     gamma_db   : SINR threshold (dB) — norm centre for viridis panels
     standoff_m : outer-region standoff (m) — for autozoom margin
-    save_pdf   : write to PDF at this path when given
+    save_svg     : write the assembled grid to a single SVG at this path
+    save_svg_dir : directory in which to write one SVG per panel per shape.
+                   Files are named ``{shape_name}_{panel}.svg`` where panel is
+                   one of: initial, bs_only, delta_opt, bs_jam, delta_jam.
+    panel_width  : width (and height) in inches for each standalone panel SVG.
+                   Default 2.5.
     hspace     : row gap as a fraction of image height (not figure height).
                  Figure height is auto-computed so each row cell == image
                  height, preventing aspect='equal' stretching at small values.
@@ -3556,7 +3581,7 @@ def plot_multi_shape_grid(
     import matplotlib.gridspec as gridspec
     import matplotlib.ticker as mticker
     from matplotlib.backends.backend_pdf import PdfPages
-    from matplotlib.colors import TwoSlopeNorm, CenteredNorm
+    from matplotlib.colors import TwoSlopeNorm, CenteredNorm, Normalize, LinearSegmentedColormap
 
     FS = 9   # axis / colorbar labels (~10 pt in IEEE two-column)
     FS_T = 8 # tick labels
@@ -3644,39 +3669,43 @@ def plot_multi_shape_grid(
     sinr_norm = TwoSlopeNorm(vmin=gamma - 20, vcenter=gamma, vmax=gamma + 20)
     _step = 8
 
-    # Layout: 6-column GridSpec per row —
-    #   [img_init | img0 | img1 | sinr_zone | img2 | cb_delta]
+    # Layout: 8-column GridSpec per row —
+    #   [img_init | img0 | img_delta_opt | cb_delt_opt | img1 | cb_sinr | img2 | cb_delt]
     #
-    # img_init: initial (pre-optimization) BS-only SINR
-    # img0:     optimized BS-only SINR
-    # img1:     optimized BS+Jammer SINR
-    # sinr_zone: shared SINR colorbar for first 3 panels (wider than bare strip
-    #            so ticks/label never bleed into images; subdivided via nested
-    #            GridSpec)
-    # img2:     ΔSINR (jam − bs_only)
-    # cb_delta: delta colorbar (narrow, ticks overflow into right margin)
-    _CB_ZONE = sinr_zone  # SINR zone width ratio relative to one image column
-    _CB_BAR  = 0.25  # fraction of _CB_ZONE used for the actual gradient strip
-    _CB_DELT = 0.08  # delta colorbar column ratio
-
-    _FW, _L, _R, _T, _B = 7.16, left, 0.92, 0.98, bottom
-    _sum_r = 4 + _CB_ZONE + _CB_DELT
+    # All 3 colorbar columns share the same zone width (_CB_ZONE) so that the
+    # wspace gap provides equal visual spacing on both sides of every bar.
+    # Each zone is split [bar | right_space] via a nested GridSpec; the bar
+    # occupies _CB_BAR of the zone, sized so that ticks+label fill exactly the
+    # remaining space, making left_gap == right_gap == wspace contribution.
+    _CB_ZONE = cb_zone   # colorbar zone width as fraction of one image column
+    # Estimated pt needed beyond the bar right edge for ticks + label at FS_T=8
+    _LABEL_PT = 30.0
+    _FW, _L, _R, _T, _B = fig_width, left, 0.92, 0.98, bottom
+    _sum_r = 5 + 3 * _CB_ZONE
     # GridSpec col width: unit = inner_w / (sum_ratios * (1 + (ncols-1)*wspace/ncols))
-    _img_col_w_in = (_R - _L) * _FW / (_sum_r * (1 + 5 * wspace / 6))
+    _img_col_w_in = (_R - _L) * _FW / (_sum_r * (1 + 7 * wspace / 8))
     _fig_h = _img_col_w_in * (N + (N - 1) * hspace) / (_T - _B)
-    # Pre-compute a fixed label x-coord (in axes fraction) for the delta colorbar
-    # so all rows align regardless of per-row tick label widths.  Uses the
-    # worst-case 3-character tick label (e.g. "-10") as the reference width.
-    _delt_cbar_w_pt = _img_col_w_in * _CB_DELT * 72          # colorbar width in pt
-    _delt_label_x   = 1.0 + (1.8 * FS_T + 8.0) / _delt_cbar_w_pt
+    # Bar fraction: size bar so that label right-edge lands at zone right-edge,
+    # making left and right gaps equal (both equal the wspace contribution).
+    _zone_pt = _CB_ZONE * _img_col_w_in * 72
+    _CB_BAR  = max(0.05, min(0.5, 1.0 - _LABEL_PT / _zone_pt))
 
     fig = plt.figure(figsize=(_FW, _fig_h))
     gs = gridspec.GridSpec(
-        N, 6,
-        width_ratios=[1, 1, 1, _CB_ZONE, 1, _CB_DELT],
+        N, 8,
+        width_ratios=[1, 1, 1, _CB_ZONE, 1, _CB_ZONE, 1, _CB_ZONE],
         left=_L, right=_R, top=_T, bottom=_B,
         hspace=hspace, wspace=wspace,
     )
+
+    def _make_cax(spec):
+        """Thin bar on left of zone; ticks/label use the right portion."""
+        inner = gridspec.GridSpecFromSubplotSpec(
+            1, 2, subplot_spec=spec,
+            width_ratios=[_CB_BAR, 1.0 - _CB_BAR],
+            wspace=0,
+        )
+        return fig.add_subplot(inner[0, 0])
 
     def _imshow(ax, field, norm, cmap):
         return ax.imshow(
@@ -3725,6 +3754,10 @@ def plot_multi_shape_grid(
                                linewidths=1.0, zorder=7, alpha=0.6)
 
     def _autozoom(ax, zone_mask):
+        if crop_half_m is not None:
+            ax.set_xlim(cx_m - crop_half_m, cx_m + crop_half_m)
+            ax.set_ylim(cy_m - crop_half_m, cy_m + crop_half_m)
+            return
         r, c = np.where(zone_mask.astype(bool))
         if len(r) == 0:
             return
@@ -3740,20 +3773,14 @@ def plot_multi_shape_grid(
         xc = np.linspace(x_min + _step * cw / 2, x_max - _step * cw / 2, W_ds)
         yc = np.linspace(y_min + _step * ch / 2, y_max - _step * ch / 2, H_ds)
 
-        ax_init = fig.add_subplot(gs[ri, 0])
-        ax0     = fig.add_subplot(gs[ri, 1])
-        ax1     = fig.add_subplot(gs[ri, 2])
-        # Narrow bar on the left of the SINR zone; right portion stays empty
-        # white space so ticks and label never overlap ax1 or ax2.
-        _sinr_inner = gridspec.GridSpecFromSubplotSpec(
-            1, 2,
-            subplot_spec=gs[ri, 3],
-            width_ratios=[_CB_BAR, 1 - _CB_BAR],
-            wspace=0,
-        )
-        cax_sinr = fig.add_subplot(_sinr_inner[0, 0])
-        ax2      = fig.add_subplot(gs[ri, 4])
-        cax_delt = fig.add_subplot(gs[ri, 5])
+        ax_init      = fig.add_subplot(gs[ri, 0])
+        ax0          = fig.add_subplot(gs[ri, 1])
+        ax_delta_opt = fig.add_subplot(gs[ri, 2])
+        cax_delt_opt = _make_cax(gs[ri, 3])
+        ax1          = fig.add_subplot(gs[ri, 4])
+        cax_sinr     = _make_cax(gs[ri, 5])
+        ax2          = fig.add_subplot(gs[ri, 6])
+        cax_delt     = _make_cax(gs[ri, 7])
 
         if row["sinr_initial"] is not None:
             _imshow(ax_init, row["sinr_initial"], sinr_norm, "viridis")
@@ -3770,6 +3797,19 @@ def plot_multi_shape_grid(
                   bs_azimuths=row["bs_azimuths"])
         _autozoom(ax0, row["zone_mask"])
 
+        if row["sinr_initial"] is not None:
+            diff_opt = row["sinr_bs"] - row["sinr_initial"]
+            abs_max_opt = 10.0
+            im_dopt = _imshow(ax_delta_opt, diff_opt,
+                              CenteredNorm(vcenter=0.0, halfrange=30.0), "RdBu")
+            _overlays(ax_delta_opt, row["zone_mask"], row["bldg_mask"],
+                      row["bs_pos"], row["jam_pos"], xc, yc, show_j=False,
+                      bs_azimuths=row["bs_azimuths"], show_inactive_j=False)
+            _autozoom(ax_delta_opt, row["zone_mask"])
+        else:
+            ax_delta_opt.axis("off")
+            im_dopt = None
+
         if row["sinr_jam"] is not None:
             im1 = _imshow(ax1, row["sinr_jam"], sinr_norm, "viridis")
             _overlays(ax1, row["zone_mask"], row["bldg_mask"],
@@ -3784,7 +3824,7 @@ def plot_multi_shape_grid(
             diff = row["sinr_jam"] - row["sinr_bs"]
             abs_max = max(float(np.nanpercentile(np.abs(diff), 98)), 1.0)
             im2 = _imshow(ax2, diff,
-                          CenteredNorm(vcenter=0.0, halfrange=abs_max), "RdBu")
+                          CenteredNorm(vcenter=0.0, halfrange=30.0), "RdBu")
             _overlays(ax2, row["zone_mask"], row["bldg_mask"],
                       row["bs_pos"], row["jam_pos"], xc, yc, show_j=True,
                       bs_azimuths=row["bs_azimuths"], show_inactive_j=False)
@@ -3793,45 +3833,136 @@ def plot_multi_shape_grid(
             ax2.axis("off")
             im2 = None
 
-        # Shared SINR colorbar — ticks and label on the right, flowing into the
-        # empty white-space half of the SINR zone (never touching either image).
         def _cb(cax, im, label):
             cb = fig.colorbar(im, cax=cax)
-            cb.set_label(label, fontsize=FS_T)
-            cb.ax.tick_params(labelsize=FS_T)
+            cb.set_label(label, fontsize=FS_T, labelpad=3)
+            cb.ax.tick_params(labelsize=FS_T, pad=2)
             cb.locator = mticker.MaxNLocator(nbins=5)
             cb.update_ticks()
             return cb
 
+        def _diff_cb(cax, im, label, halfrange=30.0):
+            cb = fig.colorbar(im, cax=cax)
+            cb.set_label(label, fontsize=FS_T, labelpad=3)
+            cb.ax.tick_params(labelsize=FS_T, pad=2)
+            cb.locator = mticker.MaxNLocator(nbins=6, prune="both")
+            cb.update_ticks()
+            return cb
+
         _cb(cax_sinr, im1 if im1 is not None else im0, "SINR (dB)")
+        if im_dopt is not None:
+            _diff_cb(cax_delt_opt, im_dopt, "ΔSINR (dB)", halfrange=30.0)
+        else:
+            cax_delt_opt.set_visible(False)
         if im2 is not None:
-            _cb(cax_delt, im2, "ΔSINR (dB)").ax.yaxis.set_label_coords(_delt_label_x, 0.5)
+            _diff_cb(cax_delt, im2, "ΔSINR (dB)", halfrange=30.0)
         else:
             cax_delt.set_visible(False)
 
-        _loc = mticker.MaxNLocator(n_ticks, integer=False, prune="both")
+        if crop_half_m is not None:
+            _t = tick_half_m if tick_half_m is not None else crop_half_m
+            _xticks = np.linspace(cx_m - _t, cx_m + _t, n_ticks)
+            _yticks = np.linspace(cy_m - _t, cy_m + _t, n_ticks)
+            def _xloc(): return mticker.FixedLocator(_xticks)
+            def _yloc(): return mticker.FixedLocator(_yticks)
+        else:
+            def _xloc(): return mticker.MaxNLocator(n_ticks, integer=False, prune="both")
+            def _yloc(): return mticker.MaxNLocator(n_ticks, integer=False, prune="both")
 
         # Y-axis ticks on leftmost column only (no per-row label — handled by supylabel)
-        ax_init.tick_params(axis="y", labelsize=FS_T, length=3)
-        ax_init.yaxis.set_major_locator(_loc)
-        for ax in [ax0, ax1, ax2]:
+        ax_init.tick_params(axis="y", labelsize=FS_T, length=3, pad=5)
+        ax_init.yaxis.set_major_locator(_yloc())
+        for ax in [ax0, ax_delta_opt, ax1, ax2]:
             ax.tick_params(axis="y", labelleft=False, length=3)
-            ax.yaxis.set_major_locator(mticker.MaxNLocator(n_ticks, integer=False, prune="both"))
+            ax.yaxis.set_major_locator(_yloc())
 
         # X-axis ticks on bottom row only (no per-col label — handled by supxlabel)
-        for ax in [ax_init, ax0, ax1, ax2]:
-            ax.xaxis.set_major_locator(mticker.MaxNLocator(n_ticks, integer=False, prune="both"))
+        for ax in [ax_init, ax0, ax_delta_opt, ax1, ax2]:
+            ax.xaxis.set_major_locator(_xloc())
             if ri == N - 1:
-                ax.tick_params(axis="x", labelsize=FS_T, length=3)
+                ax.tick_params(axis="x", labelsize=FS_T, length=3, pad=5)
             else:
                 ax.tick_params(axis="x", labelbottom=False, length=3)
 
     fig.supxlabel("X (m)", fontsize=FS)
     fig.supylabel("Y (m)", fontsize=FS)
 
-    if save_pdf:
-        with PdfPages(save_pdf) as pdf:
-            pdf.savefig(fig, bbox_inches="tight", dpi=300)
-        print(f"Saved to {save_pdf}")
+    if save_svg:
+        fig.savefig(save_svg, format="svg", bbox_inches="tight")
+        print(f"Saved to {save_svg}")
+
+    if save_svg_dir is not None:
+        out_dir = pathlib.Path(save_svg_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for rd, row in zip(run_dirs, rows):
+            shape_name = rd.name
+            ds = row["sinr_bs"][::_step, ::_step]
+            H_ds, W_ds = ds.shape
+            xc = np.linspace(x_min + _step * cw / 2, x_max - _step * cw / 2, W_ds)
+            yc = np.linspace(y_min + _step * ch / 2, y_max - _step * ch / 2, H_ds)
+
+            _diff_cmap = LinearSegmentedColormap.from_list(
+                'RdYlGn_custom',
+                ['#dd3d2d', '#e2f397', '#04703b'],
+            )
+
+            panels = []
+            if row["sinr_initial"] is not None:
+                panels.append(("initial", row["sinr_initial"], sinr_norm, "viridis",
+                               row["initial_bs_pos"], [], row["initial_bs_azimuths"],
+                               False, True, "SINR (dB)"))
+            panels.append(("bs_only", row["sinr_bs"], sinr_norm, "viridis",
+                           row["bs_pos"], row["jam_pos"], row["bs_azimuths"],
+                           False, True, "SINR (dB)"))
+            if row["sinr_initial"] is not None:
+                diff_opt = row["sinr_bs"] - row["sinr_initial"]
+                panels.append(("delta_opt", diff_opt,
+                               CenteredNorm(vcenter=0.0, halfrange=40.0), _diff_cmap,
+                               row["bs_pos"], row["jam_pos"], row["bs_azimuths"],
+                               False, False, "ΔSINR (dB)"))
+            if row["sinr_jam"] is not None:
+                panels.append(("bs_jam", row["sinr_jam"], sinr_norm, "viridis",
+                               row["bs_pos"], row["jam_pos"], row["bs_azimuths"],
+                               True, True, "SINR (dB)"))
+                diff = row["sinr_jam"] - row["sinr_bs"]
+                panels.append(("delta_jam", diff,
+                               CenteredNorm(vcenter=0.0, halfrange=40.0), _diff_cmap,
+                               row["bs_pos"], row["jam_pos"], row["bs_azimuths"],
+                               True, False, "ΔSINR (dB)"))
+            if row["sinr_jam"] is not None and row["sinr_initial"] is not None:
+                diff_total = row["sinr_jam"] - row["sinr_initial"]
+                _cmap_vdiv = LinearSegmentedColormap.from_list(
+                    "viridis_div", [plt.cm.viridis(0.0), "white", plt.cm.viridis(1.0)])
+                panels.append(("delta_total", diff_total,
+                               CenteredNorm(vcenter=0.0, halfrange=40.0), _diff_cmap,
+                               row["bs_pos"], row["jam_pos"], row["bs_azimuths"],
+                               True, False, "ΔSINR (dB)"))
+
+            from mpl_toolkits.axes_grid1 import make_axes_locatable
+            for suffix, field, norm, cmap, bsp, jmp, azs, show_j, show_inact, cb_label in panels:
+                pfig, pax = plt.subplots(figsize=(panel_width, panel_width))
+                im = _imshow(pax, field, norm, cmap)
+                _overlays(pax, row["zone_mask"], row["bldg_mask"], bsp, jmp, xc, yc,
+                          show_j=show_j, bs_azimuths=azs, show_inactive_j=show_inact)
+                _autozoom(pax, row["zone_mask"])
+                pax.set_xlabel("X (m)", fontsize=FS)
+                pax.set_ylabel("Y (m)", fontsize=FS)
+                pax.tick_params(labelsize=FS_T, pad=5)
+                pax.xaxis.set_major_locator(_xloc())
+                pax.yaxis.set_major_locator(_yloc())
+                divider = make_axes_locatable(pax)
+                pcax = divider.append_axes("right", size="5%", pad=0.04)
+                cb = pfig.colorbar(im, cax=pcax)
+                cb.set_label(cb_label, fontsize=FS_T, labelpad=3)
+                cb.ax.tick_params(labelsize=FS_T, pad=2)
+                if cb_label == "ΔSINR (dB)":
+                    cb.locator = mticker.MaxNLocator(nbins=6, prune="both")
+                else:
+                    cb.locator = mticker.MaxNLocator(nbins=5)
+                cb.update_ticks()
+                svg_path = out_dir / f"{shape_name}_{suffix}.svg"
+                pfig.savefig(svg_path, format="svg", bbox_inches="tight")
+                plt.close(pfig)
+                print(f"Saved {svg_path}")
 
     return fig
