@@ -42,7 +42,10 @@ from drjit.auto import Float
 from shapely.affinity import scale as shapely_scale
 from shapely.geometry import Polygon as ShapelyPolygon
 from sklearn.cluster import HDBSCAN, DBSCAN
-from sionna.rt import load_scene, PathSolver, RadioMapSolver, Transmitter, Receiver, cpx_abs_square, AntennaArray
+from sionna.rt import (
+    load_scene, PathSolver, RadioMapSolver, Transmitter, Receiver,
+    cpx_abs_square, cpx_mul, cpx_add, AntennaArray,
+)
 
 from angle_utils import (
     azimuth_elevation_to_yaw_pitch,
@@ -986,9 +989,16 @@ def _setup_tx_state(scene, cfg: TxConfig, scene_xml_path: str, qrand) -> dict:
     }
 
 
-def _param_strides(tx_configs):
-    """Return (strides, offsets) for the gNB flat parameter list."""
-    strides = [6] * len(tx_configs)
+def _param_strides(tx_configs, num_tx_ant):
+    """Return (strides, offsets) for the gNB flat parameter list.
+
+    Each gNB contributes 6 + 2*num_tx_ant params:
+    [az, el, x, y, z, power_dbm, wr_0, wi_0, ..., wr_{M-1}, wi_{M-1}]
+    where (wr_m, wi_m) are raw (unnormalized) real/imag precoding weights
+    for tx antenna element m.
+    """
+    stride = 6 + 2 * num_tx_ant
+    strides = [stride] * len(tx_configs)
     offsets = [sum(strides[:k]) for k in range(len(strides))]
     return strides, offsets
 
@@ -1455,7 +1465,7 @@ def _visualize_dead_zone_pipeline(
     plt.close(fig)
 
 
-def _extract_per_rx_power(h_real, h_imag, tx_idx: int):
+def _extract_per_rx_power(h_real, h_imag, tx_idx: int, w_real, w_imag):
     """Return a TensorXf of shape (num_rx,) with power from tx_idx only.
 
     Stays in TensorXf throughout to preserve DrJit AD gradient tracking.
@@ -1463,11 +1473,28 @@ def _extract_per_rx_power(h_real, h_imag, tx_idx: int):
     severs the gradient chain — so we never do that conversion here.
 
     h_real shape: (num_rx, num_rx_ant, num_tx, num_tx_ant, num_paths) - DrJit TensorXf
+
+    w_real, w_imag: length-num_tx_ant lists of (already-normalized) DrJit Float
+    scalars — the precoding weight for each tx antenna element. Elements are
+    combined coherently (complex sum weighted by precoding) before squaring,
+    matching how RadioMapSolver applies its precoding_vec, so the two solvers
+    agree for any num_tx_ant (they only coincide by accident for num_tx_ant=1
+    under naive per-element power summation).
     """
-    hr = h_real[:, :, tx_idx:tx_idx + 1, :, :]
-    hi = h_imag[:, :, tx_idx:tx_idx + 1, :, :]
-    # Collapse num_paths, num_tx_ant, num_tx=1, num_rx_ant  →  shape (num_rx,)
-    return dr.sum(dr.sum(dr.sum(dr.sum(cpx_abs_square((hr, hi)), axis=-1), axis=-1), axis=-1), axis=-1)
+    hr_all = h_real[:, :, tx_idx:tx_idx + 1, :, :]
+    hi_all = h_imag[:, :, tx_idx:tx_idx + 1, :, :]
+    er = ei = None
+    for m in range(len(w_real)):
+        hr_m = hr_all[:, :, :, m, :]
+        hi_m = hi_all[:, :, :, m, :]
+        term = cpx_mul((hr_m, hi_m), (w_real[m], w_imag[m]))
+        if er is None:
+            er, ei = term
+        else:
+            er, ei = cpx_add((er, ei), term)
+    # Collapse num_paths, num_tx=1, num_rx_ant  →  shape (num_rx,)
+    power_per_path = cpx_abs_square((er, ei))
+    return dr.sum(dr.sum(dr.sum(power_per_path, axis=-1), axis=-1), axis=-1)
 
 
 def _sir_loss_body(
@@ -1488,6 +1515,7 @@ def _sir_loss_body(
     spread_min_dist=100.0,
     inside_margin_db=0.0,
     use_gate_logits=True,
+    num_tx_ant=1,
 ):
     """Containment SIR loss with hinge penalties.
 
@@ -1518,7 +1546,7 @@ def _sir_loss_body(
     deg2rad = Float(float(np.pi / 180.0))
     dr.disable_grad(deg2rad)
 
-    _, offsets = _param_strides(tx_configs)
+    strides, offsets = _param_strides(tx_configs, num_tx_ant)
 
     # ------------------------------------------------------------------
     # Build power-scale factors for each gNB (DrJit-differentiable)
@@ -1532,6 +1560,30 @@ def _sir_loss_body(
             (pow_i - Float(float(ref_powers_dbm[i]))) / Float(10.0),
         )
         pow_scales.append(scale_i)
+
+    # ------------------------------------------------------------------
+    # Build normalized (unit total power) precoding weights per gNB.
+    # Raw (wr_m, wi_m) pairs are unconstrained; L2-normalizing them here
+    # keeps the combining weight on the unit hypersphere without the
+    # phase-wraparound issues a polar (amplitude, phase) parameterization
+    # would need to guard against.
+    # ------------------------------------------------------------------
+    eps_prec = Float(1e-12)
+    dr.disable_grad(eps_prec)
+    prec_weights = []
+    for i, cfg in enumerate(tx_configs):
+        b = offsets[i] + 6
+        wr, wi = [], []
+        for m in range(num_tx_ant):
+            wr_m = all_params[b + 2 * m];     dr.enable_grad(wr_m.array)
+            wi_m = all_params[b + 2 * m + 1]; dr.enable_grad(wi_m.array)
+            wr.append(wr_m)
+            wi.append(wi_m)
+        norm = eps_prec
+        for m in range(num_tx_ant):
+            norm = norm + wr[m] * wr[m] + wi[m] * wi[m]
+        norm = dr.sqrt(norm)
+        prec_weights.append(([w / norm for w in wr], [w / norm for w in wi]))
 
     # ------------------------------------------------------------------
     # Set TX orientations and positions (independent jitter per axis)
@@ -1585,7 +1637,8 @@ def _sir_loss_body(
 
     tx_power_vecs = []
     for j in range(N):
-        p_raw = _extract_per_rx_power(h_real, h_imag, j)
+        w_real, w_imag = prec_weights[j]
+        p_raw = _extract_per_rx_power(h_real, h_imag, j, w_real, w_imag)
         tx_power_vecs.append(p_raw * pow_scales[j])
 
     dr.eval(*tx_power_vecs)
@@ -1594,7 +1647,7 @@ def _sir_loss_body(
     # ------------------------------------------------------------------
     # Compute total gNB parameter count correctly (per-config)
     # ------------------------------------------------------------------
-    total_gnb_params = 6 * len(tx_configs)
+    total_gnb_params = sum(strides)
     _, jam_offsets = _jam_param_strides(jam_configs)
 
     # ------------------------------------------------------------------
@@ -1658,9 +1711,14 @@ def _sir_loss_body(
         )
         jh_real, jh_imag = jam_paths.a
 
+        # Jammers use a single-element antenna array (no beamforming), so the
+        # precoding weight is the trivial single-element unit vector.
+        _jam_w_real, _jam_w_imag = [Float(1.0)], [Float(0.0)]
+        dr.disable_grad(_jam_w_real[0]); dr.disable_grad(_jam_w_imag[0])
+
         J = len(jam_configs)
         for j in range(J):
-            jp_raw = _extract_per_rx_power(jh_real, jh_imag, j)
+            jp_raw = _extract_per_rx_power(jh_real, jh_imag, j, _jam_w_real, _jam_w_imag)
             jam_power_vecs.append(jp_raw * jam_pow_scales[j] * jam_gates[j])
 
         dr.eval(*jam_power_vecs)
@@ -1828,24 +1886,27 @@ def _make_compute_sir_loss(
     spread_min_dist=100.0,
     inside_margin_db=0.0,
     use_gate_logits=True,
+    num_tx_ant=1,
 ):
     """Build and return the @dr.wrap-decorated SIR loss function.
 
     Uses exec() to produce a function with a *fixed* positional signature
     matching exactly the number of scalar parameters — required by @dr.wrap.
     The flat signature is: [gNB params...] + [jammer params...]
-    where each gNB contributes [az, el, x, y, z, power_dbm] and
-    each jammer contributes [x, y, z, power_dbm, gate_logit].
+    where each gNB contributes [az, el, x, y, z, power_dbm, wr_0, wi_0, ...,
+    wr_{M-1}, wi_{M-1}] (M = num_tx_ant) and each jammer contributes
+    [x, y, z, power_dbm, gate_logit].
     """
-    _, gnb_offsets = _param_strides(tx_configs)
+    _, gnb_offsets = _param_strides(tx_configs, num_tx_ant)
     jam_strides, jam_offsets = _jam_param_strides(jam_configs)
     total_jam_params = (jam_offsets[-1] + jam_strides[-1]) if jam_configs else 0
 
-    # gNB param names: p0, p1, ... layout: [az, el, x, y, z, power_dbm]
+    # gNB param names: p0, p1, ... layout: [az, el, x, y, z, power_dbm, w...]
+    gnb_stride = 6 + 2 * num_tx_ant
     arg_names = []
     for i, cfg in enumerate(tx_configs):
         b = gnb_offsets[i]
-        arg_names += [f"p{b}", f"p{b+1}", f"p{b+2}", f"p{b+3}", f"p{b+4}", f"p{b+5}"]
+        arg_names += [f"p{b+k}" for k in range(gnb_stride)]
 
     # Jammer param names: j0, j1, ... (appended after gNB params)
     for k in range(total_jam_params):
@@ -1872,7 +1933,8 @@ def _make_compute_sir_loss(
         f"                 lambda_spread=_lambda_spread,\n"
         f"                 spread_min_dist=_spread_min_dist,\n"
         f"                 inside_margin_db=_inside_margin_db,\n"
-        f"                 use_gate_logits=_use_gate_logits)\n"
+        f"                 use_gate_logits=_use_gate_logits,\n"
+        f"                 num_tx_ant=_num_tx_ant)\n"
     )
 
     globs = {
@@ -1903,6 +1965,7 @@ def _make_compute_sir_loss(
         "_spread_min_dist":  spread_min_dist,
         "_inside_margin_db": inside_margin_db,
         "_use_gate_logits":  use_gate_logits,
+        "_num_tx_ant":       num_tx_ant,
     }
     exec(func_code, globs)
     inner_fn = globs["_inner"]
@@ -1949,6 +2012,8 @@ def optimize_multi_tx(
     lr_position: float = None,
     lr_power: float = None,
     lr_scheduler: str = "cosine",
+    learn_precoding: bool = False,
+    lr_precoding: float = None,
 ) -> dict:
     """Jointly optimise N transmitters for SIR coverage.
 
@@ -2009,6 +2074,15 @@ def optimize_multi_tx(
         Half-side of the square outer sampling region in metres. The outside
         sample count scales with this area, so larger values produce more
         outside receivers. Default 500 m.
+    learn_precoding : bool
+        If True, per-tx-antenna-element precoding (beamforming) weights are
+        learned jointly with angle/position/power. If False (default), the
+        precoding vector is held fixed at the uniform, zero-phase baseline
+        (1/sqrt(num_tx_ant) per element) that RadioMapSolver also uses by
+        default, so downstream evaluation matches the optimizer exactly.
+    lr_precoding : float or None
+        Adam learning rate for precoding weights when learn_precoding=True.
+        Defaults to learning_rate.
 
     Returns
     -------
@@ -2164,6 +2238,7 @@ def optimize_multi_tx(
     p_solver.loop_mode = "evaluated"
 
     ref_powers_dbm = [s["tx_ref_power_dbm"] for s in tx_states]
+    num_tx_ant = int(scene.tx_array.num_ant)
 
     compute_sir_loss = _make_compute_sir_loss(
         N, tx_configs, tx_states, scene, p_solver,
@@ -2182,12 +2257,13 @@ def optimize_multi_tx(
         spread_min_dist=spread_min_dist,
         inside_margin_db=inside_margin_db,
         use_gate_logits=use_gate_logits,
+        num_tx_ant=num_tx_ant,
     )
 
     # ------------------------------------------------------------------
     # 5. Initialise PyTorch parameters
     # ------------------------------------------------------------------
-    _, offsets = _param_strides(tx_configs)
+    _, offsets = _param_strides(tx_configs, num_tx_ant)
     params = []
     for i, (cfg, state) in enumerate(zip(tx_configs, tx_states)):
         params.append(torch.tensor(state["initial_azimuth"],   device="cuda",
@@ -2202,6 +2278,15 @@ def optimize_multi_tx(
                                    device="cuda", dtype=torch.float32, requires_grad=True))
         params.append(torch.tensor(state["initial_power_dbm"], device="cuda",
                                    dtype=torch.float32, requires_grad=True))
+        # Precoding weights, one (real, imag) pair per tx antenna element.
+        # Baseline = uniform, zero-phase (1/sqrt(M)) — RadioMapSolver's own
+        # default — so learn_precoding=False reproduces today's physics
+        # exactly. Only learnable (requires_grad) when learn_precoding=True.
+        for _m in range(num_tx_ant):
+            params.append(torch.tensor(1.0 / np.sqrt(num_tx_ant), device="cuda",
+                                       dtype=torch.float32, requires_grad=learn_precoding))
+            params.append(torch.tensor(0.0, device="cuda",
+                                       dtype=torch.float32, requires_grad=learn_precoding))
 
     # Jammer params: [az, el, x, y, z, power_dbm, gate_logit] per jammer.
     zone_centroid = tx_states[0]["box_polygon"].centroid
@@ -2242,18 +2327,25 @@ def optimize_multi_tx(
         jam_params.append(torch.tensor(0.0, device="cuda",
                                        dtype=torch.float32, requires_grad=True))
 
-    _lr_pos = lr_position if lr_position is not None else learning_rate
-    _lr_pow = lr_power    if lr_power    is not None else learning_rate
+    _lr_pos  = lr_position   if lr_position   is not None else learning_rate
+    _lr_pow  = lr_power      if lr_power      is not None else learning_rate
+    _lr_prec = lr_precoding  if lr_precoding  is not None else learning_rate
 
     # Split params into groups so position/power can use independent LRs.
-    # Layout: BS params stride 6 [az, el, x, y, z, pow], jammer stride 7 [az, el, x, y, z, pow, gate].
-    angle_g, pos_g, pow_g, gate_g = [], [], [], []
+    # Layout: BS params stride 6+2M [az, el, x, y, z, pow, w_real x M, w_imag x M],
+    # jammer stride 7 [az, el, x, y, z, pow, gate].
+    angle_g, pos_g, pow_g, gate_g, prec_g = [], [], [], [], []
     if not freeze_bs:
         for i in range(N):
             b = offsets[i]
             angle_g.extend([params[b], params[b + 1]])
             pos_g.extend([params[b + 2], params[b + 3], params[b + 4]])
             pow_g.append(params[b + 5])
+    # Precoding is decoupled from freeze_bs — it can be learned independently
+    # of whether geometry/power are frozen.
+    for i in range(N):
+        b = offsets[i]
+        prec_g.extend(params[b + 6: b + 6 + 2 * num_tx_ant])
     for k in range(len(jam_configs or [])):
         j = k * 7
         angle_g.extend([jam_params[j], jam_params[j + 1]])
@@ -2266,6 +2358,7 @@ def optimize_multi_tx(
         {'params': pos_g,   'lr': _lr_pos},
         {'params': pow_g,   'lr': _lr_pow},
         {'params': gate_g,  'lr': learning_rate},
+        {'params': prec_g,  'lr': _lr_prec},
     ] if g['params']]
     optimizer = torch.optim.Adam(param_groups, betas=(0.9, 0.999))
     scheduler = (
@@ -2279,7 +2372,9 @@ def optimize_multi_tx(
     loss_history = []
     rm_solver    = RadioMapSolver()
 
-    # Buffers for final averaging (last 10 iterations)
+    # Buffers for final averaging (last 10 iterations). Precoding is
+    # deliberately NOT windowed-averaged here — see the finalization block
+    # below for why.
     final_bufs = {i: {"az": [], "el": [], "pow": []} for i in range(N)}
 
     # ------------------------------------------------------------------
@@ -2292,7 +2387,7 @@ def optimize_multi_tx(
         pvals = [float(p.item()) for p in params]
 
         # Apply current parameter values to scene (once for all TXs)
-        _, offsets = _param_strides(tx_configs)
+        _, offsets = _param_strides(tx_configs, num_tx_ant)
         for k, (cfg_k, state_k) in enumerate(zip(tx_configs, tx_states)):
             b = offsets[k]
             az_k, el_k = pvals[b], pvals[b + 1]
@@ -2486,6 +2581,32 @@ def optimize_multi_tx(
         state["best_angles"]    = [best_az, best_el]
         state["final_position"] = [final_x, final_y, final_z]
 
+        # Use the FINAL iteration's raw precoding values directly — do NOT
+        # window-average them the way az/el/pow are averaged above.
+        #
+        # The loss is exactly invariant under rotating a BS's entire
+        # precoding vector by a common phase (w_m -> w_m * e^{jth} for every
+        # element m simultaneously): |sum_m w_m h_m|^2 is unchanged since
+        # |e^{jth}| = 1. That makes the raw (wr_m, wi_m) vector's overall
+        # phase a flat direction with exactly zero gradient at every point
+        # along the whole trajectory — there is nothing keeping it from
+        # drifting iteration to iteration. Averaging RAW snapshots across a
+        # window before renormalizing sums vectors that may point in that
+        # drifting phase's different directions, which can partially cancel
+        # and land on a vector unrelated to any actual per-iteration weight
+        # (this is exactly what caused the RadioMapSolver eval SINR to
+        # diverge from the training loss's SINR once learn_precoding=True).
+        # Reading straight from the final params avoids the issue entirely,
+        # since it is exactly what the last training step's forward pass
+        # normalized and used.
+        prec_r = [float(params[b + 6 + 2 * m].item()) for m in range(num_tx_ant)]
+        prec_i = [float(params[b + 7 + 2 * m].item()) for m in range(num_tx_ant)]
+        prec_norm = float(np.sqrt(sum(r * r + im * im for r, im in zip(prec_r, prec_i)) + 1e-12))
+        state["best_precoding"] = {
+            "real": [float(r / prec_norm) for r in prec_r],
+            "imag": [float(im / prec_norm) for im in prec_i],
+        }
+
     # Remove optimization receivers
     for rx_name in list(rx_objects.keys()):
         if rx_name in [obj.name for obj in scene.receivers.values()]:
@@ -2509,6 +2630,7 @@ def optimize_multi_tx(
         entry["best_power_dbm"]   = state["best_power_dbm"]
         entry["initial_power_dbm"] = state["initial_power_dbm"]
         entry["power_history"]    = state["power_history"]
+        entry["best_precoding"]   = state["best_precoding"]
         result[cfg.name] = entry
 
     result["joint"] = {
@@ -2520,6 +2642,8 @@ def optimize_multi_tx(
         "sampling_strata": sampling_strata,
         "lds":             lds,
         "use_gate_logits": use_gate_logits,
+        "learn_precoding": learn_precoding,
+        "num_tx_ant":      num_tx_ant,
     }
 
     # ------------------------------------------------------------------
@@ -2618,6 +2742,21 @@ def compare_multi_tx_performance(
     N = len(tx_configs)
     gamma_db = float(gamma_db)
 
+    # Precoding vector for the optimized BS RadioMap pass, built from each
+    # TX's best_precoding so RadioMapSolver combines antenna elements with
+    # exactly the same weights the optimizer's own loss used — falls back to
+    # RadioMapSolver's own uniform default for any TX missing the key (e.g.
+    # results produced before this field existed).
+    num_tx_ant = int(scene.tx_array.num_ant)
+    prec_real = np.full((N, num_tx_ant), 1.0 / np.sqrt(num_tx_ant), dtype=np.float32)
+    prec_imag = np.zeros((N, num_tx_ant), dtype=np.float32)
+    for i, cfg in enumerate(tx_configs):
+        bp = multi_result[cfg.name].get("best_precoding")
+        if bp is not None:
+            prec_real[i, :] = bp["real"]
+            prec_imag[i, :] = bp["imag"]
+    precoding_vec = (mi.TensorXf(prec_real), mi.TensorXf(prec_imag))
+
     def _watts_to_db(w):
         return 10.0 * np.log10(np.maximum(w, 1e-18))
 
@@ -2651,6 +2790,7 @@ def compare_multi_tx_performance(
             edge_diffraction=True,
             refraction=False,
             stop_threshold=None,
+            precoding_vec=precoding_vec,
         )
 
     def _bs_sinr_field(rss_list_2d, jam_map=None):
