@@ -885,7 +885,8 @@ def _make_qrand(lds: str):
         return scipy.stats.qmc.Halton(d=3, scramble=False, seed=None)
 
 
-def _setup_tx_state(scene, cfg: TxConfig, scene_xml_path: str, qrand) -> dict:
+def _setup_tx_state(scene, cfg: TxConfig, scene_xml_path: str, qrand,
+                    obstacles) -> dict:
     """Initialise geometry and sampling infrastructure for one TX."""
     tx = scene.get(cfg.name)
 
@@ -923,22 +924,31 @@ def _setup_tx_state(scene, cfg: TxConfig, scene_xml_path: str, qrand) -> dict:
     else:
         box_polygon = ShapelyPolygon(cfg.zone_params["vertices"])
 
-    cached_building_polygons = []
-    for bcoords in building_exclusions:
-        try:
-            p = ShapelyPolygon(bcoords)
-            if p.is_valid:
-                cached_building_polygons.append(p)
-        except Exception:
-            pass
+    # Every building in the scene, not just those touching this zone: BSs and
+    # jammers move outside the zone, and the outside-receiver ring extends far
+    # beyond it, so all of them must avoid every footprint. Receivers sit at
+    # ground level, so they use the 2-D union of all footprints.
+    cached_building_polygons = obstacles.footprints
+    building_union = obstacles.union_all
 
     zone_polygon = (
-        box_polygon.difference(shapely.ops.unary_union(cached_building_polygons))
-        if cached_building_polygons else box_polygon
+        box_polygon.difference(building_union)
+        if building_union is not None else box_polygon
     )
 
     tri_verts_full, _ = triangulate_zone(target_zone, building_exclusions)
     tri_full_prepared = prepare_triangulated_sampler(tri_verts_full)
+
+    # A free-roaming BS seeded inside a building volume is moved out now,
+    # before its initial boresight is computed, so iteration 0 already starts
+    # from a valid position (the post-step projection would only fix it
+    # afterwards). A BS seeded above the roof is left where it is.
+    if not cfg.on_building:
+        nx, ny, nz = obstacles.push(tx_x, tx_y, tx_z, z_max=_NODE_Z_MAX)
+        if (nx, ny, nz) != (tx_x, tx_y, tx_z):
+            tx_x, tx_y, tx_z = nx, ny, nz
+            tx_position = [tx_x, tx_y, tx_z]
+            tx.position = mi.Point3f(float(tx_x), float(tx_y), float(tx_z))
 
     # Initial angles -------------------------------------------------------
     target_z = 1.5
@@ -968,6 +978,8 @@ def _setup_tx_state(scene, cfg: TxConfig, scene_xml_path: str, qrand) -> dict:
         "target_zone":            target_zone,
         "building_exclusions":    building_exclusions,
         "cached_building_polygons": cached_building_polygons,
+        "building_union":         building_union,
+        "obstacles":              obstacles,
         "tri_verts_full":         tri_verts_full,
         "tri_full_prepared":      tri_full_prepared,
         "qrand":                  qrand,
@@ -1016,14 +1028,133 @@ def _jam_param_strides(jam_configs):
     return strides, offsets
 
 
-def _push_outside_buildings(x, y, building_polygons):
-    """If (x, y) is inside any building polygon, snap it to the nearest exterior point."""
+def _union_of_footprints(footprints):
+    """Union of building footprints for containment/snap queries; None if empty.
+
+    Grow-then-shrink by 10 cm fuses footprints that share a wall but are
+    separated by a hairline crack. Left as-is, the union keeps the crack as
+    boundary, so the nearest "wall" to a point inside is the crack and a push
+    through it lands in the neighbouring building instead of outside.
+    """
+    if not footprints:
+        return None
+    return shapely.ops.unary_union(footprints).buffer(0.1).buffer(-0.1)
+
+
+def _push_outside_buildings(x, y, building_union):
+    """Move (x, y) out of every building footprint; unchanged if already outside.
+
+    `building_union` is the union of all footprints, or None. Snapping to the
+    union's boundary (rather than one polygon's exterior) can't land inside an
+    adjacent or overlapping building. The point is then nudged a hair past the
+    wall, because a point computed exactly on a boundary can still test as
+    "inside" through float rounding.
+    """
+    if building_union is None:
+        return x, y
     pt = shapely.geometry.Point(x, y)
-    for bp in building_polygons:
-        if bp.contains(pt):
-            nearest = shapely.ops.nearest_points(pt, bp.exterior)[1]
-            return nearest.x, nearest.y
-    return x, y
+    eps = 1e-3
+    for _ in range(4):
+        if not building_union.contains(pt):
+            break
+        wall = shapely.ops.nearest_points(pt, building_union.boundary)[1]
+        d = float(np.hypot(wall.x - pt.x, wall.y - pt.y))
+        ux, uy = ((wall.x - pt.x) / d, (wall.y - pt.y) / d) if d > 0 else (0.0, 0.0)
+        pt = shapely.geometry.Point(wall.x + eps * ux, wall.y + eps * uy)
+        eps *= 10.0
+    return pt.x, pt.y
+
+
+_ROOF_CLEARANCE_M = 1.0   # a node must sit this far above a roof to fly over it
+_NODE_Z_MAX = 50.0        # the z clamp applied to BS and jammer altitudes
+_JAM_INIT_Z = 50.0        # altitude every jammer starts at
+_PIN_TOL_M = 0.05         # projection moved a node more than this => it was pinned
+
+
+class _BuildingObstacles:
+    """Building footprints with roof heights, for 3-D node-placement checks.
+
+    A node at (x, y, z) is inside a building when (x, y) lies in its footprint
+    AND z is below the roof (plus a clearance), so a node above the roof may
+    fly over it. Ground-level receivers use `union_all`, the 2-D union of every
+    footprint.
+    """
+
+    def __init__(self, footprints, roof_heights, clearance=_ROOF_CLEARANCE_M):
+        self.footprints = list(footprints)
+        self.roofs = np.asarray(roof_heights, dtype=float)
+        self.clearance = float(clearance)
+        self.union_all = _union_of_footprints(self.footprints)
+        self._levels = np.unique(self.roofs)
+        self._blocking = {}
+
+    def _blocking_union(self, z):
+        """Union of footprints whose roof (+clearance) is above altitude z.
+
+        Cached per distinct roof height, so at most one union is built for each
+        altitude band the nodes actually visit.
+        """
+        k = int(np.searchsorted(self._levels, z - self.clearance, side="right"))
+        if k >= len(self._levels):
+            return None  # above every roof
+        if k not in self._blocking:
+            keep = self.roofs >= self._levels[k]
+            self._blocking[k] = _union_of_footprints(
+                [p for p, kp in zip(self.footprints, keep) if kp]
+            )
+        return self._blocking[k]
+
+    def _roof_at(self, x, y):
+        pt = shapely.geometry.Point(x, y)
+        return max((r for p, r in zip(self.footprints, self.roofs)
+                    if p.contains(pt)), default=0.0)
+
+    def push(self, x, y, z, z_max=None):
+        """Move (x, y, z) out of any building volume it is inside.
+
+        Picks the nearer of two exits: sideways to the wall at this altitude, or
+        straight up to just above the roof (only if that stays within z_max).
+        Nodes already outside every building volume are returned unchanged.
+        """
+        for _ in range(3):
+            blocking = self._blocking_union(z)
+            if blocking is None or not blocking.contains(shapely.geometry.Point(x, y)):
+                break
+            hx, hy = _push_outside_buildings(x, y, blocking)
+            roof = self._roof_at(x, y)
+            z_up = roof + self.clearance + 1e-3
+            if (roof > 0.0 and z_max is not None and z_up <= z_max
+                    and (z_up - z) < float(np.hypot(hx - x, hy - y))):
+                z = z_up
+            else:
+                x, y = hx, hy
+        return x, y, z
+
+
+def _load_building_obstacles(scene_xml_path):
+    """Every building in the scene as a _BuildingObstacles.
+
+    Deliberately NOT limited to buildings touching a zone (unlike
+    get_zone_polygon_with_exclusions): BSs and jammers roam outside the zone,
+    so placement checks must know every building. Self-intersecting footprints
+    are repaired rather than dropped so no building escapes them; each repaired
+    part keeps the building's roof height.
+    """
+    from scene_parser import extract_building_info
+
+    footprints, roofs = [], []
+    for info in extract_building_info(scene_xml_path, verbose=False).values():
+        try:
+            geom = ShapelyPolygon([(v[0], v[1]) for v in info["vertices"]])
+        except Exception:
+            continue
+        if not geom.is_valid:
+            geom = shapely.make_valid(geom)
+        for g in getattr(geom, "geoms", [geom]):
+            if g.geom_type == "Polygon" and not g.is_empty:
+                footprints.append(g)
+                roofs.append(float(info["z_height"]))
+    return _BuildingObstacles(footprints, roofs)
 
 
 def _sample_zone_points(state: dict, cfg: TxConfig, n: int,
@@ -1184,9 +1315,8 @@ def _sample_outside_zone(state: dict, n_inside: int, ground_z: float,
     ])
     outer_ring = outer_poly.difference(box_poly)
 
-    cached_bldgs = state.get("cached_building_polygons", [])
-    if cached_bldgs:
-        bldg_union = shapely.ops.unary_union(cached_bldgs)
+    bldg_union = state.get("building_union")
+    if bldg_union is not None:
         outer_ring = outer_ring.difference(bldg_union)
 
     zone_area = box_poly.area
@@ -2037,12 +2167,24 @@ def optimize_multi_tx(
         Optional callable invoked at the end of every iteration, after dead
         zones are accumulated and sample points are placed.  Signature::
 
-            callback(iteration: int, tx_states: list, tx_configs: list)
+            callback(iteration, tx_states, tx_configs, jam_positions=...,
+                     jam_state=..., scene=..., jam_scene=..., loss=...,
+                     precoding_vec=...)
 
         Each state dict will have ``current_tx_position`` set to the
         transmitter's current [x, y, z] coordinates for that iteration.
-        Use ``visualize_multi_tx_strata`` from ``boresight_pathsolver`` as a
-        ready-made callback.
+        ``scene``/``jam_scene`` are refreshed with this iteration's post-step
+        values before the callback runs, so a callback can safely run a
+        RadioMapSolver pass against them. ``jam_state`` is a list of dicts
+        (name/azimuth_deg/elevation_deg/position/power_dbm/gate/active), one
+        per jammer, mirroring the final result's jammer entries.
+        ``precoding_vec`` is this iteration's current (normalised) per-TX
+        precoding weights in RadioMapSolver's own ``(TensorXf real, TensorXf
+        imag)`` format — pass it straight through as that solver's
+        ``precoding_vec=`` kwarg to match the training loss's SIR exactly,
+        even under ``learn_precoding=True``.
+        Use ``visualize_multi_tx_strata`` from ``boresight_pathsolver`` or
+        ``make_coverage_gif_callback`` (below) as ready-made callbacks.
     gamma_db : float
         Detection threshold in dB. Cells above/below this drive the hinge losses.
     lambda_in, lambda_out : float
@@ -2118,7 +2260,8 @@ def optimize_multi_tx(
     # 1. Build per-TX state dicts
     # ------------------------------------------------------------------
     qrand_shared = _make_qrand(lds)  # shared LDS instance
-    tx_states = [_setup_tx_state(scene, cfg, scene_xml_path, qrand_shared)
+    obstacles = _load_building_obstacles(scene_xml_path)
+    tx_states = [_setup_tx_state(scene, cfg, scene_xml_path, qrand_shared, obstacles)
                  for cfg in tx_configs]
 
     # ------------------------------------------------------------------
@@ -2184,6 +2327,9 @@ def optimize_multi_tx(
             else:
                 jx = float(random.randrange(int(lower_bound_x), int(upper_bound_x), 1))
                 jy = float(random.randrange(int(lower_bound_y), int(upper_bound_y), 1))
+            # Seeds (supplied or random) must not start inside a building
+            # volume; jammers start at _JAM_INIT_Z, which clears most roofs.
+            jx, jy, _ = obstacles.push(jx, jy, _JAM_INIT_Z, z_max=_NODE_Z_MAX)
             pos = mi.Point3f([jx, jy, 25.0])
             jammer = Transmitter(name=jcfg.name, position=pos,
                                 power_dbm=jcfg.initial_power_dbm)
@@ -2265,9 +2411,6 @@ def optimize_multi_tx(
         params.append(torch.tensor(state["initial_power_dbm"], device="cuda",
                                    dtype=torch.float32, requires_grad=True))
         # Precoding weights, one (real, imag) pair per tx antenna element.
-        # Baseline = uniform, zero-phase (1/sqrt(M)) — RadioMapSolver's own
-        # default — so learn_precoding=False reproduces today's physics
-        # exactly. Only learnable (requires_grad) when learn_precoding=True.
         for _m in range(num_tx_ant):
             params.append(torch.tensor(1.0 / np.sqrt(num_tx_ant), device="cuda",
                                        dtype=torch.float32, requires_grad=learn_precoding))
@@ -2281,7 +2424,7 @@ def optimize_multi_tx(
     for jcfg in (jam_configs or []):
         jammer = jam_objects[jcfg.name]
         init_pos = jammer.position.numpy().flatten()
-        init_pos_3d = [float(init_pos[0]), float(init_pos[1]), 50.0]
+        init_pos_3d = [float(init_pos[0]), float(init_pos[1]), _JAM_INIT_Z]
         if jcfg.initial_azimuth_deg is not None and jcfg.initial_elevation_deg is not None:
             init_az = jcfg.initial_azimuth_deg
             init_el = jcfg.initial_elevation_deg
@@ -2303,7 +2446,7 @@ def optimize_multi_tx(
                                        dtype=torch.float32, requires_grad=True))
         jam_params.append(torch.tensor(float(init_pos[1]), device="cuda",
                                        dtype=torch.float32, requires_grad=True))
-        jam_params.append(torch.tensor(50.0, device="cuda",
+        jam_params.append(torch.tensor(_JAM_INIT_Z, device="cuda",
                                        dtype=torch.float32, requires_grad=True))
         jam_params.append(torch.tensor(jcfg.initial_power_dbm, device="cuda",
                                        dtype=torch.float32, requires_grad=True))
@@ -2362,6 +2505,17 @@ def optimize_multi_tx(
     # deliberately NOT windowed-averaged here — see the finalization block
     # below for why.
     final_bufs = {i: {"az": [], "el": [], "pow": []} for i in range(N)}
+
+    # Building projection for free-roaming nodes. Counts the steps each node's
+    # projection had to move it (the gradient was pushing it into a building),
+    # reported in the result as "building_pinned_steps".
+    pin_total: dict = {}
+
+    def _project_free_node(name, x, y, z):
+        px, py, pz = obstacles.push(x, y, z, z_max=_NODE_Z_MAX)
+        if float(np.sqrt((px - x) ** 2 + (py - y) ** 2 + (pz - z) ** 2)) > _PIN_TOL_M:
+            pin_total[name] = pin_total.get(name, 0) + 1
+        return px, py, pz
 
     # ------------------------------------------------------------------
     # 7. Optimisation loop
@@ -2450,28 +2604,32 @@ def optimize_multi_tx(
                     x_t.data.fill_(proj_x)
                     y_t.data.fill_(proj_y)
                 else:
-                   # Keep free-roaming TXs outside building footprints.
-                    bldgs = state["cached_building_polygons"]
-                    if bldgs:
-                        px, py = _push_outside_buildings(x_t.item(), y_t.item(), bldgs)
-                        x_t.data.fill_(px)
-                        y_t.data.fill_(py)
+                    # Keep free-roaming TXs out of every building volume: inside
+                    # a footprint AND below the roof. Above the roof is fine.
+                    px, py, pz = _project_free_node(
+                        cfg.name, x_t.item(), y_t.item(), params[b + 4].item()
+                    )
+                    x_t.data.fill_(px)
+                    y_t.data.fill_(py)
+                    params[b + 4].data.fill_(pz)
 
                 # Z clamp [40, 50]
                 params[b + 4].clamp_(40.0, 50.0)
                 # Power clamp
                 params[b + 5].clamp_(*cfg.power_dbm_bounds)
 
-            # Clamp jammer positions outside building footprints and power to bounds.
+            # Clamp jammer positions outside building volumes and power to bounds.
             if jam_configs:
                 _, joff = _jam_param_strides(jam_configs)
-                bldgs = tx_states[0]["cached_building_polygons"] if tx_states else []
-                zone_poly = tx_states[0].get("zone_polygon") if tx_states else None
+                # The coverage zone itself, NOT zone minus buildings: jammers may
+                # fly over buildings, and a jammer over an in-zone building would
+                # sit in one of that polygon's holes and slip past the exclusion.
+                zone_poly = tx_states[0].get("box_polygon") if tx_states else None
                 for j, jcfg in enumerate(jam_configs):
                     jx = jam_params[joff[j] + 2].item()
                     jy = jam_params[joff[j] + 3].item()
-                    if bldgs:
-                        jx, jy = _push_outside_buildings(jx, jy, bldgs)
+                    jz = jam_params[joff[j] + 4].item()
+                    jx, jy, jz = _project_free_node(jcfg.name, jx, jy, jz)
                     # Keep jammers outside the coverage zone so they can't
                     # degrade inside SINR, which would starve gate gradients
                     # and cause sigmoid saturation on the logit.
@@ -2482,8 +2640,12 @@ def optimize_multi_tx(
                             shapely.geometry.Point(jx, jy), zone_poly.boundary
                         )[1]
                         jx, jy = nearest.x, nearest.y
+                        # The snap can land on a wall; re-check so the result is
+                        # guaranteed outside every building volume.
+                        jx, jy, jz = obstacles.push(jx, jy, jz, z_max=_NODE_Z_MAX)
                     jam_params[joff[j] + 2].data.fill_(jx)
                     jam_params[joff[j] + 3].data.fill_(jy)
+                    jam_params[joff[j] + 4].data.fill_(jz)
                     # Z clamp [30, 60]
                     jam_params[joff[j] + 4].clamp_(5.0, 50.0)
                     jam_params[joff[j] + 5].clamp_(*jcfg.power_dbm_bounds)
@@ -2525,17 +2687,78 @@ def optimize_multi_tx(
             ]
 
         if on_iteration_callback is not None:
+            # Push this iteration's post-step values into the plain-float
+            # scene objects. The differentiable forward pass above only sets
+            # these from the *pre*-step params (see top of loop), so without
+            # this refresh anything reading `scene`/`jam_scene` here (e.g. a
+            # coverage-map callback) would see values one iteration stale.
+            for i, cfg in enumerate(tx_configs):
+                b = offsets[i]
+                yaw_c, pitch_c = azimuth_elevation_to_yaw_pitch(
+                    float(params[b].item()), float(params[b + 1].item())
+                )
+                scene.get(cfg.name).orientation = mi.Point3f(
+                    float(yaw_c), float(pitch_c), 0.0
+                )
+                scene.get(cfg.name).position = mi.Point3f(
+                    *tx_states[i]["current_tx_position"]
+                )
+                scene.get(cfg.name).power_dbm = [float(params[b + 5].item())]
+
+            # Current (normalised) precoding weights per TX, in the exact
+            # RadioMapSolver `precoding_vec` shape/format so a callback can
+            # feed them straight into a RadioMap pass that matches this
+            # iteration's SIR computation, even mid-training under
+            # learn_precoding=True. Cheap to build even when precoding is
+            # fixed (learn_precoding=False) — those params never move off
+            # the initial uniform value.
+            prec_real = np.empty((len(tx_configs), num_tx_ant), dtype=np.float32)
+            prec_imag = np.empty((len(tx_configs), num_tx_ant), dtype=np.float32)
+            for i, cfg in enumerate(tx_configs):
+                b  = offsets[i]
+                pr = [float(params[b + 6 + 2 * m].item()) for m in range(num_tx_ant)]
+                pi = [float(params[b + 7 + 2 * m].item()) for m in range(num_tx_ant)]
+                pn = float(np.sqrt(sum(r * r + im * im for r, im in zip(pr, pi)) + 1e-12))
+                prec_real[i, :] = [r / pn for r in pr]
+                prec_imag[i, :] = [im / pn for im in pi]
+            precoding_vec = (mi.TensorXf(prec_real), mi.TensorXf(prec_imag))
+
+            jam_positions = []
+            jam_state = []
             if jam_configs:
                 _, joff = _jam_param_strides(jam_configs)
-                jam_positions = [
-                    [float(jam_params[joff[j] + 2].item()),
-                     float(jam_params[joff[j] + 3].item())]
-                    for j in range(len(jam_configs))
-                ]
-            else:
-                jam_positions = []
+                for j, jcfg in enumerate(jam_configs):
+                    b = joff[j]
+                    jaz = float(jam_params[b].item())
+                    jel = float(jam_params[b + 1].item())
+                    jx  = float(jam_params[b + 2].item())
+                    jy  = float(jam_params[b + 3].item())
+                    jz  = float(jam_params[b + 4].item())
+                    jpw = float(jam_params[b + 5].item())
+                    jgl = float(jam_params[b + 6].item())
+                    jgate = 1.0 / (1.0 + np.exp(-jgl)) if use_gate_logits else 1.0
+                    jam_positions.append([jx, jy])
+                    jam_state.append({
+                        "name": jcfg.name,
+                        "azimuth_deg": jaz, "elevation_deg": jel,
+                        "position": [jx, jy, jz],
+                        "power_dbm": jpw,
+                        "gate": jgate,
+                        "active": jgate >= 0.5,
+                    })
+                    if jam_scene is not None:
+                        yaw_j, pitch_j = azimuth_elevation_to_yaw_pitch(jaz, jel)
+                        jam_scene.get(jcfg.name).orientation = mi.Point3f(
+                            float(yaw_j), float(pitch_j), 0.0
+                        )
+                        jam_scene.get(jcfg.name).position = mi.Point3f(jx, jy, jz)
+                        jam_scene.get(jcfg.name).power_dbm = [jpw]
             on_iteration_callback(iteration, tx_states, tx_configs,
-                                  jam_positions=jam_positions)
+                                  jam_positions=jam_positions,
+                                  jam_state=jam_state,
+                                  scene=scene, jam_scene=jam_scene,
+                                  loss=loss_val,
+                                  precoding_vec=precoding_vec)
 
         if verbose:
             dur = time.time() - iter_start
@@ -2630,6 +2853,10 @@ def optimize_multi_tx(
         "use_gate_logits": use_gate_logits,
         "learn_precoding": learn_precoding,
         "num_tx_ant":      num_tx_ant,
+        # Steps each node's building projection had to move it, i.e. steps the
+        # gradient pushed it into a building volume. Nodes that never touched
+        # one are absent.
+        "building_pinned_steps": dict(pin_total),
     }
 
     # ------------------------------------------------------------------
@@ -2688,6 +2915,36 @@ def optimize_multi_tx(
         print(f"{'='*70}\n")
 
     return result, jam_scene if jam_configs else None
+
+
+# Solid building fill shared by every figure; matches the raster-mask plots
+# (plot_results_from_file / plot_multi_shape_grid), which use this same gray.
+_BUILDING_FILL_COLOR = "#797878"
+
+
+def _draw_building_footprints(ax, building_polygons, zorder=3):
+    """Draw footprints as one solid-filled artist with a thin black outline.
+
+    Courtyard holes stay open. Adds a single "Buildings" legend entry.
+    """
+    from matplotlib.patches import PathPatch
+    from matplotlib.path import Path
+    from shapely.geometry.polygon import orient
+
+    verts, codes = [], []
+    for geom in building_polygons:
+        for bp in getattr(geom, "geoms", [geom]):
+            # Exterior CCW / holes CW, so the fill leaves holes unfilled.
+            bp = orient(bp, 1.0)
+            for ring in (bp.exterior, *bp.interiors):
+                xy = np.asarray(ring.coords)
+                verts.extend(xy)
+                codes.extend([Path.MOVETO] + [Path.LINETO] * (len(xy) - 2)
+                             + [Path.CLOSEPOLY])
+    if verts:
+        ax.add_patch(PathPatch(Path(verts, codes), facecolor=_BUILDING_FILL_COLOR,
+                               edgecolor="black", linewidth=0.5, zorder=zorder,
+                               label="Buildings"))
 
 
 # ---------------------------------------------------------------------------
@@ -3113,26 +3370,15 @@ def compare_multi_tx_performance(
             H_ds, W_ds = mask_ds.shape
             x_coords = np.linspace(x_min + _step * cw / 2, x_max - _step * cw / 2, W_ds)
             y_coords = np.linspace(y_min + _step * ch / 2, y_max - _step * ch / 2, H_ds)
+            # zorder 4: zone boundary stays visible on top of the solid buildings.
             ax.contour(x_coords, y_coords, mask_ds, levels=[0.5],
-                       colors=["black"], linewidths=lw, linestyles="-")
+                       colors=["black"], linewidths=lw, linestyles="-", zorder=4)
             ax.plot([], [], color="black", linestyle="-", linewidth=lw, label=cfg.name)
 
-        # Building footprint outlines — drawn in world coordinates from the
+        # Solid building footprints, drawn in world coordinates from the
         # Shapely polygons, so no rasterization step is needed.
         if building_polygons:
-            _bldg_added = False
-            for bp in building_polygons:
-                bx_poly, by_poly = bp.exterior.xy
-                kw = dict(color="dimgray", linewidth=0.7, linestyle="-",
-                          alpha=0.75, zorder=3)
-                if not _bldg_added:
-                    ax.plot(bx_poly, by_poly, label="Buildings", **kw)
-                    _bldg_added = True
-                else:
-                    ax.plot(bx_poly, by_poly, **kw)
-                for interior in bp.interiors:
-                    ix, iy = interior.xy
-                    ax.plot(ix, iy, **kw)
+            _draw_building_footprints(ax, building_polygons, zorder=3)
 
         # BS and jammer markers plotted directly in world coordinates.
         _bs_colors = ["lime", "cyan", "orange", "hotpink"]
@@ -3237,6 +3483,380 @@ def compare_multi_tx_performance(
     ax_cdf.legend(fontsize=8, loc="lower right"); ax_cdf.grid(True, alpha=0.3)
     fig_cdf.tight_layout()
     return fig_map, fig_cdf, stats
+
+
+# ---------------------------------------------------------------------------
+# Per-iteration coverage-map GIF
+# ---------------------------------------------------------------------------
+#
+# render_coverage_frame() draws one SINR map in the same visual style as
+# compare_multi_tx_performance()'s map panel (RdBu_r SINR field, zone
+# contours, building outlines, BS/jammer markers, autozoom). It is kept
+# independent from compare_multi_tx_performance() rather than refactored out
+# of it, so that function's tested output for reproducing paper results
+# can't be affected by this add-on.
+#
+# make_coverage_gif_callback() wraps it into an `on_iteration_callback` for
+# optimize_multi_tx(), and frames_to_gif() assembles the saved PNGs into an
+# animated GIF at a chosen frame rate.
+
+# Marker colors are defined once and shared by the frame renderer and the GIF
+# encoder: frames_to_gif() reserves these exact colors in its shared palette so
+# they can't drift between frames (see its docstring).
+_BS_MARKER_COLORS = ["lime", "cyan", "orange", "hotpink"]
+_JAM_ON_COLOR, _JAM_OFF_COLOR = "yellow", "grey"
+
+
+def _sinr_field_from_rss(rss_list_2d, noise_power, jam_map=None):
+    """Best-SINR-over-TX field in dB, mirroring the training loss's formula:
+    SINR_i(r) = P_BS_i / (noise + sum_{j!=i} P_BS_j + jammer power).
+    """
+    best = None
+    n = len(rss_list_2d)
+    for i in range(n):
+        p_sig = rss_list_2d[i]
+        p_int = sum(rss_list_2d[j] for j in range(n) if j != i)
+        denom = p_int + noise_power
+        if jam_map is not None:
+            denom = denom + jam_map
+        sinr_i = p_sig / denom
+        best = sinr_i if best is None else np.maximum(best, sinr_i)
+    return 10.0 * np.log10(np.maximum(best, 1e-18))
+
+
+def _draw_coverage_ax(
+    ax, sinr_field, tx_configs, inside_masks, union_inside, map_config,
+    tx_positions: dict, building_polygons=None, jam_state: "list | None" = None,
+    title: str = "", step: int = 2, norm=None,
+):
+    """Draw one SINR coverage panel. Mirrors compare_multi_tx_performance's
+    map-drawing conventions, generalised to take plain positions instead of
+    a finished `multi_result` dict so it can be called mid-optimisation.
+    """
+    import matplotlib.pyplot as plt
+
+    cx_m, cy_m = map_config["center"][0], map_config["center"][1]
+    sx_m, sy_m = map_config["size"][0],   map_config["size"][1]
+    cw, ch     = map_config["cell_size"][0], map_config["cell_size"][1]
+    x_min, x_max = cx_m - sx_m / 2, cx_m + sx_m / 2
+    y_min, y_max = cy_m - sy_m / 2, cy_m + sy_m / 2
+
+    im = ax.imshow(sinr_field[::step, ::step], cmap="coolwarm",
+                   norm=norm, interpolation="nearest",
+                   aspect="equal", rasterized=True,
+                   origin="lower",
+                   extent=[x_min, x_max, y_min, y_max])
+
+    _lw_cycle = [2.0, 1.4, 1.0, 0.7]
+    for tx_idx, cfg in enumerate(tx_configs):
+        lw = _lw_cycle[tx_idx % len(_lw_cycle)]
+        mask_ds = inside_masks[cfg.name][::step, ::step].astype(float)
+        H_ds, W_ds = mask_ds.shape
+        x_coords = np.linspace(x_min + step * cw / 2, x_max - step * cw / 2, W_ds)
+        y_coords = np.linspace(y_min + step * ch / 2, y_max - step * ch / 2, H_ds)
+        # zorder 4: zone boundary stays visible on top of the solid buildings.
+        ax.contour(x_coords, y_coords, mask_ds, levels=[0.5],
+                   colors=["black"], linewidths=lw, linestyles="-", zorder=4)
+        ax.plot([], [], color="black", linestyle="-", linewidth=lw, label=cfg.name)
+
+    if building_polygons:
+        _draw_building_footprints(ax, building_polygons, zorder=3)
+
+    for tx_idx, cfg in enumerate(tx_configs):
+        pos = tx_positions.get(cfg.name)
+        if pos is not None:
+            bx, by = pos[0], pos[1]
+            color = _BS_MARKER_COLORS[tx_idx % len(_BS_MARKER_COLORS)]
+            ax.scatter(bx, by, marker="*", color=color, s=160,
+                       edgecolors="black", linewidths=0.6, zorder=6,
+                       label=f"{cfg.name} (BS)")
+
+    if jam_state:
+        for jd in jam_state:
+            jx, jy = jd["position"][0], jd["position"][1]
+            is_active = jd.get("active", True)
+            color = _JAM_ON_COLOR if is_active else _JAM_OFF_COLOR
+            label = jd["name"] if is_active else f"{jd['name']} (off)"
+            alpha = 1.0 if is_active else 0.4
+            ax.scatter(jx, jy, marker="x", color=color, s=80,
+                       linewidths=2, zorder=5, label=label, alpha=alpha)
+
+    # Auto-zoom to the union zone, same margin heuristic as
+    # compare_multi_tx_performance so frames line up with its final figure.
+    rows, cols = np.where(union_inside)
+    if len(rows) > 0:
+        x_z_min = x_min + cols.min() * cw
+        x_z_max = x_min + (cols.max() + 1) * cw
+        y_z_min = y_min + rows.min() * ch
+        y_z_max = y_min + (rows.max() + 1) * ch
+        margin = max(x_z_max - x_z_min, y_z_max - y_z_min) * 0.5
+        ax.set_xlim(max(x_min, x_z_min - margin), min(x_max, x_z_max + margin))
+        ax.set_ylim(max(y_min, y_z_min - margin), min(y_max, y_z_max + margin))
+
+    ax.set_title(title, fontsize=11)
+    ax.set_xlabel("X (m)", fontsize=9)
+    ax.set_ylabel("Y (m)", fontsize=9)
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="SINR (dB)")
+    ax.legend(fontsize=8, loc="upper right")
+    return im
+
+
+def render_coverage_frame(
+    scene,
+    tx_configs: list,
+    tx_states: list,
+    map_config: dict,
+    zone_masks: dict,
+    iteration: int,
+    output_dir: str,
+    jam_scene=None,
+    jam_configs: "list | None" = None,
+    jam_state: "list | None" = None,
+    noise_power: float = 1e-10,
+    gamma_db: float = 0.0,
+    building_polygons: "list | None" = None,
+    samples_per_tx: int = int(2e7),
+    max_depth: int = 6,
+    cell_size=(2.0, 2.0),
+    step: int = 2,
+    dpi: int = 100,
+    loss: "float | None" = None,
+    precoding_vec=None,
+) -> str:
+    """Render and save one SINR coverage-map PNG for the optimiser's current
+    (post-step) state, in the same visual style as
+    compare_multi_tx_performance()'s map panel.
+
+    Runs its own RadioMapSolver pass(es) against `scene` (and `jam_scene`,
+    if active jammers are present), so it adds real cost per call — tune
+    `samples_per_tx`/`max_depth`/`cell_size` for speed, and call this only
+    every few iterations (see `make_coverage_gif_callback`'s `frame_every`)
+    rather than on every one for a long run.
+
+    precoding_vec : (mi.TensorXf, mi.TensorXf) or None
+        Per-TX (real, imag) precoding weights, shape (N_tx, num_tx_ant) each
+        — RadioMapSolver's own `precoding_vec` format. Pass the current
+        value from `optimize_multi_tx`'s callback (see its docstring) to
+        make the BS RadioMap pass match the training loss's SIR exactly,
+        including under `learn_precoding=True`. `None` falls back to
+        RadioMapSolver's own uniform default.
+
+    Returns the path to the saved PNG.
+    """
+    import os
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import TwoSlopeNorm
+
+    os.makedirs(output_dir, exist_ok=True)
+    n = len(tx_configs)
+
+    solver = RadioMapSolver()
+    rm = solver(
+        scene, max_depth=max_depth, samples_per_tx=samples_per_tx,
+        cell_size=list(cell_size), center=map_config["center"],
+        orientation=[0, 0, 0], size=map_config["size"],
+        los=True, specular_reflection=True, diffuse_reflection=True,
+        diffraction=True, edge_diffraction=True, refraction=False,
+        stop_threshold=None,
+        precoding_vec=precoding_vec,
+    )
+    rss_list_2d = [np.nan_to_num(rm.rss.numpy()[i], nan=0.0) for i in range(n)]
+
+    has_jammers = bool(jam_configs) and jam_scene is not None
+    jam_map = None
+    if has_jammers:
+        active_names = {jd["name"] for jd in (jam_state or []) if jd.get("active", True)}
+        if active_names:
+            jam_solver = RadioMapSolver()
+            jrm = jam_solver(
+                jam_scene, max_depth=max_depth, samples_per_tx=samples_per_tx,
+                cell_size=list(cell_size), center=map_config["center"],
+                orientation=[0, 0, 0], size=map_config["size"],
+                los=True, specular_reflection=True, diffuse_reflection=True,
+                diffraction=True, edge_diffraction=True, refraction=False,
+                stop_threshold=None,
+            )
+            jrss = jrm.rss.numpy()
+            jam_map = np.zeros_like(rss_list_2d[0])
+            for j, jcfg in enumerate(jam_configs):
+                if jcfg.name in active_names:
+                    jam_map = jam_map + np.nan_to_num(jrss[j], nan=0.0)
+
+    sinr_field = _sinr_field_from_rss(rss_list_2d, noise_power, jam_map=jam_map)
+
+    grid_shape   = next(iter(zone_masks.values())).shape
+    inside_masks = {cfg.name: (zone_masks[cfg.name] == 1.0) for cfg in tx_configs}
+    union_inside = np.zeros(grid_shape, dtype=bool)
+    for cfg in tx_configs:
+        union_inside |= inside_masks[cfg.name]
+
+    tx_positions = {
+        cfg.name: tx_states[i]["current_tx_position"][:2]
+        for i, cfg in enumerate(tx_configs)
+    }
+
+    vmin, vmax = gamma_db - 20, gamma_db + 20
+    norm = TwoSlopeNorm(vmin=vmin, vcenter=gamma_db, vmax=vmax)
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    title = f"Iteration {iteration}"
+    if loss is not None:
+        title += f"   loss={loss:.4f}"
+    _draw_coverage_ax(
+        ax, sinr_field, tx_configs, inside_masks, union_inside, map_config,
+        tx_positions, building_polygons=building_polygons,
+        jam_state=jam_state if has_jammers else None,
+        title=title, step=step, norm=norm,
+    )
+    fig.tight_layout()
+    out_path = os.path.join(output_dir, f"frame_{iteration:05d}.png")
+    fig.savefig(out_path, dpi=dpi)
+    plt.close(fig)
+    return out_path
+
+
+def make_coverage_gif_callback(
+    map_config: dict,
+    zone_masks: dict,
+    output_dir: str,
+    jam_configs: "list | None" = None,
+    frame_every: int = 1,
+    noise_power: float = 1e-10,
+    gamma_db: float = 0.0,
+    building_polygons: "list | None" = None,
+    samples_per_tx: int = int(2e7),
+    max_depth: int = 6,
+    cell_size=(2.0, 2.0),
+    step: int = 2,
+    dpi: int = 100,
+) -> callable:
+    """Build an `on_iteration_callback` for optimize_multi_tx() that renders
+    one coverage-map PNG (via render_coverage_frame) every `frame_every`
+    iterations.
+
+    Example
+    -------
+        cb = make_coverage_gif_callback(map_config, zone_masks_dict,
+                                         "gif_frames/run1", jam_configs=jam_configs,
+                                         frame_every=2)
+        result, jam_scene = optimize_multi_tx(..., on_iteration_callback=cb)
+        frames_to_gif(cb.frame_paths, "run1_progress.gif", fps=12)
+
+    The returned callback exposes the ordered list of saved frame paths as
+    `.frame_paths`, ready to pass straight to `frames_to_gif`.
+    """
+    frame_paths: list = []
+
+    def _callback(iteration, tx_states, tx_configs, jam_positions=None,
+                  jam_state=None, scene=None, jam_scene=None, loss=None,
+                  precoding_vec=None):
+        if iteration % frame_every != 0:
+            return
+        path = render_coverage_frame(
+            scene, tx_configs, tx_states, map_config, zone_masks, iteration,
+            output_dir, jam_scene=jam_scene, jam_configs=jam_configs,
+            jam_state=jam_state, noise_power=noise_power, gamma_db=gamma_db,
+            building_polygons=building_polygons, samples_per_tx=samples_per_tx,
+            max_depth=max_depth, cell_size=cell_size, step=step, dpi=dpi,
+            loss=loss, precoding_vec=precoding_vec,
+        )
+        frame_paths.append(path)
+
+    _callback.frame_paths = frame_paths
+    return _callback
+
+
+def frames_to_gif(
+    frames, output_path: str, fps: float = 10.0, loop: int = 0,
+    protected_colors: "list | None" = None,
+) -> str:
+    """Assemble PNG frames into an animated GIF at a given playback rate.
+
+    A GIF holds at most 256 colors. Left to Pillow, each frame gets its own
+    adaptive palette dominated by the SINR heatmap, so the few pixels of a
+    base-station or jammer marker get remapped to whatever palette entry is
+    nearest in that frame and the marker's color visibly shifts between
+    frames. Instead, every frame here is mapped onto ONE palette shared by
+    the whole GIF, with `protected_colors` reserved as exact entries, and no
+    dithering, so a given color renders identically in every frame.
+
+    Parameters
+    ----------
+    frames : str, os.PathLike, or list[str]
+        Either a directory of PNGs (sorted by filename, so name frames with
+        a zero-padded index) or an explicit ordered list of file paths, e.g.
+        `make_coverage_gif_callback(...).frame_paths`.
+    output_path : str
+        Destination .gif path.
+    fps : float
+        Playback rate in frames per second (converted to a per-frame
+        duration in ms, floored at 20ms/frame to stay within what most GIF
+        viewers honour).
+    loop : int
+        Number of times the GIF repeats; 0 loops forever.
+    protected_colors : list of matplotlib color specs, or None
+        Colors kept exact in the shared palette. None (default) protects the
+        coverage-frame annotation colors: the BS and jammer markers, the
+        building fill, black and white. Pass [] to disable.
+
+    Returns
+    -------
+    str : output_path, once written.
+    """
+    import os
+    from matplotlib.colors import to_rgb
+    from PIL import Image
+
+    if isinstance(frames, (str, os.PathLike)):
+        frame_dir = str(frames)
+        paths = sorted(
+            os.path.join(frame_dir, f) for f in os.listdir(frame_dir)
+            if f.lower().endswith(".png")
+        )
+    else:
+        paths = list(frames)
+
+    if not paths:
+        raise ValueError("No frames to assemble into a GIF.")
+
+    images = [Image.open(p).convert("RGB") for p in paths]
+
+    if protected_colors is None:
+        protected_colors = [*_BS_MARKER_COLORS, _JAM_ON_COLOR, _JAM_OFF_COLOR,
+                            _BUILDING_FILL_COLOR, "black", "white"]
+    protected = []
+    for c in protected_colors:
+        rgb = tuple(int(round(255 * v)) for v in to_rgb(c))
+        if rgb not in protected:
+            protected.append(rgb)
+
+    # Adaptive palette for everything else, learned from a sample of frames
+    # spread across the whole run so it covers the heatmap's full range.
+    n_adaptive = 256 - len(protected)
+    picks = sorted(set(np.linspace(0, len(images) - 1, min(16, len(images))).astype(int)))
+    montage = Image.fromarray(
+        np.concatenate([np.asarray(images[i])[::2, ::2] for i in picks], axis=0)
+    )
+    adaptive = montage.quantize(colors=n_adaptive, method=Image.Quantize.MEDIANCUT)
+    flat = list(adaptive.getpalette()[: 3 * n_adaptive])
+    for rgb in protected:
+        flat.extend(rgb)
+    flat.extend([0] * (768 - len(flat)))
+    palette_img = Image.new("P", (1, 1))
+    palette_img.putpalette(flat)
+
+    # Nearest-color mapping is deterministic per RGB value, so with a shared
+    # palette and no dithering a pixel color always lands on the same entry.
+    quantized = [im.quantize(palette=palette_img, dither=Image.Dither.NONE)
+                 for im in images]
+
+    duration_ms = max(20, int(round(1000.0 / fps)))
+    quantized[0].save(
+        output_path, format="GIF", save_all=True,
+        append_images=quantized[1:], duration=duration_ms, loop=loop,
+        optimize=False,
+    )
+    return output_path
 
 
 def plot_results_from_file(
@@ -3446,7 +4066,7 @@ def plot_results_from_file(
     def _draw_map(ax, sinr_field, title, show_jammers=False):
         im = ax.imshow(
             sinr_field[::_step, ::_step],
-            cmap="viridis", norm=norm,
+            cmap="RdBu", norm=norm,
             interpolation="nearest", aspect="equal", rasterized=True,
             origin="lower", extent=[x_min, x_max, y_min, y_max],
         )

@@ -7,7 +7,7 @@ import sys
 import os
 
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"] = "0, 1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 sys.path.append(os.path.abspath('../src'))
 
@@ -30,7 +30,7 @@ import warnings
 warnings.filterwarnings("ignore", message="invalid value encountered in multiply")
 warnings.filterwarnings("ignore", category=UserWarning, module="jupyter_client")
 
-from sionna.rt import load_scene, Receiver, Camera, PathSolver, AntennaArray
+from sionna.rt import load_scene, Receiver, Camera, PathSolver, AntennaArray, PlanarArray
 from sionna.rt.antenna_pattern import antenna_pattern_registry
 
 from boresight_pathsolver import create_zone_mask
@@ -44,50 +44,48 @@ from shapely.geometry import Polygon as ShapelyPolygon
 
 # ── Scene registry ─────────────────────────────────────────────────────────────
 SCENE_CONFIGS = [
-    {"scene_name": "duke",         "scene_xml": "../scene/scenes/Duke/scene.xml"},
-    {"scene_name": "washington_dc","scene_xml": "../scene/scenes/dupont_circle/scene.xml"},
     {"scene_name": "boulder",      "scene_xml": "../scene/scenes/boulder_open/scene.xml"},
 ]
 
-OUTPUT_BASE = pathlib.Path("../results/3_scenes_w_jammers")
-
+OUTPUT_BASE = pathlib.Path("../results/extension_dataset")
 
 # ── Shared experiment parameters ───────────────────────────────────────────────
-SHAPES = ["square", "circle", "splat", "l_shape"]
+SHAPES = ["hexagon", "semi_circle", "oval"]
 
 SIZE_CONFIGS = [
-    {"name": "large",  "size_m": 400.0, "n_bs": 4, "standoff_m": 150.0},
-    {"name": "small",  "size_m": 200.0, "n_bs": 2, "standoff_m": 150.0},
+    {"name": "medium",  "size_m": 500.0, "n_bs": 2, "standoff_m": 50.0}
 ]
 
-SAMPLE_COUNTS = [250, 500, 750, 1000]
+SAMPLE_COUNTS = [500]
 
-N_JAMMERS             = 12
-OUTSIDE_MARGIN_M      = 200.0
+N_JAMMERS             = 6
+OUTSIDE_MARGIN_M      = 150.0
 BS_HEIGHT_M           = 50.0
 BS_TARGET_Z_M         = 1.5
 BS_PROJECT_EDGE       = True
-JAM_MIN_BS_DISTANCE_M = 75.0
+JAM_MIN_BS_DISTANCE_M = 50.0
 
 _base_hparams = dict(
     lds="Halton",
     sampler="rejection",
     sampling_strata="full",
     gamma_db=0.0,
-    inside_margin_db=20.0,
-    min_sinr_db=20.0,
-    lambda_in=3.0,
-    lambda_out=15.0,
-    lambda_uniform=0.2,
-    lambda_min_j=1.0,
-    use_gate_logits=True,     # False = all jammers always fully on (useful for debugging coverage)
+    inside_margin_db=12.0,
+    min_sinr_db=15.0,
+    lambda_in=4.0,
+    lambda_out=10.0,
+    lambda_uniform=5.0,
+    lambda_min_j=0.0,
+    use_gate_logits=False,     # False = all jammers always fully on (useful for debugging coverage)
     lambda_spread=0.0,
     spread_min_dist=0.0,
-    soft_mean_weight=6.0,
-    soft_mean_in_weight=6.0,
-    learning_rate=0.1,
-    lr_position=4.0,
+    soft_mean_weight=3.0,
+    soft_mean_in_weight=3.0,
+    learning_rate=0.15,
+    lr_position=5.0,
     lr_power=0.1,
+    lr_precoding = 2.0,
+    learn_precoding = True,
     noise_power=1e-10,
     lr_scheduler="cosine",
 )
@@ -115,7 +113,7 @@ def make_zone_params(shape: str, size_m: float) -> dict:
         return {"center": [0.0, 0.0], "vertices": vertices}
 
     if shape == "splat":
-        rng   = np.random.default_rng(seed=42)
+        rng   = np.random.default_rng(seed=21)
         n_pts = 120
         theta = np.linspace(0, 2 * np.pi, n_pts, endpoint=False)
         r     = np.full(n_pts, size_m, dtype=float)
@@ -135,6 +133,44 @@ def make_zone_params(shape: str, size_m: float) -> dict:
         s = float(size_m)
         vertices = [(-s, -s), (s, -s), (s, 0.0), (0.0, 0.0), (0.0, s), (-s, s)]
         return {"center": [0.0, 0.0], "vertices": [(float(x), float(y)) for x, y in vertices]}
+
+    # Adding a triangle shape for testing
+    if shape == "triangle":
+        s = float(size_m)
+        vertices = [(-s, s), (0.0, s), (s, s), (0.0, -s)]    
+        return {"center": [0.0, 0.0], "vertices": [(float(x), float(y)) for x, y in vertices]}
+
+    # Also adding a hexagon
+    if shape == "hexagon":
+        s = float(size_m)
+        vertices = [(s * np.cos(np.pi/3 * i), s * np.sin(np.pi/3 * i)) for i in range(6)]
+        return {"center": [0.0, 0.0], "vertices": [(float(x), float(y)) for x, y in vertices]}
+
+    if shape == "semi_circle":
+        r = float(size_m)
+        theta = np.linspace(0, np.pi, 32)
+        vertices = [(round(r * np.cos(t), 3), round(r * np.sin(t), 3)) for t in theta]
+        return {"center": [0.0, 0.0], "vertices": vertices}
+
+    if shape == "oval":
+        a = float(size_m)
+        b = 0.6 * a
+        theta = np.linspace(0, 2 * np.pi, 64, endpoint=False)
+        vertices = [(round(a * np.cos(t), 3), round(b * np.sin(t), 3)) for t in theta]
+        return {"center": [0.0, 0.0], "vertices": vertices}
+
+    if shape == "large_x":
+        s = float(size_m)
+        t = 0.3 * s
+        raw = [(-t, -s), (t, -s), (t, -t), (s, -t), (s, t), (t, t),
+               (t, s), (-t, s), (-t, t), (-s, t), (-s, -t), (-t, -t)]
+        ang = np.pi / 4
+        vertices = [
+            (round(x * np.cos(ang) - y * np.sin(ang), 3),
+             round(x * np.sin(ang) + y * np.cos(ang), 3))
+            for x, y in raw
+        ]
+        return {"center": [0.0, 0.0], "vertices": vertices}
 
     raise ValueError(f"Unknown shape: {shape!r}")
 
@@ -438,10 +474,13 @@ for scene_cfg in SCENE_CONFIGS:
 
     single_element = np.array([[0.0, 0.0, 0.0]])
 
-    scene.tx_array = AntennaArray(
-        antenna_pattern=gnb_pattern,
-        normalized_positions=single_element.T
-    )
+    scene.tx_array = PlanarArray(num_rows=2,
+                             num_cols=2,
+                             vertical_spacing=0.5,
+                             horizontal_spacing=0.5,
+                             polarization="V",
+                             pattern="tr38901")
+
     jammer_array = AntennaArray(
         antenna_pattern=friendly_pattern,
         normalized_positions=single_element.T
@@ -523,7 +562,7 @@ for scene_cfg in SCENE_CONFIGS:
                     target_z=BS_TARGET_Z_M,
                     project_to_edge=BS_PROJECT_EDGE,
                     name_prefix="bs",
-                    seed=44,
+                    seed=45,
                 )
 
                 jam_positions = _seed_jammers_uniform(
@@ -559,7 +598,7 @@ for scene_cfg in SCENE_CONFIGS:
                 result_bs, _ = optimize_multi_tx(
                     scene=scene,
                     jam_configs=None,
-                    num_iterations=100,
+                    num_iterations=1,
                     **_warmup_kwargs,
                 )
                 elapsed_warmup = result_bs["joint"]["elapsed_time_s"]
@@ -578,7 +617,7 @@ for scene_cfg in SCENE_CONFIGS:
                         float(a) for a in r["best_angles"]
                     )
 
-                # Run 2: Joint BS + jammers — BS positions frozen
+                # Run 2: Joint BS + jammers
                 print("    Run 2: Joint optimization (100 iter, BS positions frozen)")
                 result_jam, jam_scene = optimize_multi_tx(
                     scene=scene,
