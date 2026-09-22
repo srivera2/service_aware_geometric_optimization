@@ -1,0 +1,4597 @@
+"""
+multi_tx_optimizer.py
+=====================
+Multi-transmitter SIR optimization for Sionna RT.
+
+Jointly optimizes N transmitter boresight angles, positions, and optionally
+transmit powers to maximise the Signal-to-Interference Ratio (SIR) in each
+transmitter's target coverage zone.
+
+Public API
+----------
+TxConfig                       : dataclass describing one transmitter
+JammerConfig                   : dataclass describing one friendly jammer
+seed_bs_positions()            : LOS-aware greedy farthest-point BS placement inside zone
+seed_jammer_positions()        : concave-edge jammer placement outside zone
+setup_bs_transmitters()        : seed + place + configure n BSs in one call
+optimize_multi_tx()            : run the joint optimization
+compare_multi_tx_performance() : evaluate optimised BS-only SINR containment within target zone
+plot_results_from_file()       : load saved .npy arrays + JSON and reproduce the SINR plots
+"""
+
+from __future__ import annotations
+
+import warnings
+from dataclasses import dataclass
+from typing import Optional
+import time
+
+import alphashape
+import matplotlib.pyplot as plt
+import mitsuba as mi
+from IPython.display import display
+import numpy as np
+import scipy.stats.qmc
+import shapely
+import shapely.ops
+import torch
+from torch.optim.lr_scheduler import CosineAnnealingLR
+import drjit as dr
+import random
+from drjit.auto import Float
+from shapely.affinity import scale as shapely_scale
+from shapely.geometry import Polygon as ShapelyPolygon
+from sklearn.cluster import HDBSCAN, DBSCAN
+from sionna.rt import (
+    load_scene, PathSolver, RadioMapSolver, Transmitter, Receiver,
+    cpx_abs_square, cpx_mul, cpx_add, AntennaArray,
+)
+
+from angle_utils import (
+    azimuth_elevation_to_yaw_pitch,
+    compute_initial_angles_from_position,
+)
+from boresight_pathsolver import filter_and_append, sample_grid_points
+from triangulate import (
+    get_zone_polygon_with_exclusions,
+    triangulate_zone,
+    prepare_triangulated_sampler,
+    sample_from_prepared,
+    sample_triangulated_zone,
+    sample_dead_zones,
+    visualize_triangulation
+)
+from tx_placement import TxPlacement
+
+# Initialize random number generator
+random.seed()
+
+# ---------------------------------------------------------------------------
+# TxConfig
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TxConfig:
+    """Configuration for one transmitter in the joint optimisation.
+
+    Parameters
+    ----------
+    name : str
+        Sionna scene name (must already be added to the scene, e.g. "gnb", "gnb2").
+    building_id : int
+        Building ID from extract_building_info(); TX position is constrained to
+        this building's rooftop polygon.
+    zone_params : dict
+        Coverage-zone description in one of two formats:
+            {'center': [x, y], 'width': w, 'height': h}   # box
+            {'vertices': [(x1,y1), ...]}                   # polygon
+    tx_height_offset : float
+        Metres above the rooftop surface (default 10 m).
+    initial_power_dbm : float
+        Starting transmit power [dBm].
+    power_dbm_bounds : tuple[float, float]
+        (min, max) dBm clamp range for power optimisation.
+    initial_azimuth_deg : float or None
+        Override initial azimuth; None -> auto-compute from TX -> zone centroid.
+    initial_elevation_deg : float or None
+        Override initial elevation; None -> auto-compute.
+    """
+    name: str
+    on_building: bool
+    building_id: int
+    zone_params: dict
+    tx_height_offset: float = 10.0
+    initial_power_dbm: float = 40.0
+    power_dbm_bounds: tuple = (40.0, 50.0)
+    initial_azimuth_deg: Optional[float] = None
+    initial_elevation_deg: Optional[float] = None
+
+
+@dataclass
+class JammerConfig:
+    """Configuration for one friendly jammer in the joint optimisation.
+
+    Parameters
+    ----------
+    name : str
+        Unique name registered in jam_scene (e.g. "jam_0").
+    initial_position : list[float] or None
+        [x, y] starting position in metres.  None -> sampled uniformly from
+        the map bounds at startup.
+    initial_power_dbm : float
+        Starting transmit power [dBm].
+    power_dbm_bounds : tuple[float, float]
+        (min, max) dBm clamp applied after each gradient step.
+    initial_azimuth_deg : float or None
+        Override initial azimuth; None -> auto-compute from jammer -> zone centroid.
+    initial_elevation_deg : float or None
+        Override initial elevation; None -> auto-compute.
+    """
+    name: str
+    initial_position: Optional[list] = None   # [x, y]; None = random
+    initial_power_dbm: float = 23.0
+    power_dbm_bounds: tuple = (0.0, 50.0)
+    elevation_bounds: tuple = (0.0, -90.0)
+    initial_azimuth_deg: Optional[float] = None
+    initial_elevation_deg: Optional[float] = None
+
+
+# ---------------------------------------------------------------------------
+# Placement seeding utilities
+# ---------------------------------------------------------------------------
+
+def _los_blocked(bx, by, bz, tx, ty, tz, bldg_polys_2d, bldg_heights):
+    """Return True if the 3-D segment (bx,by,bz)→(tx,ty,tz) is blocked.
+
+    For each building whose 2-D footprint intersects the segment we compute
+    the height of the LOS line at the nearest intersection centroid.  If any
+    building roof exceeds that height the path is considered blocked.
+    """
+    from shapely.geometry import LineString as _LS2
+    seg = _LS2([(bx, by), (tx, ty)])
+    h_dist = np.hypot(tx - bx, ty - by)
+    if h_dist < 1e-6:
+        return False
+    for poly, z_h in zip(bldg_polys_2d, bldg_heights):
+        if not seg.intersects(poly):
+            continue
+        ic = seg.intersection(poly).centroid
+        d = np.hypot(ic.x - bx, ic.y - by)
+        h_at = bz + (tz - bz) * (d / h_dist)
+        if z_h > h_at:
+            return True
+    return False
+
+
+def _project_to_zone_edge(
+    pos_xy: list,
+    centroid,
+    zone_poly,
+    building_polygons=None,
+    step_back_m: float = 3.0,
+) -> list:
+    """Project pos_xy to the farthest zone boundary along centroid→pos direction.
+
+    Walks the ray from the zone centroid through pos_xy until it exits the zone
+    polygon, then steps back step_back_m so the result is clearly interior.
+    If the stepped-back point lands inside a building, it retreats in further
+    increments until clear (or gives up after 20 tries).
+    """
+    from shapely.geometry import LineString as _LS, Point as _Pt
+
+    cx, cy = float(centroid.x), float(centroid.y)
+    dx = pos_xy[0] - cx
+    dy = pos_xy[1] - cy
+    length = (dx ** 2 + dy ** 2) ** 0.5
+    if length < 1e-6:
+        return pos_xy
+
+    dx /= length
+    dy /= length
+
+    far = 20_000.0
+    ray = _LS([(cx, cy), (cx + dx * far, cy + dy * far)])
+    inter = ray.intersection(zone_poly)
+
+    def _coords(geom):
+        if geom.is_empty:
+            return []
+        t = geom.geom_type
+        if t == "Point":
+            return [(geom.x, geom.y)]
+        if t == "MultiPoint":
+            return [(g.x, g.y) for g in geom.geoms]
+        if t == "LineString":
+            return list(geom.coords)
+        if t in ("MultiLineString", "GeometryCollection"):
+            out = []
+            for g in geom.geoms:
+                out.extend(_coords(g))
+            return out
+        return []
+
+    coords = _coords(inter)
+    if not coords:
+        return pos_xy
+
+    # Farthest point along the ray from the centroid
+    best_t, best_pt = -1.0, pos_xy
+    for (x, y) in coords:
+        t = (x - cx) * dx + (y - cy) * dy
+        if t > best_t:
+            best_t = t
+            best_pt = [x, y]
+
+    # Step back from edge so the point is clearly inside the zone
+    px = best_pt[0] - dx * step_back_m
+    py = best_pt[1] - dy * step_back_m
+
+    # Retreat further if we landed inside a building
+    if building_polygons:
+        pt = _Pt(px, py)
+        for _ in range(20):
+            if not any(bp.contains(pt) for bp in building_polygons):
+                break
+            px -= dx * step_back_m
+            py -= dy * step_back_m
+            pt = _Pt(px, py)
+
+    return [px, py]
+
+
+def seed_bs_positions(
+    zone_params: dict,
+    n_bs: int,
+    building_polygons=None,
+    building_info: dict = None,
+    bs_height: float = 25.0,
+    target_z: float = 1.5,
+    seed: int = 42,
+    project_to_edge: bool = False,
+    min_building_clearance: float = 10.0,
+    min_bs_separation: float = 250.0,
+) -> list:
+    """Place n_bs base stations inside the zone, maximally spread and LOS-clear.
+
+    Candidates are sampled inside the zone polygon (building footprints
+    excluded), then split into two pools:
+
+    * **LOS pool** — positions with an unobstructed 3-D line of sight from
+      ``(x, y, bs_height)`` to the zone centroid at ``target_z``.
+    * **Fallback pool** — all remaining interior positions.
+
+    Greedy farthest-point selection runs on the LOS pool first.  If the LOS
+    pool is exhausted before ``n_bs`` stations are placed, the algorithm
+    continues into the fallback pool (with a printed warning).
+
+    Parameters
+    ----------
+    zone_params : dict
+        ``{'vertices': [(x,y), ...]}`` or ``{'center', 'width', 'height'}``.
+    n_bs : int
+        Number of base stations to place.
+    building_polygons : list[ShapelyPolygon] or None
+        2-D building footprints used to exclude positions from the interior
+        candidate grid.  Pass the same list used in ``_setup_tx_state``.
+    building_info : dict or None
+        Dict returned by ``extract_building_info``; used for the 3-D LOS
+        check.  If ``None``, the LOS filter is skipped.
+    bs_height : float
+        BS elevation (metres above scene origin).  Default 25 m.
+    target_z : float
+        Height of the LOS target point at the zone centroid.  Default 1.5 m.
+    seed : int
+        RNG seed for reproducible candidate sampling.
+    project_to_edge : bool
+        If True, each selected position is projected outward from the zone
+        centroid to the farthest zone boundary in that direction, pushing BSs
+        into concave protrusions of the zone.  Default False.
+    min_building_clearance : float
+        Minimum distance (metres) between any candidate position and the
+        nearest building footprint.  Building polygons are buffered by this
+        amount before being subtracted from the candidate area.  Default 30 m.
+    min_bs_separation : float
+        Minimum distance (metres) between any two selected BS positions.
+        Enforced greedily during cluster selection; if no candidate in a
+        cluster satisfies the constraint a warning is printed and the nearest
+        candidate is used anyway.  Default 50 m.
+
+    Returns
+    -------
+    list of [x, y] positions (floats, metres).
+    """
+    from shapely import contains_xy as _cxy
+    from shapely.geometry import Point as _Pt
+
+    rng = np.random.default_rng(seed)
+
+    if "vertices" in zone_params:
+        zone_poly = ShapelyPolygon(zone_params["vertices"])
+    else:
+        cx0, cy0 = zone_params["center"][0], zone_params["center"][1]
+        w, h = zone_params["width"], zone_params["height"]
+        zone_poly = ShapelyPolygon([
+            (cx0 - w / 2, cy0 - h / 2), (cx0 + w / 2, cy0 - h / 2),
+            (cx0 + w / 2, cy0 + h / 2), (cx0 - w / 2, cy0 + h / 2),
+        ])
+
+    valid_poly = zone_poly
+    if building_polygons:
+        bldg_union = shapely.ops.unary_union(building_polygons)
+        clearance = min_building_clearance if min_building_clearance > 0 else 0
+        if clearance > 0:
+            bldg_union = bldg_union.buffer(clearance)
+        valid_poly = zone_poly.difference(bldg_union)
+
+    minx, miny, maxx, maxy = valid_poly.bounds
+    n_cand = max(4000, n_bs * 400)
+    xs = rng.uniform(minx, maxx, n_cand * 5)
+    ys = rng.uniform(miny, maxy, n_cand * 5)
+    inside = _cxy(valid_poly, xs, ys)
+    candidates = np.column_stack([xs[inside], ys[inside]])[:n_cand]
+
+    if len(candidates) < n_bs:
+        raise ValueError(
+            f"seed_bs_positions: only {len(candidates)} valid interior candidates "
+            f"for {n_bs} BSs — zone may be too small, heavily built-up, or the "
+            f"{min_building_clearance} m building clearance leaves too little space "
+            f"(try reducing min_building_clearance)."
+        )
+
+    # ── LOS filter ────────────────────────────────────────────────────────────
+    # Used only as a preference signal within each k-means cluster below,
+    # NOT as a hard gate — avoids starving non-convex zone lobes of candidates.
+    if building_info:
+        cent = zone_poly.centroid
+        cx_los, cy_los = float(cent.x), float(cent.y)
+        bldg_polys_2d = []
+        bldg_heights  = []
+        for info in building_info.values():
+            verts = info.get("vertices", [])
+            z_h   = info.get("z_height", 0.0)
+            if len(verts) >= 3:
+                _bp = ShapelyPolygon([(v[0], v[1]) for v in verts])
+                if not _bp.is_valid:
+                    _bp = _bp.buffer(0)
+                bldg_polys_2d.append(_bp)
+                bldg_heights.append(float(z_h))
+
+        los_ok = np.array([
+            not _los_blocked(
+                float(candidates[i, 0]), float(candidates[i, 1]), bs_height,
+                cx_los, cy_los, target_z,
+                bldg_polys_2d, bldg_heights,
+            )
+            for i in range(len(candidates))
+        ])
+    else:
+        los_ok = np.ones(len(candidates), dtype=bool)
+
+    # ── K-means++ spread: one BS per zone region ───────────────────────────────
+    # Partition ALL interior candidates (no LOS gate) into n_bs clusters so
+    # every part of the zone is represented.  Within each cluster, prefer the
+    # LOS-clear candidate nearest the cluster centre; fall back to any candidate.
+    from sklearn.cluster import KMeans as _KMeans
+
+    km = _KMeans(n_clusters=n_bs, init="k-means++", n_init=10, random_state=seed)
+    km.fit(candidates.astype(float))
+    labels  = km.labels_           # cluster index per candidate
+    centers = km.cluster_centers_  # n_bs × 2 ideal positions
+
+    used   = set()
+    result = []
+    for k in range(n_bs):
+        cluster_idx = np.where(labels == k)[0]
+        if len(cluster_idx) == 0:
+            continue
+
+        los_in_cluster = cluster_idx[los_ok[cluster_idx]]
+        pool_idx = los_in_cluster if len(los_in_cluster) > 0 else cluster_idx
+
+        # Filter by minimum separation from already-placed BSs.
+        if result and min_bs_separation > 0:
+            placed = np.array(result)
+            pool_cands = candidates[pool_idx]
+            sep_ok = np.all(
+                np.linalg.norm(pool_cands[:, None, :] - placed[None, :, :], axis=2)
+                >= min_bs_separation,
+                axis=1,
+            )
+            if sep_ok.any():
+                pool_idx = pool_idx[sep_ok]
+            else:
+                print(
+                    f"seed_bs_positions: cluster {k} has no candidate "
+                    f">= {min_bs_separation} m from existing BSs; "
+                    f"relaxing separation constraint for this station."
+                )
+
+        dists = np.linalg.norm(candidates[pool_idx] - centers[k], axis=1)
+        best  = pool_idx[int(np.argmin(dists))]
+        result.append(candidates[best])
+        used.add(int(best))
+
+    # Safety: fill any empty-cluster gaps from remaining unused candidates.
+    # Two passes: first honoring min_bs_separation, then relaxing it.
+    for strict in (True, False):
+        if len(result) >= n_bs:
+            break
+        for i in range(len(candidates)):
+            if len(result) >= n_bs:
+                break
+            if i in used:
+                continue
+            if strict and result and min_bs_separation > 0:
+                placed = np.array(result)
+                if np.linalg.norm(candidates[i] - placed, axis=1).min() < min_bs_separation:
+                    continue
+            result.append(candidates[i])
+            used.add(i)
+
+    positions = [[float(p[0]), float(p[1])] for p in result[:n_bs]]
+
+    if project_to_edge:
+        centroid = zone_poly.centroid
+        positions = [
+            _project_to_zone_edge(p, centroid, zone_poly, building_polygons)
+            for p in positions
+        ]
+
+    return positions
+
+
+def setup_bs_transmitters(
+    scene,
+    zone_params: dict,
+    n_bs: int,
+    scene_xml_path: str,
+    bs_height: float = 25.0,
+    target_z: float = 1.5,
+    name_prefix: str = "bs",
+    seed: int = 42,
+    project_to_edge: bool = False,
+    initial_power_dbm: float = 35.0,
+    power_dbm_bounds: tuple = (30.0, 40.0),
+) -> tuple:
+    """Create and place n_bs base stations in the scene, ready for optimisation.
+
+    Combines position seeding, scene registration, and ``TxConfig`` creation
+    into a single call so adding more BSs only requires changing ``n_bs``.
+
+    Steps
+    -----
+    1. Load building geometry from *scene_xml_path* for footprint exclusion and
+       3-D LOS filtering.
+    2. Call :func:`seed_bs_positions` (LOS-aware greedy farthest-point spread).
+    3. For each BS: add a :class:`~sionna.rt.Transmitter` to the scene if it
+       does not already exist, or update its position if it does.
+    4. Return a ``TxConfig`` list and the seeded ``[x, y, z]`` positions.
+
+    Parameters
+    ----------
+    scene : sionna.rt.Scene
+    zone_params : dict
+        ``{'vertices': [(x,y), ...]}`` or ``{'center', 'width', 'height'}``.
+    n_bs : int
+        Number of base stations to create.
+    scene_xml_path : str
+        Path to the scene XML; used to extract building info.
+    bs_height : float
+        Transmitter elevation (metres).  Default 25 m.
+    target_z : float
+        LOS target height at zone centroid (metres).  Default 1.5 m.
+    name_prefix : str
+        Transmitter names will be ``"{name_prefix}_{i}"`` for i = 0 … n_bs-1.
+    seed : int
+        Reproducibility seed passed to ``seed_bs_positions``.
+    project_to_edge : bool
+        If True, each BS is projected outward from the zone centroid to the
+        farthest zone boundary in its direction, pushing BSs into concave
+        protrusions.  Default False.
+    initial_power_dbm : float
+        Starting transmit power [dBm].
+    power_dbm_bounds : tuple[float, float]
+        (min, max) dBm clamp for power optimisation.
+
+    Returns
+    -------
+    tx_configs : list[TxConfig]
+    bs_positions_xyz : list[[x, y, z]]
+        Seeded positions including elevation, for use as ``origin_point`` in
+        :func:`~boresight_pathsolver.create_zone_mask`.
+    """
+    from scene_parser import extract_building_info
+
+    building_info = extract_building_info(scene_xml_path)
+
+    # 2-D building polygons for footprint exclusion (no height needed here)
+    building_polygons = []
+    for info in building_info.values():
+        verts = info.get("vertices", [])
+        if len(verts) >= 3:
+            try:
+                p = ShapelyPolygon([(v[0], v[1]) for v in verts])
+                if p.is_valid:
+                    building_polygons.append(p)
+            except Exception:
+                pass
+
+    positions_xy = seed_bs_positions(
+        zone_params=zone_params,
+        n_bs=n_bs,
+        building_polygons=building_polygons,
+        building_info=building_info,
+        bs_height=bs_height,
+        target_z=target_z,
+        seed=seed,
+        project_to_edge=project_to_edge,
+    )
+
+    bs_positions_xyz = [[float(x), float(y), bs_height] for x, y in positions_xy]
+    tx_configs = []
+
+    for i, (x, y, z) in enumerate(bs_positions_xyz):
+        name = f"{name_prefix}_{i}"
+        existing = scene.get(name)
+        if existing is None:
+            tx = Transmitter(name=name, position=[x, y, z],
+                             power_dbm=initial_power_dbm)
+            scene.add(tx)
+        else:
+            existing.position = mi.Point3f(float(x), float(y), float(z))
+            existing.power_dbm = [float(initial_power_dbm)]
+
+        tx_configs.append(TxConfig(
+            name=name,
+            on_building=False,
+            building_id=0,
+            zone_params=zone_params,
+            initial_power_dbm=initial_power_dbm,
+            power_dbm_bounds=power_dbm_bounds,
+        ))
+        print(f"  {name}: ({x:.1f}, {y:.1f}, {z:.1f})")
+
+    return tx_configs, bs_positions_xyz
+
+
+def seed_jammer_positions(
+    zone_params: dict,
+    n_jammers: Optional[int] = None,
+    bs_positions: list = None,
+    standoff_distance: float = 100.0,
+    min_bs_distance: float = 80.0,
+    concave_order: int = 8,
+    max_gap_deg: float = 90.0,
+    interpolation_factor: int = 1,
+    seed: int = 42,
+) -> list:
+    """Place jammers outside the zone at every boundary feature.
+
+    Produces one jammer per *concave corner* (local radius minimum — inward
+    dip of the zone boundary) **and** one jammer per *convex arc peak* (the
+    vertex of maximum radius on each arc between consecutive concave corners).
+    Together these seed points cover the full perimeter: inward pockets AND
+    outward lobes all get a jammer to suppress leakage from every direction.
+
+    Each jammer is placed radially outward from the zone centroid:
+    ``position = boundary_vertex + outward_normal × standoff_distance``
+    Jammers are then pushed further outward in 10 m steps until they are at
+    least ``min_bs_distance`` metres from every BS.
+
+    For box zones jammers are placed evenly around the exterior perimeter.
+
+    Parameters
+    ----------
+    zone_params : dict
+        ``{'vertices': [(x,y), ...]}`` or ``{'center', 'width', 'height'}``.
+        Also accepts ``{'center', 'radius'}`` (circle),
+        ``{'center', 'side'}`` (square), and
+        ``{'center', 'width', 'height', 'angle_deg'}`` (rotated rectangle).
+    n_jammers : int or None
+        Maximum number of jammers to place.  ``None`` (default) → place one
+        per detected boundary feature (all concave corners + all convex arc
+        peaks), giving full perimeter coverage.
+    bs_positions : list of [x, y] or [x, y, z]
+        Friendly base-station positions; only x/y are used.
+    standoff_distance : float
+        Metres past the zone boundary vertex where the jammer is initially
+        seeded.  A larger standoff gives the optimizer room to raise power
+        without immediately leaking into the protected zone.  Default 100 m.
+    min_bs_distance : float
+        Minimum distance (metres) from any BS.  Jammers that start too close
+        are pushed further outward in 10 m steps (max 30 steps).
+    concave_order : int
+        Half-window for local-minimum detection on the radius profile.
+    max_gap_deg : float
+        Maximum allowed angular gap (degrees, measured from the centroid)
+        between consecutive jammers.  After feature-based seeding, any gap
+        larger than this threshold gets a fill jammer inserted at the gap
+        midpoint.  Default 90°.
+    interpolation_factor : int
+        Multiplier applied to the jammer count after all other placement
+        logic.  ``1`` (default) leaves the set unchanged.  ``2`` inserts one
+        contour-following jammer between every consecutive pair, doubling the
+        count.  ``k`` inserts ``k-1`` evenly-spaced jammers per gap, so the
+        total approaches ``k × original``.  Inserted jammers are ray-cast to
+        the zone boundary and placed at ``standoff_distance`` outward, so they
+        follow the zone contour rather than straight-line interpolating.
+    seed : int
+        Unused (placement is deterministic); kept for API consistency.
+
+    Returns
+    -------
+    list of [x, y] positions (floats, metres).
+    """
+    from shapely.geometry import Point as _Pt, LineString as _LS
+
+    # ── Normalise non-polygon zone types to vertex list ──────────────────────
+    zone_params = dict(zone_params)  # shallow copy — don't mutate caller's dict
+    if "radius" in zone_params:
+        _cx, _cy = float(zone_params["center"][0]), float(zone_params["center"][1])
+        _r = float(zone_params["radius"])
+        _thetas = np.linspace(0, 2 * np.pi, 120, endpoint=False)
+        zone_params = {"vertices": [(_cx + _r * np.cos(t), _cy + _r * np.sin(t))
+                                    for t in _thetas]}
+    elif "side" in zone_params:
+        _cx, _cy = float(zone_params["center"][0]), float(zone_params["center"][1])
+        _s = float(zone_params["side"]) / 2
+        zone_params = {"vertices": [(_cx - _s, _cy - _s), (_cx + _s, _cy - _s),
+                                    (_cx + _s, _cy + _s), (_cx - _s, _cy + _s)]}
+    elif "angle_deg" in zone_params:
+        _cx, _cy = float(zone_params["center"][0]), float(zone_params["center"][1])
+        _hw = float(zone_params["width"]) / 2
+        _hh = float(zone_params["height"]) / 2
+        _th = float(np.deg2rad(zone_params["angle_deg"]))
+        _c, _s_th = np.cos(_th), np.sin(_th)
+        _corners = [(-_hw, -_hh), (_hw, -_hh), (_hw, _hh), (-_hw, _hh)]
+        zone_params = {"vertices": [(_cx + x * _c - y * _s_th,
+                                     _cy + x * _s_th + y * _c)
+                                    for x, y in _corners]}
+
+    bs_xy = np.array([[float(p[0]), float(p[1])] for p in (bs_positions or [])],
+                     dtype=float).reshape(-1, 2)
+
+    def _push_to_min_bs_dist(jx, jy, nx, ny):
+        for _ in range(30):
+            if len(bs_xy) == 0:
+                break
+            if np.linalg.norm(bs_xy - np.array([jx, jy]), axis=1).min() >= min_bs_distance:
+                break
+            jx += nx * 10.0
+            jy += ny * 10.0
+        return jx, jy
+
+    def _place_outward(vertex_idx, vertices, zone_poly, cx, cy, r):
+        vx, vy = float(vertices[vertex_idx][0]), float(vertices[vertex_idx][1])
+        dx, dy = vx - cx, vy - cy
+        dist = np.hypot(dx, dy)
+        if dist < 1e-6:
+            return None
+        nx, ny = dx / dist, dy / dist
+        jx = vx + nx * standoff_distance
+        jy = vy + ny * standoff_distance
+        if zone_poly.contains(_Pt(jx, jy)):
+            jx += nx * standoff_distance
+            jy += ny * standoff_distance
+        return jx, jy, nx, ny
+
+    if "vertices" in zone_params:
+        vertices = list(zone_params["vertices"])
+        zone_poly = ShapelyPolygon(vertices)
+        cx, cy = zone_poly.centroid.x, zone_poly.centroid.y
+
+        n_v = len(vertices)
+        r = np.array([np.hypot(v[0] - cx, v[1] - cy) for v in vertices])
+
+        # ── Concave corners (local minima in radius) ──────────────────────────
+        concave_idx = [
+            i for i in range(n_v)
+            if all(r[i] < r[(i + k) % n_v] for k in range(1, concave_order + 1))
+            and all(r[i] < r[(i - k) % n_v] for k in range(1, concave_order + 1))
+        ]
+
+        def _prominence(i):
+            nbrs = [r[(i + k) % n_v]
+                    for k in range(-concave_order, concave_order + 1) if k != 0]
+            return float(np.mean(nbrs)) - float(r[i])
+
+        concave_sorted = sorted(concave_idx, key=_prominence, reverse=True)
+        concave_candidates = []
+        for i in concave_sorted:
+            pt = _place_outward(i, vertices, zone_poly, cx, cy, r)
+            if pt is not None:
+                concave_candidates.append(pt)
+
+        # ── Convex arc peaks (local maxima between consecutive concave corners) ─
+        # Walk the boundary in position order and find the highest-radius vertex
+        # on each arc between consecutive concave corners.
+        convex_candidates = []
+        if concave_idx:
+            concave_by_pos = sorted(concave_idx)
+            n_c = len(concave_by_pos)
+            for arc_i in range(n_c):
+                c_start = concave_by_pos[arc_i]
+                c_end   = concave_by_pos[(arc_i + 1) % n_c]
+                # Vertices strictly between the two concave corners (wraps if needed)
+                if c_start < c_end:
+                    arc_inner = list(range(c_start + 1, c_end))
+                else:
+                    arc_inner = list(range(c_start + 1, n_v)) + list(range(0, c_end))
+                if not arc_inner:
+                    continue
+                # Highest-radius vertex on this arc is the convex lobe peak
+                peak_idx = max(arc_inner, key=lambda i: r[i])
+                pt = _place_outward(peak_idx, vertices, zone_poly, cx, cy, r)
+                if pt is not None:
+                    convex_candidates.append(pt)
+
+            # Sort convex peaks by their peak radius (highest outward lobe first)
+            convex_candidates.sort(key=lambda t: -np.hypot(t[0] - cx, t[1] - cy))
+        else:
+            # No concavities at all: use the single highest-radius vertex as the
+            # only convex peak and pad with equally-spaced exterior points.
+            peak_idx = int(np.argmax(r))
+            pt = _place_outward(peak_idx, vertices, zone_poly, cx, cy, r)
+            if pt is not None:
+                convex_candidates.append(pt)
+
+        # Concave jammers first (by prominence), then convex arc peaks (by r).
+        all_candidates = concave_candidates + convex_candidates
+
+        # If there are still not enough, pad with equally-spaced exterior points.
+        cap = n_jammers if n_jammers is not None else len(all_candidates)
+        if len(all_candidates) < cap:
+            used_angles = {round(np.arctan2(t[1] - cy, t[0] - cx), 2)
+                           for t in all_candidates}
+            for angle in np.linspace(0, 2 * np.pi, cap * 4, endpoint=False):
+                if len(all_candidates) >= cap:
+                    break
+                if round(angle, 2) in used_angles:
+                    continue
+                ray = _LS([(cx, cy),
+                            (cx + 2000 * np.cos(angle), cy + 2000 * np.sin(angle))])
+                inter = ray.intersection(zone_poly.boundary)
+                if inter.is_empty:
+                    continue
+                bpt = (max(inter.geoms, key=lambda g: g.distance(_Pt(cx, cy)))
+                       if hasattr(inter, "geoms") else inter)
+                bx, by = float(bpt.x), float(bpt.y)
+                nx, ny = np.cos(angle), np.sin(angle)
+                all_candidates.append((bx + nx * standoff_distance,
+                                       by + ny * standoff_distance, nx, ny))
+
+    else:
+        # Box zone: distribute evenly around exterior perimeter
+        cx, cy = zone_params["center"][0], zone_params["center"][1]
+        w, h   = zone_params["width"], zone_params["height"]
+        zone_poly = ShapelyPolygon([
+            (cx - w / 2, cy - h / 2), (cx + w / 2, cy - h / 2),
+            (cx + w / 2, cy + h / 2), (cx - w / 2, cy + h / 2),
+        ])
+        cap = n_jammers if n_jammers is not None else 4
+        angles = np.linspace(0, 2 * np.pi, cap, endpoint=False)
+        all_candidates = []
+        for angle in angles:
+            ray = _LS([(cx, cy), (cx + 2000 * np.cos(angle), cy + 2000 * np.sin(angle))])
+            inter = ray.intersection(zone_poly.boundary)
+            if inter.is_empty:
+                continue
+            pt = (max(inter.geoms, key=lambda g: g.distance(_Pt(cx, cy)))
+                  if hasattr(inter, "geoms") else inter)
+            bx, by = float(pt.x), float(pt.y)
+            nx, ny = np.cos(angle), np.sin(angle)
+            all_candidates.append((bx + nx * standoff_distance,
+                                   by + ny * standoff_distance, nx, ny))
+
+    # ── Shared ray-cast helper (used by gap fill and interpolation) ──────────
+    _TWO_PI = 2 * np.pi
+
+    def _fill_ray(angle):
+        nx, ny = np.cos(angle), np.sin(angle)
+        ray = _LS([(cx, cy), (cx + 2000 * nx, cy + 2000 * ny)])
+        inter = ray.intersection(zone_poly.boundary)
+        if inter.is_empty:
+            return None
+        bpt = (max(inter.geoms, key=lambda g: g.distance(_Pt(cx, cy)))
+               if hasattr(inter, "geoms") else inter)
+        bx, by = float(bpt.x), float(bpt.y)
+        return (bx + nx * standoff_distance,
+                by + ny * standoff_distance, nx, ny)
+
+    # ── Angular gap fill ─────────────────────────────────────────────────────
+    # Iteratively subdivide any angular sector (from centroid) larger than
+    # max_gap_deg until all gaps are within the threshold.  Using midpoint
+    # bisection handles both large initial gaps (e.g. a single starting
+    # candidate on a smooth circle) and the n_cands==1 wrap-around edge case.
+    if all_candidates and max_gap_deg > 0:
+        max_gap_rad = np.deg2rad(max_gap_deg)
+
+        fill_candidates = []
+        live_angles = sorted(
+            np.arctan2(t[1] - cy, t[0] - cx) for t in all_candidates
+        )
+
+        changed = True
+        max_iters = 32  # safety cap (2^32 fills would be absurd)
+        while changed and max_iters > 0:
+            max_iters -= 1
+            changed = False
+            n_a = len(live_angles)
+            new_angles = []
+            for i in range(n_a):
+                a0 = live_angles[i]
+                a1 = live_angles[(i + 1) % n_a]
+                # Correct wrap-around: when n_a==1 the gap is the full circle
+                gap = (a1 - a0) % _TWO_PI or _TWO_PI
+                if gap > max_gap_rad:
+                    mid = a0 + gap / 2
+                    pt = _fill_ray(mid)
+                    if pt is not None:
+                        fill_candidates.append(pt)
+                        new_angles.append(mid)
+                        changed = True
+            live_angles = sorted(live_angles + new_angles)
+
+        all_candidates = all_candidates + fill_candidates
+
+    # ── Contour interpolation ────────────────────────────────────────────────
+    # Insert (interpolation_factor - 1) evenly-spaced jammers between every
+    # consecutive pair of existing jammers (in angular order around the
+    # centroid).  Each inserted point is ray-cast to the zone boundary so it
+    # follows the zone contour rather than straight-line interpolating.
+    if interpolation_factor > 1 and all_candidates:
+        n_inserts = interpolation_factor - 1
+        sorted_cands = sorted(all_candidates,
+                              key=lambda t: np.arctan2(t[1] - cy, t[0] - cx))
+        n_sc = len(sorted_cands)
+        interp_candidates = []
+        for i in range(n_sc):
+            a0 = np.arctan2(sorted_cands[i][1] - cy, sorted_cands[i][0] - cx)
+            a1 = np.arctan2(sorted_cands[(i + 1) % n_sc][1] - cy,
+                            sorted_cands[(i + 1) % n_sc][0] - cx)
+            gap = (a1 - a0) % _TWO_PI or _TWO_PI
+            for k in range(1, n_inserts + 1):
+                mid = a0 + gap * k / (n_inserts + 1)
+                pt = _fill_ray(mid)
+                if pt is not None:
+                    interp_candidates.append(pt)
+        all_candidates = sorted_cands + interp_candidates
+
+    cap = n_jammers if n_jammers is not None else len(all_candidates)
+    result = []
+    for jx, jy, nx, ny in all_candidates[:cap]:
+        jx, jy = _push_to_min_bs_dist(jx, jy, nx, ny)
+        result.append([float(jx), float(jy)])
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _make_qrand(lds: str):
+    """Return a scipy QMC sampler (or None for pure uniform)."""
+    if lds == "Sobol":
+        return scipy.stats.qmc.Sobol(d=3, scramble=False, seed=None)
+    elif lds == "Halton":
+        return scipy.stats.qmc.Halton(d=3, scramble=False, seed=None)
+    elif lds == "Latin":
+        return scipy.stats.qmc.LatinHypercube(d=3, scramble=False, seed=None)
+    elif lds == "Uniform":
+        return None
+    else:
+        warnings.warn(f"Unknown LDS '{lds}'. Falling back to Halton.")
+        return scipy.stats.qmc.Halton(d=3, scramble=False, seed=None)
+
+
+def _setup_tx_state(scene, cfg: TxConfig, scene_xml_path: str, qrand,
+                    obstacles) -> dict:
+    """Initialise geometry and sampling infrastructure for one TX."""
+    tx = scene.get(cfg.name)
+
+    tx_x = float(dr.detach(tx.position[0])[0])
+    tx_y = float(dr.detach(tx.position[1])[0])
+    tx_z = float(dr.detach(tx.position[2])[0])
+    tx_position = [tx_x, tx_y, tx_z]
+    tx_power_dbm = float(tx.power_dbm[0])
+
+    if cfg.on_building:
+        tx_placement = TxPlacement(
+            scene, cfg.name, scene_xml_path, cfg.building_id, create_if_missing=False
+        )
+    else:
+        tx_placement = TxPlacement(
+            scene, cfg.name, scene_xml_path, None, create_if_missing=False
+        )
+
+    # Zone geometry --------------------------------------------------------
+    zone_type = "polygon" if "vertices" in cfg.zone_params else "box"
+    target_zone, building_exclusions, _ = get_zone_polygon_with_exclusions(
+        zone_type=zone_type,
+        zone_params=cfg.zone_params,
+        scene_xml_path=scene_xml_path,
+        exclude_buildings=True,
+    )
+
+    if zone_type == "box":
+        bx, by = cfg.zone_params["center"][0], cfg.zone_params["center"][1]
+        bw, bh = cfg.zone_params["width"], cfg.zone_params["height"]
+        box_polygon = ShapelyPolygon([
+            (bx - bw / 2, by - bh / 2), (bx + bw / 2, by - bh / 2),
+            (bx + bw / 2, by + bh / 2), (bx - bw / 2, by + bh / 2),
+        ])
+    else:
+        box_polygon = ShapelyPolygon(cfg.zone_params["vertices"])
+
+    # Every building in the scene, not just those touching this zone: BSs and
+    # jammers move outside the zone, and the outside-receiver ring extends far
+    # beyond it, so all of them must avoid every footprint. Receivers sit at
+    # ground level, so they use the 2-D union of all footprints.
+    cached_building_polygons = obstacles.footprints
+    building_union = obstacles.union_all
+
+    zone_polygon = (
+        box_polygon.difference(building_union)
+        if building_union is not None else box_polygon
+    )
+
+    tri_verts_full, _ = triangulate_zone(target_zone, building_exclusions)
+    tri_full_prepared = prepare_triangulated_sampler(tri_verts_full)
+
+    # A free-roaming BS seeded inside a building volume is moved out now,
+    # before its initial boresight is computed, so iteration 0 already starts
+    # from a valid position (the post-step projection would only fix it
+    # afterwards). A BS seeded above the roof is left where it is.
+    if not cfg.on_building:
+        nx, ny, nz = obstacles.push(tx_x, tx_y, tx_z, z_max=_NODE_Z_MAX)
+        if (nx, ny, nz) != (tx_x, tx_y, tx_z):
+            tx_x, tx_y, tx_z = nx, ny, nz
+            tx_position = [tx_x, tx_y, tx_z]
+            tx.position = mi.Point3f(float(tx_x), float(tx_y), float(tx_z))
+
+    # Initial angles -------------------------------------------------------
+    target_z = 1.5
+    if "center" in cfg.zone_params:
+        look_at_xyz = list(cfg.zone_params["center"])[:2] + [target_z]
+    else:
+        c = box_polygon.centroid
+        look_at_xyz = [c.x, c.y, target_z]
+
+    if cfg.initial_azimuth_deg is not None and cfg.initial_elevation_deg is not None:
+        initial_azimuth = cfg.initial_azimuth_deg
+        initial_elevation = cfg.initial_elevation_deg
+    else:
+        initial_azimuth, initial_elevation = compute_initial_angles_from_position(
+            tx_position, look_at_xyz, verbose=False
+        )
+
+    initial_power_dbm = cfg.initial_power_dbm
+
+    return {
+        "tx_placement":           tx_placement,
+        "tx_position":            tx_position,
+        "tx_height":              tx_z,
+        "tx_ref_power_dbm":       tx_power_dbm,
+        "box_polygon":            box_polygon,
+        "zone_polygon":           zone_polygon,
+        "target_zone":            target_zone,
+        "building_exclusions":    building_exclusions,
+        "cached_building_polygons": cached_building_polygons,
+        "building_union":         building_union,
+        "obstacles":              obstacles,
+        "tri_verts_full":         tri_verts_full,
+        "tri_full_prepared":      tri_full_prepared,
+        "qrand":                  qrand,
+        "dead_zones":             [],
+        "dead_buffs":             [],
+        "dead_points":            np.zeros((0, 3)),
+        "initial_azimuth":        initial_azimuth,
+        "initial_elevation":      initial_elevation,
+        "initial_power_dbm":      initial_power_dbm,
+        "rx_slice":               None,   # filled after all states created
+        "rx_indices_drjit":       None,   # filled after all states created
+        "az_history":             [],
+        "el_history":             [],
+        "power_history":          [],
+        "current_sample_points":  None,
+        "_alive_tri_cache_key":   None,
+        "_alive_tri_verts":       None,
+        "_alive_tri_prepared":    None,
+    }
+
+
+def _param_strides(tx_configs, num_tx_ant):
+    """Return (strides, offsets) for the gNB flat parameter list.
+
+    Each gNB contributes 6 + 2*num_tx_ant params:
+    [az, el, x, y, z, power_dbm, wr_0, wi_0, ..., wr_{M-1}, wi_{M-1}]
+    where (wr_m, wi_m) are raw (unnormalized) real/imag precoding weights
+    for tx antenna element m.
+    """
+    stride = 6 + 2 * num_tx_ant
+    strides = [stride] * len(tx_configs)
+    offsets = [sum(strides[:k]) for k in range(len(strides))]
+    return strides, offsets
+
+
+def _jam_param_strides(jam_configs):
+    """Return (strides, offsets) for the jammer flat parameter list.
+
+    Each jammer contributes 7 params: [az, el, x, y, z, power_dbm, gate_logit].
+    gate_logit is an unconstrained scalar; sigmoid(gate_logit) gates the jammer's field
+    contribution so the optimizer can drive it to ~0 to effectively turn the jammer off.
+    """
+    jam_configs = jam_configs or []
+    strides = [7] * len(jam_configs)
+    offsets = [sum(strides[:k]) for k in range(len(strides))]
+    return strides, offsets
+
+
+def _union_of_footprints(footprints):
+    """Union of building footprints for containment/snap queries; None if empty.
+
+    Grow-then-shrink by 10 cm fuses footprints that share a wall but are
+    separated by a hairline crack. Left as-is, the union keeps the crack as
+    boundary, so the nearest "wall" to a point inside is the crack and a push
+    through it lands in the neighbouring building instead of outside.
+    """
+    if not footprints:
+        return None
+    return shapely.ops.unary_union(footprints).buffer(0.1).buffer(-0.1)
+
+
+def _push_outside_buildings(x, y, building_union):
+    """Move (x, y) out of every building footprint; unchanged if already outside.
+
+    `building_union` is the union of all footprints, or None. Snapping to the
+    union's boundary (rather than one polygon's exterior) can't land inside an
+    adjacent or overlapping building. The point is then nudged a hair past the
+    wall, because a point computed exactly on a boundary can still test as
+    "inside" through float rounding.
+    """
+    if building_union is None:
+        return x, y
+    pt = shapely.geometry.Point(x, y)
+    eps = 1e-3
+    for _ in range(4):
+        if not building_union.contains(pt):
+            break
+        wall = shapely.ops.nearest_points(pt, building_union.boundary)[1]
+        d = float(np.hypot(wall.x - pt.x, wall.y - pt.y))
+        ux, uy = ((wall.x - pt.x) / d, (wall.y - pt.y) / d) if d > 0 else (0.0, 0.0)
+        pt = shapely.geometry.Point(wall.x + eps * ux, wall.y + eps * uy)
+        eps *= 10.0
+    return pt.x, pt.y
+
+
+_ROOF_CLEARANCE_M = 1.0   # a node must sit this far above a roof to fly over it
+_NODE_Z_MAX = 50.0        # the z clamp applied to BS and jammer altitudes
+_JAM_INIT_Z = 50.0        # altitude every jammer starts at
+_PIN_TOL_M = 0.05         # projection moved a node more than this => it was pinned
+
+
+class _BuildingObstacles:
+    """Building footprints with roof heights, for 3-D node-placement checks.
+
+    A node at (x, y, z) is inside a building when (x, y) lies in its footprint
+    AND z is below the roof (plus a clearance), so a node above the roof may
+    fly over it. Ground-level receivers use `union_all`, the 2-D union of every
+    footprint.
+    """
+
+    def __init__(self, footprints, roof_heights, clearance=_ROOF_CLEARANCE_M):
+        self.footprints = list(footprints)
+        self.roofs = np.asarray(roof_heights, dtype=float)
+        self.clearance = float(clearance)
+        self.union_all = _union_of_footprints(self.footprints)
+        self._levels = np.unique(self.roofs)
+        self._blocking = {}
+
+    def _blocking_union(self, z):
+        """Union of footprints whose roof (+clearance) is above altitude z.
+
+        Cached per distinct roof height, so at most one union is built for each
+        altitude band the nodes actually visit.
+        """
+        k = int(np.searchsorted(self._levels, z - self.clearance, side="right"))
+        if k >= len(self._levels):
+            return None  # above every roof
+        if k not in self._blocking:
+            keep = self.roofs >= self._levels[k]
+            self._blocking[k] = _union_of_footprints(
+                [p for p, kp in zip(self.footprints, keep) if kp]
+            )
+        return self._blocking[k]
+
+    def _roof_at(self, x, y):
+        pt = shapely.geometry.Point(x, y)
+        return max((r for p, r in zip(self.footprints, self.roofs)
+                    if p.contains(pt)), default=0.0)
+
+    def push(self, x, y, z, z_max=None):
+        """Move (x, y, z) out of any building volume it is inside.
+
+        Picks the nearer of two exits: sideways to the wall at this altitude, or
+        straight up to just above the roof (only if that stays within z_max).
+        Nodes already outside every building volume are returned unchanged.
+        """
+        for _ in range(3):
+            blocking = self._blocking_union(z)
+            if blocking is None or not blocking.contains(shapely.geometry.Point(x, y)):
+                break
+            hx, hy = _push_outside_buildings(x, y, blocking)
+            roof = self._roof_at(x, y)
+            z_up = roof + self.clearance + 1e-3
+            if (roof > 0.0 and z_max is not None and z_up <= z_max
+                    and (z_up - z) < float(np.hypot(hx - x, hy - y))):
+                z = z_up
+            else:
+                x, y = hx, hy
+        return x, y, z
+
+
+def _load_building_obstacles(scene_xml_path):
+    """Every building in the scene as a _BuildingObstacles.
+
+    Deliberately NOT limited to buildings touching a zone (unlike
+    get_zone_polygon_with_exclusions): BSs and jammers roam outside the zone,
+    so placement checks must know every building. Self-intersecting footprints
+    are repaired rather than dropped so no building escapes them; each repaired
+    part keeps the building's roof height.
+    """
+    from scene_parser import extract_building_info
+
+    footprints, roofs = [], []
+    for info in extract_building_info(scene_xml_path, verbose=False).values():
+        try:
+            geom = ShapelyPolygon([(v[0], v[1]) for v in info["vertices"]])
+        except Exception:
+            continue
+        if not geom.is_valid:
+            geom = shapely.make_valid(geom)
+        for g in getattr(geom, "geoms", [geom]):
+            if g.geom_type == "Polygon" and not g.is_empty:
+                footprints.append(g)
+                roofs.append(float(info["z_height"]))
+    return _BuildingObstacles(footprints, roofs)
+
+
+def _sample_zone_points(state: dict, cfg: TxConfig, n: int,
+                        sampler: str, sampling_strata: str,
+                        ground_z: float) -> np.ndarray:
+    """Sample n receiver points in this TX's coverage zone.
+
+    sampler         : "triangulated" | "rejection"
+    sampling_strata : "dead_only"    | "proportional"   | "full"
+
+    In "proportional" and "dead_only" modes the alive zone and each dead zone
+    stratum are always sampled independently.  Each dead zone stratum receives
+    a point budget proportional to its area (largest-remainder allocation).
+    The "full" strata must be chosen explicitly; it never fires as a fallback.
+    """
+    dead_zones     = state["dead_zones"]
+    zone_polygon   = state["zone_polygon"]
+    tri_verts_full = state["tri_verts_full"]
+    qrand          = state["qrand"]
+    cached_bldgs   = state["cached_building_polygons"]
+
+    def _sample_full_zone(n_pts):
+        if sampler == "rejection":
+            pts, *_ = sample_grid_points(
+                zone_polygon, n_pts, qrand,
+                building_polygons=cached_bldgs, ground_z=ground_z,
+            )
+        else:
+            pts = sample_from_prepared(state["tri_full_prepared"], n_pts, ground_z=ground_z)
+        return pts
+
+    def _sample_dead_strata(n_pts):
+        """Sample n_pts across dead zone strata, each stratum independently.
+
+        Point budget per stratum is proportional to area (largest-remainder).
+        Returns an (m, 3) array or None if all strata fail.
+        """
+        areas = [dz.area for dz in dead_zones]
+        total = sum(areas) or 1.0
+        exact = [n_pts * a / total for a in areas]
+        floors = [int(e) for e in exact]
+        remainder = n_pts - sum(floors)
+        order = sorted(range(len(dead_zones)), key=lambda i: -(exact[i] - floors[i]))
+        for i in order[:remainder]:
+            floors[i] += 1
+
+        if sampler == "rejection":
+            parts = []
+            for dz, k in zip(dead_zones, floors):
+                if k > 0:
+                    pts, *_ = sample_grid_points(
+                        dz, k, qrand,
+                        building_polygons=cached_bldgs, ground_z=ground_z,
+                    )
+                    parts.append(pts)
+            return np.vstack(parts) if parts else None
+        else:
+            # sample_dead_zones triangulates each stratum and allocates
+            # proportionally by area — pass the pre-computed allocations
+            # by sampling each stratum independently and stacking.
+            parts = []
+            for dz, k in zip(dead_zones, floors):
+                if k > 0:
+                    pts = sample_dead_zones([dz], k, building_exclusions=[state["building_exclusions"]])
+                    if pts is not None and len(pts) > 0:
+                        pts[:, 2] = ground_z
+                        parts.append(pts)
+            return np.vstack(parts) if parts else None
+
+    if sampling_strata == "proportional":
+        if not dead_zones:
+            # No dead zones — entire zone is alive
+            return _sample_full_zone(n)[:n]
+
+        dead_union = shapely.ops.unary_union(dead_zones)
+        alive_zone = zone_polygon.difference(dead_union)
+        if alive_zone.is_empty:
+            alive_zone = zone_polygon
+
+        alive_area = alive_zone.area
+        dead_area  = dead_union.intersection(zone_polygon).area
+        total_area = alive_area + dead_area or 1.0
+        n_alive = max(1, round(n * alive_area / total_area))
+        n_dead  = max(0, n - n_alive)
+
+        # Sample alive zone independently
+        if sampler == "rejection":
+            alive_pts, *_ = sample_grid_points(
+                alive_zone, n_alive, qrand,
+                building_polygons=cached_bldgs, ground_z=ground_z,
+            )
+        else:
+            cache_key = id(dead_zones)
+            if state["_alive_tri_cache_key"] != cache_key:
+                try:
+                    alive_tri, _ = triangulate_zone(
+                        alive_zone, state["building_exclusions"]
+                    )
+                    state["_alive_tri_verts"]    = alive_tri
+                    state["_alive_tri_prepared"] = prepare_triangulated_sampler(alive_tri)
+                    state["_alive_tri_cache_key"] = cache_key
+                except Exception as e:
+                    warnings.warn(
+                        f"alive-zone triangulation failed, falling back to full zone: {e}"
+                    )
+                    state["_alive_tri_verts"]    = tri_verts_full
+                    state["_alive_tri_prepared"] = state["tri_full_prepared"]
+                    state["_alive_tri_cache_key"] = cache_key
+            alive_pts = sample_from_prepared(
+                state["_alive_tri_prepared"], n_alive, ground_z=ground_z
+            )
+
+        # Sample each dead zone stratum independently
+        if n_dead > 0:
+            dead_pts = _sample_dead_strata(n_dead)
+            if dead_pts is not None and len(dead_pts) > 0:
+                return np.vstack([alive_pts, dead_pts[:n_dead]])[:n]
+
+        return alive_pts[:n]
+
+    elif sampling_strata == "dead_only":
+        if dead_zones:
+            pts = _sample_dead_strata(n)
+            if pts is not None and len(pts) > 0:
+                return pts[:n]
+        return np.zeros((0, 3), dtype=np.float32)
+
+    elif sampling_strata == "full":
+        return _sample_full_zone(n)[:n]
+
+    else:
+        raise ValueError(f"Unknown sampling_strata: {sampling_strata!r}")
+
+
+def _sample_outside_zone(state: dict, n_inside: int, ground_z: float,
+                         outer_half_size: float = 500.0) -> np.ndarray:
+    """Sample points outside the zone, area-proportional to n_inside.
+
+    The sample count is scaled by (outer_ring.area / zone.area) so that the
+    spatial density of outside samples matches the inside density, giving each
+    square metre equal weight in the loss function.
+
+    The outer region is a square of ±outer_half_size metres centred on the zone
+    centroid with the zone polygon and building footprints subtracted.  Using a
+    fixed square (rather than a scaled copy of the zone) gives a consistent,
+    zone-shape-invariant outer sampling region across all simulation geometries.
+    """
+    from shapely import contains_xy as _cxy
+    import shapely.ops
+
+    box_poly = state["box_polygon"]
+    centroid = box_poly.centroid
+    cx, cy = centroid.x, centroid.y
+    h = outer_half_size
+    outer_poly = ShapelyPolygon([
+        (cx - h, cy - h), (cx + h, cy - h),
+        (cx + h, cy + h), (cx - h, cy + h),
+    ])
+    outer_ring = outer_poly.difference(box_poly)
+
+    bldg_union = state.get("building_union")
+    if bldg_union is not None:
+        outer_ring = outer_ring.difference(bldg_union)
+
+    zone_area = box_poly.area
+    ring_area  = outer_ring.area
+    area_ratio = ring_area / zone_area if zone_area > 0 else 1.0
+    n = max(1, round(n_inside * area_ratio))
+
+    minx, miny, maxx, maxy = outer_ring.bounds
+    rng = np.random.default_rng()
+    pts: list = []
+    while len(pts) < n:
+        batch = max((n - len(pts)) * 4, 512)
+        xs = rng.uniform(minx, maxx, batch)
+        ys = rng.uniform(miny, maxy, batch)
+        mask = _cxy(outer_ring, xs, ys)
+        for x, y in zip(xs[mask], ys[mask]):
+            pts.append([x, y, ground_z])
+            if len(pts) >= n:
+                break
+    return np.array(pts[:n], dtype=np.float32)
+
+
+def _accumulate_dead_zones(
+    state, cfg, tx_idx, rm,
+    map_config, dead_tail_percentile, max_dbscan_points,
+    debug_viz=False, iteration=0
+):
+    """Rebuild dead-zone polygons for one TX using cell-aggregated RSS.
+
+    Uses rm.rss[tx_idx] (shape H×W, watts) so multipath fades average out
+    across the cell and only spatially coherent weak areas are identified.
+    """
+    from shapely import contains_xy as _cxy
+
+    state["dead_points"] = np.zeros((0, 3))
+    state["dead_zones"]  = []
+    state["dead_buffs"]  = []
+
+    # Per-TX cell-aggregated RSS (watts), shape (H, W)
+    rss_np = rm.rss.numpy()[tx_idx]
+    #print(f"RSS Size from RMS: {rss_np}")
+
+    # Compute 1 m cell centres from map_config geometry
+    cx, cy = map_config["center"][0], map_config["center"][1]
+    #print(f"Center Values: {cx}, {cy}")
+    sx, sy = map_config["size"][0],   map_config["size"][1]
+    #print(f"Zone Size Values: {sx}, {sy}")
+    H, W   = rss_np.shape
+    xs = cx - sx / 2.0 + sx / W * (np.arange(W) + 0.5)
+    #print(f"Grid Axis X: {xs}")
+    ys = cy - sy / 2.0 + sy / H * (np.arange(H) + 0.5)
+    #print(f"Grid Axis Y: {ys}")
+    xx, yy = np.meshgrid(xs, ys)
+
+    pos_x = xx.ravel()
+    pos_y = yy.ravel()
+    power = rss_np.ravel()
+
+    # Zone Check
+    in_zone  = _cxy(state["zone_polygon"], pos_x, pos_y)
+    pos_x_z  = pos_x[in_zone]
+    pos_y_z  = pos_y[in_zone]
+    power_z  = power[in_zone]
+
+    if len(pos_x_z) == 0:
+        return
+    
+    # Fill rx_data 
+    rx_data  = np.column_stack([pos_x_z, pos_y_z, power_z])
+    dead_pts = filter_and_append(rx_data, state["dead_points"], dead_tail_percentile)
+
+    if debug_viz:
+        import matplotlib.pyplot as _plt
+        import os
+        os.makedirs("debug_viz", exist_ok=True)
+
+        fig, ax = _plt.subplots(figsize=(8, 8))
+
+        log_pwr_z = np.log10(power_z + 1e-30)
+        sc = ax.scatter(pos_x_z, pos_y_z, c=log_pwr_z,
+                        cmap="viridis", s=4.0, alpha=0.8, rasterized=True)
+
+        # Overlay dead-tail boundary
+        if len(dead_pts):
+            thresh_log = np.log10(dead_pts[:, 2].max() + 1e-30)
+            ax.scatter(dead_pts[:, 0], dead_pts[:, 1],
+                       edgecolors="black", facecolors="none",
+                       s=6.0, linewidths=0.3, alpha=0.6, rasterized=True,
+                       label=f"dead tail ({dead_tail_percentile}th %ile)")
+
+        zone_geoms = (list(state["zone_polygon"].geoms)
+                      if state["zone_polygon"].geom_type == "MultiPolygon"
+                      else [state["zone_polygon"]])
+        for gi, geom in enumerate(zone_geoms):
+            ax.plot(*geom.exterior.xy, "w-", linewidth=1.5,
+                    label="zone" if gi == 0 else None)
+
+        _plt.colorbar(sc, ax=ax, label="log₁₀(RSS) — all in-zone cells")
+        ax.set_title(f"{cfg.name} (tx_idx={tx_idx}) — iter {iteration} "
+                     f"— {len(dead_pts)} dead cells / {int(in_zone.sum())} in-zone")
+        ax.set_aspect("equal")
+        out_path = os.path.join("debug_viz", f"{cfg.name}_iter{iteration:03d}.png")
+        fig.savefig(out_path, dpi=120)
+        _plt.show()
+        _plt.close(fig)
+        print(f"[debug_viz] {out_path}")
+
+    if len(dead_pts) == 0:
+        return
+
+    if len(dead_pts) > max_dbscan_points:
+        rng      = np.random.default_rng(42)
+        dead_pts = dead_pts[rng.choice(len(dead_pts), max_dbscan_points, replace=False)]
+
+    #clusters      = HDBSCAN(min_samples=5, copy=False).fit(dead_pts[:, :2])
+    
+    clusters      = DBSCAN(min_samples=5, eps=5.0).fit(dead_pts[:, :2])
+    labels        = clusters.labels_
+    
+    unique_labels = set(labels) - {-1}
+
+    for cid in sorted(unique_labels):
+        pts = dead_pts[labels == cid, :2]
+        if len(pts) < 3:
+            continue
+        # Delaunay (used by alphashape) lifts 2-D points onto a 3-D paraboloid;
+        # if the points are (nearly) collinear the lifted simplex is flat and
+        # Qhull raises QH6013/QH6154.  Check via the smaller singular value of
+        # the centred point matrix — if it's essentially zero the cluster is
+        # degenerate and contributes nothing useful as a dead-zone polygon.
+        centered = pts - pts.mean(axis=0)
+        _, s, _ = np.linalg.svd(centered, full_matrices=False)
+        if s[-1] < 1e-6:
+            continue
+
+        shape = alphashape.alphashape(pts, alpha=0.01)
+        shape = shapely.make_valid(shape)
+        state["dead_zones"].append(shape)
+    
+    state["dead_buffs"] = state["dead_zones"]
+    state["dead_points"] = dead_pts
+
+    if debug_viz and len(state["dead_zones"]) > 0:
+        _visualize_dead_zone_pipeline(
+            dead_pts, labels, state["dead_zones"],
+            state["zone_polygon"], cfg.name, iteration,
+            building_exclusions=state["building_exclusions"],
+        )
+
+
+def _visualize_dead_zone_pipeline(
+    dead_pts, labels, dead_zones, zone_polygon,
+    tx_name, iteration, building_exclusions=None,
+):
+    """Three-panel figure showing the dead-zone processing pipeline:
+    cluster labels → alphashapes → triangulated strata.
+    """
+    from IPython.display import display
+    from matplotlib.collections import PolyCollection
+
+    n_clusters = len(dead_zones)
+    cmap = plt.cm.get_cmap("tab10" if n_clusters <= 10 else "tab20")
+    colors = [cmap(i % cmap.N) for i in range(max(n_clusters, 1))]
+
+    unique_cluster_ids = sorted(set(labels) - {-1})
+    label_to_color = {cid: colors[i % len(colors)] for i, cid in enumerate(unique_cluster_ids)}
+
+    # Pre-build building polygons once for drawing on all panels
+    bldg_polys = []
+    if building_exclusions:
+        for bcoords in building_exclusions:
+            try:
+                p = ShapelyPolygon(bcoords)
+                if p.is_valid and not p.is_empty:
+                    bldg_polys.append(p)
+            except Exception:
+                pass
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+
+    def _draw_zone(ax):
+        geoms = (list(zone_polygon.geoms)
+                 if zone_polygon.geom_type == "MultiPolygon"
+                 else [zone_polygon])
+        for geom in geoms:
+            ax.plot(*geom.exterior.xy, "k-", linewidth=1.5)
+            # Interior rings are buildings fully inside the zone — draw them too
+            for interior in geom.interiors:
+                ix, iy = interior.xy
+                ax.fill(ix, iy, color="#999999", alpha=0.7, zorder=2)
+                ax.plot(ix, iy, "k-", linewidth=0.8, zorder=3)
+        # Buildings touching the boundary become MultiPolygon splits rather than
+        # interior rings, so draw all building footprints directly to catch those.
+        for bp in bldg_polys:
+            bx, by = bp.exterior.xy
+            ax.fill(bx, by, color="#999999", alpha=0.7, zorder=2)
+            ax.plot(bx, by, "k-", linewidth=0.8, zorder=3)
+        ax.set_aspect("equal")
+        ax.grid(True, alpha=0.2)
+
+    # ── Panel 1: DBSCAN cluster labels ────────────────────────────────────
+    ax = axes[0]
+    _draw_zone(ax)
+    noise_mask = labels == -1
+    if noise_mask.any():
+        ax.scatter(dead_pts[noise_mask, 0], dead_pts[noise_mask, 1],
+                   c="lightgray", s=2, alpha=0.4, rasterized=True, label="noise")
+    for cid in unique_cluster_ids:
+        mask = labels == cid
+        ax.scatter(dead_pts[mask, 0], dead_pts[mask, 1],
+                   color=label_to_color[cid], s=3, alpha=0.7,
+                   rasterized=True, label=f"cluster {cid}")
+    ax.set_title("1. DBSCAN Cluster Labels")
+    ax.set_xlabel("X (m)"); ax.set_ylabel("Y (m)")
+    if n_clusters <= 10:
+        ax.legend(markerscale=3, fontsize=7, loc="best")
+
+    # ── Panel 2: alphashapes ──────────────────────────────────────────────
+    ax = axes[1]
+    _draw_zone(ax)
+    for i, shape in enumerate(dead_zones):
+        color = colors[i % len(colors)]
+        geoms = (list(shape.geoms)
+                 if shape.geom_type in ("MultiPolygon", "GeometryCollection")
+                 else [shape])
+        for geom in geoms:
+            if geom.geom_type != "Polygon":
+                continue
+            x, y = geom.exterior.xy
+            ax.fill(x, y, color=color, alpha=0.45)
+            ax.plot(x, y, color=color, linewidth=1.0)
+    ax.set_title("2. Alphashape Strata")
+    ax.set_xlabel("X (m)")
+
+    # ── Panel 3: triangulated strata ─────────────────────────────────────
+    ax = axes[2]
+    _draw_zone(ax)
+    excl = building_exclusions or []
+    for i, shape in enumerate(dead_zones):
+        color = colors[i % len(colors)]
+        geoms = (list(shape.geoms)
+                 if shape.geom_type in ("MultiPolygon", "GeometryCollection")
+                 else [shape])
+        for geom in geoms:
+            if geom.geom_type != "Polygon" or geom.is_empty:
+                continue
+            boundary = list(geom.exterior.coords)[:-1]
+            try:
+                tv, _ = triangulate_zone(boundary, excl)
+            except Exception:
+                continue
+            if len(tv) == 0:
+                continue
+            fc = (*color[:3], 0.4)
+            ec = (*color[:3], 0.9)
+            ax.add_collection(PolyCollection(tv, facecolor=fc, edgecolor=ec, linewidth=0.4))
+    ax.autoscale_view()
+    ax.set_title("3. Triangulated Strata")
+    ax.set_xlabel("X (m)")
+
+    plt.tight_layout()
+    display(fig)
+    plt.close(fig)
+
+
+def _extract_per_rx_power(h_real, h_imag, tx_idx: int, w_real, w_imag):
+    """Return a TensorXf of shape (num_rx,) with power from tx_idx only.
+
+    Stays in TensorXf throughout to preserve DrJit AD gradient tracking.
+    Calling .array on a TensorXf returns drjit.cuda.Float (non-AD), which
+    severs the gradient chain — so we never do that conversion here.
+
+    h_real shape: (num_rx, num_rx_ant, num_tx, num_tx_ant, num_paths) - DrJit TensorXf
+
+    w_real, w_imag: length-num_tx_ant lists of (already-normalized) DrJit Float
+    scalars — the precoding weight for each tx antenna element. Elements are
+    combined coherently (complex sum weighted by precoding) before squaring,
+    matching how RadioMapSolver applies its precoding_vec, so the two solvers
+    agree for any num_tx_ant (they only coincide by accident for num_tx_ant=1
+    under naive per-element power summation).
+    """
+    hr_all = h_real[:, :, tx_idx:tx_idx + 1, :, :]
+    hi_all = h_imag[:, :, tx_idx:tx_idx + 1, :, :]
+    er = ei = None
+    for m in range(len(w_real)):
+        hr_m = hr_all[:, :, :, m, :]
+        hi_m = hi_all[:, :, :, m, :]
+        term = cpx_mul((hr_m, hi_m), (w_real[m], w_imag[m]))
+        if er is None:
+            er, ei = term
+        else:
+            er, ei = cpx_add((er, ei), term)
+    # Collapse num_paths, num_tx=1, num_rx_ant  →  shape (num_rx,)
+    power_per_path = cpx_abs_square((er, ei))
+    return dr.sum(dr.sum(dr.sum(power_per_path, axis=-1), axis=-1), axis=-1)
+
+
+def _sir_loss_body(
+    all_params, N, tx_configs, tx_states, scene, p_solver,
+    noise_power, rx_objects,
+    ref_powers_dbm, jam_configs, jam_scene, jam_rx_objects, jam_objects,
+    num_inside=None,
+    gamma_db=0.0,
+    lambda_in=0.0,
+    lambda_out=10.0,
+    lambda_uniform=0.0,
+    lambda_min_j=1.0,
+    min_sinr_db=10.0,
+    soft_mean_weight=0.25,
+    soft_mean_in_weight=0.0,
+    epsilon=1e-30,
+    lambda_spread=0.0,
+    spread_min_dist=100.0,
+    inside_margin_db=0.0,
+    use_gate_logits=True,
+    num_tx_ant=1,
+):
+    """Containment SIR loss with hinge penalties.
+
+    Loss components (all in dB-space):
+      L_in      : squared hinge on (gamma - SINR) for inside cells
+                  -> penalizes service holes
+      L_out     : squared hinge on (SINR - gamma) for outside cells
+                  -> penalizes detectable leakage
+      L_uniform : variance of inside-cell SINR + squared hinge below min_sinr_db
+                  -> penalizes hotspot-driven coverage (non-uniform distribution)
+      L_min_j   : mean gate value across jammers
+                  -> sparsity pressure; drives unused jammers off
+
+    Parameters
+    ----------
+    gamma_db : float
+        Detection / decode threshold in dB. Set from threat model.
+    lambda_in, lambda_out : float
+        Loss-term weights. Sweep lambda_out / lambda_in for the
+        leakage / service-hole Pareto frontier.
+    lambda_uniform : float
+        Weight for the uniformity penalty (L_uniform). Default 0 (disabled).
+    min_sinr_db : float
+        Minimum acceptable SINR inside the zone (dB). Cells below this
+        threshold contribute a squared hinge to L_uniform, on top of the
+        variance term. Default 10 dB.
+    """
+    deg2rad = Float(float(np.pi / 180.0))
+    dr.disable_grad(deg2rad)
+
+    strides, offsets = _param_strides(tx_configs, num_tx_ant)
+
+    # ------------------------------------------------------------------
+    # Build power-scale factors for each gNB (DrJit-differentiable)
+    # ------------------------------------------------------------------
+    pow_scales = []
+    for i, cfg in enumerate(tx_configs):
+        pow_i = all_params[offsets[i] + 5]
+        dr.enable_grad(pow_i.array)
+        scale_i = dr.power(
+            Float(10.0),
+            (pow_i - Float(float(ref_powers_dbm[i]))) / Float(10.0),
+        )
+        pow_scales.append(scale_i)
+
+    # ------------------------------------------------------------------
+    # Build normalized (unit total power) precoding weights per gNB.
+    # Raw (wr_m, wi_m) pairs are unconstrained; L2-normalizing them here
+    # keeps the combining weight on the unit hypersphere without the
+    # phase-wraparound issues a polar (amplitude, phase) parameterization
+    # would need to guard against.
+    # ------------------------------------------------------------------
+    eps_prec = Float(1e-12)
+    dr.disable_grad(eps_prec)
+    prec_weights = []
+    for i, cfg in enumerate(tx_configs):
+        b = offsets[i] + 6
+        wr, wi = [], []
+        for m in range(num_tx_ant):
+            wr_m = all_params[b + 2 * m];     dr.enable_grad(wr_m.array)
+            wi_m = all_params[b + 2 * m + 1]; dr.enable_grad(wi_m.array)
+            wr.append(wr_m)
+            wi.append(wi_m)
+        norm = eps_prec
+        for m in range(num_tx_ant):
+            norm = norm + wr[m] * wr[m] + wi[m] * wi[m]
+        norm = dr.sqrt(norm)
+        prec_weights.append(([w / norm for w in wr], [w / norm for w in wi]))
+
+    # ------------------------------------------------------------------
+    # Set TX orientations and positions (independent jitter per axis)
+    # ------------------------------------------------------------------
+    for i, cfg in enumerate(tx_configs):
+        b    = offsets[i]
+        az_i = all_params[b];     dr.enable_grad(az_i.array)
+        el_i = all_params[b + 1]; dr.enable_grad(el_i.array)
+        x_i  = all_params[b + 2]; dr.enable_grad(x_i.array)
+        y_i  = all_params[b + 3]; dr.enable_grad(y_i.array)
+        z_i  = all_params[b + 4]; dr.enable_grad(z_i.array)
+
+        # Independent samples per DOF (previously a single scalar reused)
+        # jit_yaw   = Float(float(np.random.normal(0.0, 0.5 * np.pi / 180.0)))
+        # jit_pitch = Float(float(np.random.normal(0.0, 0.5 * np.pi / 180.0)))
+        # jit_x     = Float(float(np.random.normal(0.0, 0.1)))
+        # jit_y     = Float(float(np.random.normal(0.0, 0.1)))
+        # jit_z     = Float(float(np.random.normal(0.0, 0.1)))
+
+        jit_yaw   = Float(float(0.0))
+        jit_pitch = Float(float(0.0))
+        jit_x     = Float(float(0.0))
+        jit_y     = Float(float(0.0))
+        jit_z     = Float(float(0.0))
+
+        for j in (jit_yaw, jit_pitch, jit_x, jit_y, jit_z):
+            dr.disable_grad(j)
+
+        yaw   = az_i * deg2rad + jit_yaw
+        pitch = -(el_i * deg2rad) + jit_pitch
+        roll  = Float(0.0); dr.disable_grad(roll)
+
+        scene.get(cfg.name).orientation = [yaw, pitch, roll]
+        scene.get(cfg.name).position = [
+            x_i + jit_x,
+            y_i + jit_y,
+            z_i + jit_z,
+        ]
+
+    # ------------------------------------------------------------------
+    # gNB PathSolver call (directional pattern, scene)
+    # ------------------------------------------------------------------
+    paths = p_solver(
+        scene,
+        los=True,
+        refraction=True,
+        specular_reflection=True,
+        diffuse_reflection=True,
+    )
+    h_real, h_imag = paths.a
+
+    tx_power_vecs = []
+    for j in range(N):
+        w_real, w_imag = prec_weights[j]
+        p_raw = _extract_per_rx_power(h_real, h_imag, j, w_real, w_imag)
+        tx_power_vecs.append(p_raw * pow_scales[j])
+
+    dr.eval(*tx_power_vecs)
+    del paths, h_real, h_imag
+
+    # ------------------------------------------------------------------
+    # Compute total gNB parameter count correctly (per-config)
+    # ------------------------------------------------------------------
+    total_gnb_params = sum(strides)
+    _, jam_offsets = _jam_param_strides(jam_configs)
+
+    # ------------------------------------------------------------------
+    # Set jammer positions and build power-scale factors
+    # ------------------------------------------------------------------
+    jam_pow_scales = []
+    jam_gates     = []   # sigmoid(gate_logit) per jammer — 0 = off, 1 = on
+    jam_power_vecs = []
+    jam_xy_positions = []  # (xj, yj) DrJIT Floats for spread penalty
+    J = 0
+    if jam_configs:
+        for j, jcfg in enumerate(jam_configs):
+            b    = total_gnb_params + jam_offsets[j]
+            azj  = all_params[b];     dr.enable_grad(azj.array)
+            elj  = all_params[b + 1]; dr.enable_grad(elj.array)
+            xj   = all_params[b + 2]; dr.enable_grad(xj.array)
+            yj   = all_params[b + 3]; dr.enable_grad(yj.array)
+            zj   = all_params[b + 4]; dr.enable_grad(zj.array)
+            pj   = all_params[b + 5]; dr.enable_grad(pj.array)
+            glj  = all_params[b + 6]; dr.enable_grad(glj.array)
+            if use_gate_logits:
+                gate_j = dr.rcp(Float(1.0) + dr.exp(-glj))
+            else:
+                gate_j = Float(1.0); dr.disable_grad(gate_j)
+            jam_gates.append(gate_j)
+            jam_xy_positions.append((xj, yj))
+
+            jit_yaw   = Float(float(np.random.normal(0.0, 0.5 * np.pi / 180.0)))
+            jit_pitch = Float(float(np.random.normal(0.0, 0.5 * np.pi / 180.0)))
+            jit_x = Float(float(np.random.normal(0.0, 2.0)))
+            jit_y = Float(float(np.random.normal(0.0, 2.0)))
+            jit_z = Float(float(np.random.normal(0.0, 0.1)))
+            for _jv in (jit_yaw, jit_pitch, jit_x, jit_y, jit_z):
+                dr.disable_grad(_jv)
+
+            yaw_j   = azj * deg2rad + jit_yaw
+            pitch_j = -(elj * deg2rad) + jit_pitch
+            roll_j  = Float(0.0); dr.disable_grad(roll_j)
+
+            jam_scene.get(jcfg.name).orientation = [yaw_j, pitch_j, roll_j]
+            jam_scene.get(jcfg.name).position = [
+                xj + jit_x,
+                yj + jit_y,
+                zj + jit_z,
+            ]
+            scale_j = dr.power(
+                Float(10.0),
+                (pj - Float(float(jcfg.initial_power_dbm))) / Float(10.0),
+            )
+            jam_pow_scales.append(scale_j)
+
+        # ------------------------------------------------------------------
+        # Jammer PathSolver call (iso pattern, jam_scene)
+        # ------------------------------------------------------------------
+        jam_paths = p_solver(
+            jam_scene,
+            los=True,
+            refraction=False,
+            specular_reflection=True,
+            diffuse_reflection=False,
+        )
+        jh_real, jh_imag = jam_paths.a
+
+        # Jammers use a single-element antenna array (no beamforming), so the
+        # precoding weight is the trivial single-element unit vector.
+        _jam_w_real, _jam_w_imag = [Float(1.0)], [Float(0.0)]
+        dr.disable_grad(_jam_w_real[0]); dr.disable_grad(_jam_w_imag[0])
+
+        J = len(jam_configs)
+        for j in range(J):
+            jp_raw = _extract_per_rx_power(jh_real, jh_imag, j, _jam_w_real, _jam_w_imag)
+            jam_power_vecs.append(jp_raw * jam_pow_scales[j] * jam_gates[j])
+
+        dr.eval(*jam_power_vecs)
+        del jam_paths, jh_real, jh_imag
+
+    # ------------------------------------------------------------------
+    # Per-receiver SINR with best-BS selection
+    # ------------------------------------------------------------------
+    eps_f   = Float(float(epsilon));   dr.disable_grad(eps_f)
+    noise_f = Float(float(noise_power)); dr.disable_grad(noise_f)
+
+    total_jam_power = None
+    for jp in jam_power_vecs:
+        total_jam_power = jp if total_jam_power is None else (total_jam_power + jp)
+
+    best_sinr = None
+    for i in range(N):
+        p_sig = tx_power_vecs[i]
+
+        p_gnb_int = None
+        for j in range(N):
+            if j == i:
+                continue
+            p_gnb_int = tx_power_vecs[j] if p_gnb_int is None else (p_gnb_int + tx_power_vecs[j])
+
+        denom = noise_f
+        if p_gnb_int is not None:
+            denom = denom + p_gnb_int
+        if total_jam_power is not None:
+            denom = denom + total_jam_power
+
+        sinr_i = p_sig / denom
+        best_sinr = sinr_i if best_sinr is None else dr.maximum(best_sinr, sinr_i)
+
+    # ------------------------------------------------------------------
+    # Convert SINR to dB once (linear -> dB), then build hinge losses
+    # ------------------------------------------------------------------
+    log10 = Float(float(np.log(10.0))); dr.disable_grad(log10)
+    # Clamp before log: receivers with no signal paths have best_sinr≈0, giving
+    # d(log)/d(x) = 1/eps_f ≈ 1e30 which explodes gradients and causes Adam NaN.
+    # A floor of 1e-10 (-100 dB SINR) is physically below any useful threshold;
+    # dr.maximum is differentiable (grad=1 above floor, 0 below), so the gradient
+    # is cleanly zeroed for dead receivers rather than blowing up.
+    sinr_floored = dr.maximum(best_sinr, Float(1e-10))
+    sinr_db = Float(10.0) * dr.log(sinr_floored) / log10
+
+    gamma_f = Float(float(gamma_db));  dr.disable_grad(gamma_f)
+    zero_f  = Float(0.0);              dr.disable_grad(zero_f)
+
+    # Inside / outside split
+    if num_inside is not None and num_inside < dr.width(best_sinr):
+        n_in = int(num_inside)
+        sinr_in  = sinr_db[:n_in]
+        sinr_out = sinr_db[n_in:]
+
+        # L_in: softplus-squared hinge at (gamma + inside_margin_db) + soft mean.
+        # Softplus = log(1 + exp(x)) approximates max(0, x) but has non-zero
+        # gradient above the threshold — gradient decays smoothly rather than
+        # cliffing to zero the instant a cell crosses gamma.  Numerically stable
+        # form: max(x,0) + log(1 + exp(-|x|)), avoids exp overflow for large x.
+        # inside_margin_db shifts the target above gamma so cells that are only
+        # barely above the containment threshold continue to receive hinge pressure.
+        margin_f = Float(float(inside_margin_db)); dr.disable_grad(margin_f)
+        deficit_x = (gamma_f + margin_f) - sinr_in
+        sp_in = (dr.maximum(deficit_x, zero_f)
+                 + dr.log(Float(1.0) + dr.exp(-dr.abs(deficit_x))))
+        loss_inside = (dr.mean(sp_in * sp_in)
+                       - Float(float(soft_mean_in_weight)) * dr.mean(sinr_in))
+
+        # L_out: softplus-squared hinge + soft mean.
+        # Same smooth treatment on the outside so gradient is present even when
+        # cells are just below gamma, keeping continuous pressure on jammers.
+        excess_x = sinr_out - gamma_f
+        sp_out = (dr.maximum(excess_x, zero_f)
+                  + dr.log(Float(1.0) + dr.exp(-dr.abs(excess_x))))
+        loss_outside = dr.mean(sp_out * sp_out) + Float(float(soft_mean_weight)) * dr.mean(sinr_out)
+    else:
+        # No partition provided: treat all cells as "inside"
+        deficit = dr.maximum(gamma_f - sinr_db, zero_f)
+        loss_inside = dr.mean(deficit * deficit)
+        loss_outside = Float(0.0); dr.disable_grad(loss_outside)
+
+    # L_uniform: variance of inside-cell SINR + squared hinge below min_sinr_db.
+    # Var = E[X²] - E[X]² avoids a scalar-broadcast subtraction across the array.
+    # Both terms fire only when inside receivers exist; disabled when lambda_uniform=0.
+    loss_uniform = Float(0.0); dr.disable_grad(loss_uniform)
+    if lambda_uniform != 0.0 and num_inside is not None and num_inside < dr.width(best_sinr):
+        n_in = int(num_inside)
+        sinr_in_u = sinr_db[:n_in]
+        mean_in    = dr.mean(sinr_in_u)
+        variance   = dr.mean(sinr_in_u * sinr_in_u) - mean_in * mean_in
+        floor_f    = Float(float(min_sinr_db)); dr.disable_grad(floor_f)
+        floor_def  = dr.maximum(floor_f - sinr_in_u, zero_f)
+        loss_floor = dr.mean(floor_def * floor_def)
+        loss_uniform = variance + loss_floor
+
+    # L_min_j: mean gate value across jammers. Gate = sigmoid(gate_logit) ∈ (0,1).
+    # Penalizing the mean gate pushes unused jammers' logits negative → gate → 0 → off.
+    loss_min_j = Float(0.0); dr.disable_grad(loss_min_j)
+    if J > 0:
+        for gate_j in jam_gates:
+            loss_min_j = loss_min_j + gate_j
+        loss_min_j = loss_min_j / Float(float(J))
+
+    # L_spread: penalize pairwise proximity of jammer XY positions.
+    # Uses a soft inverse: spread_ref² / (dist² + spread_ref²), which equals 1.0
+    # at zero separation and 0.5 at spread_min_dist metres. Minimising this term
+    # pushes jammers apart, giving each one a distinct sector to cover.
+    if J > 1 and lambda_spread != 0.0:
+        n_pairs = J * (J - 1) // 2
+        spread_ref_sq = Float(float(spread_min_dist * spread_min_dist))
+        spread_sum = Float(0.0); dr.disable_grad(spread_sum)
+        for ji in range(J):
+            for jk in range(ji + 1, J):
+                dx = jam_xy_positions[ji][0] - jam_xy_positions[jk][0]
+                dy = jam_xy_positions[ji][1] - jam_xy_positions[jk][1]
+                dist_sq = dx * dx + dy * dy
+                spread_sum = spread_sum + spread_ref_sq / (dist_sq + spread_ref_sq)
+        loss_spread = spread_sum / Float(float(n_pairs))
+    else:
+        loss_spread = Float(0.0); dr.disable_grad(loss_spread)
+
+    # ------------------------------------------------------------------
+    # Compose total loss
+    # ------------------------------------------------------------------
+    lam_in      = Float(float(lambda_in));      dr.disable_grad(lam_in)
+    lam_out     = Float(float(lambda_out));     dr.disable_grad(lam_out)
+    lam_uniform = Float(float(lambda_uniform)); dr.disable_grad(lam_uniform)
+    lam_loss_min_j = Float(float(lambda_min_j)); dr.disable_grad(lam_loss_min_j)
+    lam_spread  = Float(float(lambda_spread));  dr.disable_grad(lam_spread)
+
+    total = (lam_in         * loss_inside +
+             lam_out        * loss_outside +
+             lam_uniform    * loss_uniform +
+             lam_loss_min_j * loss_min_j +
+             lam_spread     * loss_spread)
+
+    # Optional debug (comment out for production training)
+    if num_inside is not None and num_inside < dr.width(best_sinr):
+        n_in = int(num_inside)
+        print(f"  [dbg] mean SINR_dB inside : {dr.mean(sinr_db[:n_in])}")
+        print(f"  [dbg] mean SINR_dB outside: {dr.mean(sinr_db[n_in:])}")
+    print(f"  [dbg] L_in={dr.mean(loss_inside)}  L_out={dr.mean(loss_outside)}  "
+          f"L_uniform={dr.mean(loss_uniform)}  L_min_j={dr.mean(loss_min_j)}  "
+          f"L_spread={dr.mean(loss_spread)}")
+
+    return total
+
+
+def _make_compute_sir_loss(
+    N, tx_configs, tx_states, scene, p_solver,
+    noise_power, rx_objects, ref_powers_dbm,
+    jam_configs, jam_scene, jam_rx_objects, jam_objects,
+    num_inside=None,
+    gamma_db=0.0,
+    lambda_in=1.0,
+    lambda_out=10.0,
+    lambda_uniform=0.0,
+    lambda_min_j=1.0,
+    min_sinr_db=10.0,
+    soft_mean_weight=0.25,
+    soft_mean_in_weight=0.0,
+    epsilon=1e-30,
+    lambda_spread=0.0,
+    spread_min_dist=100.0,
+    inside_margin_db=0.0,
+    use_gate_logits=True,
+    num_tx_ant=1,
+):
+    """Build and return the @dr.wrap-decorated SIR loss function.
+
+    Uses exec() to produce a function with a *fixed* positional signature
+    matching exactly the number of scalar parameters — required by @dr.wrap.
+    The flat signature is: [gNB params...] + [jammer params...]
+    where each gNB contributes [az, el, x, y, z, power_dbm, wr_0, wi_0, ...,
+    wr_{M-1}, wi_{M-1}] (M = num_tx_ant) and each jammer contributes
+    [x, y, z, power_dbm, gate_logit].
+    """
+    _, gnb_offsets = _param_strides(tx_configs, num_tx_ant)
+    jam_strides, jam_offsets = _jam_param_strides(jam_configs)
+    total_jam_params = (jam_offsets[-1] + jam_strides[-1]) if jam_configs else 0
+
+    # gNB param names: p0, p1, ... layout: [az, el, x, y, z, power_dbm, w...]
+    gnb_stride = 6 + 2 * num_tx_ant
+    arg_names = []
+    for i, cfg in enumerate(tx_configs):
+        b = gnb_offsets[i]
+        arg_names += [f"p{b+k}" for k in range(gnb_stride)]
+
+    # Jammer param names: j0, j1, ... (appended after gNB params)
+    for k in range(total_jam_params):
+        arg_names.append(f"j{k}")
+
+    arg_str  = ", ".join(arg_names)
+    list_str = "[" + ", ".join(arg_names) + "]"
+
+    func_code = (
+        f"def _inner({arg_str}):\n"
+        f"    return _body({list_str}, _N, _cfgs, _states, _scene, _psolver,\n"
+        f"                 _noise, _rxobj, _refpow,\n"
+        f"                 _jam_cfgs, _jam_scene, _jam_rxobj, _jam_obj,\n"
+        f"                 num_inside=_num_inside,\n"
+        f"                 gamma_db=_gamma_db,\n"
+        f"                 lambda_in=_lambda_in,\n"
+        f"                 lambda_out=_lambda_out,\n"
+        f"                 lambda_uniform=_lambda_uniform,\n"
+        f"                 lambda_min_j=_lambda_min_j,\n"
+        f"                 min_sinr_db=_min_sinr_db,\n"
+        f"                 soft_mean_weight=_soft_mean_weight,\n"
+        f"                 soft_mean_in_weight=_soft_mean_in_weight,\n"
+        f"                 epsilon=_epsilon,\n"
+        f"                 lambda_spread=_lambda_spread,\n"
+        f"                 spread_min_dist=_spread_min_dist,\n"
+        f"                 inside_margin_db=_inside_margin_db,\n"
+        f"                 use_gate_logits=_use_gate_logits,\n"
+        f"                 num_tx_ant=_num_tx_ant)\n"
+    )
+
+    globs = {
+        "_body":           _sir_loss_body,
+        "_N":              N,
+        "_cfgs":           tx_configs,
+        "_states":         tx_states,
+        "_scene":          scene,
+        "_psolver":        p_solver,
+        "_noise":          noise_power,
+        "_rxobj":          rx_objects,
+        "_refpow":         ref_powers_dbm,
+        "_jam_cfgs":       jam_configs,
+        "_jam_scene":      jam_scene,
+        "_jam_rxobj":      jam_rx_objects,
+        "_jam_obj":        jam_objects,
+        "_num_inside":     num_inside,
+        "_gamma_db":       gamma_db,
+        "_lambda_in":      lambda_in,
+        "_lambda_out":     lambda_out,
+        "_lambda_uniform":   lambda_uniform,
+        "_lambda_min_j":     lambda_min_j,
+        "_min_sinr_db":      min_sinr_db,
+        "_soft_mean_weight":    soft_mean_weight,
+        "_soft_mean_in_weight": soft_mean_in_weight,
+        "_epsilon":             epsilon,
+        "_lambda_spread":    lambda_spread,
+        "_spread_min_dist":  spread_min_dist,
+        "_inside_margin_db": inside_margin_db,
+        "_use_gate_logits":  use_gate_logits,
+        "_num_tx_ant":       num_tx_ant,
+    }
+    exec(func_code, globs)
+    inner_fn = globs["_inner"]
+    return dr.wrap(source="torch", target="drjit")(inner_fn)
+
+
+# ---------------------------------------------------------------------------
+# Public API: optimize_multi_tx
+# ---------------------------------------------------------------------------
+
+def optimize_multi_tx(
+    scene,
+    tx_configs: list,
+    map_config: dict,
+    scene_xml_path: str,
+    jammer_array: Optional[AntennaArray] = None,
+    jam_configs: Optional[list] = None,
+    learning_rate: float = 3.0,
+    num_iterations: int = 50,
+    num_sample_points: int = 100,
+    noise_power: float = 1e-10,
+    dead_tail_percentile: float = 1.0,
+    max_dbscan_points: int = 100_000,
+    lds: str = "Halton",
+    sampler: str = "triangulated",
+    sampling_strata: str = "proportional",
+    verbose: bool = True,
+    on_iteration_callback: Optional[callable] = None,
+    debug_viz: bool = False,
+    gamma_db: float = 0.0,
+    lambda_in: float = 1.0,
+    lambda_out: float = 10.0,
+    lambda_uniform: float = 0.0,
+    lambda_min_j: float = 1.0,
+    min_sinr_db: float = 10.0,
+    soft_mean_weight: float = 0.25,
+    soft_mean_in_weight: float = 0.0,
+    freeze_bs: bool = False,
+    outside_half_size: float = 500.0,
+    lambda_spread: float = 0.0,
+    spread_min_dist: float = 100.0,
+    inside_margin_db: float = 0.0,
+    use_gate_logits: bool = True,
+    lr_position: float = None,
+    lr_power: float = None,
+    lr_scheduler: str = "cosine",
+    learn_precoding: bool = False,
+    lr_precoding: float = None,
+) -> dict:
+    """Jointly optimise N transmitters for SIR coverage.
+
+    Parameters
+    ----------
+    scene : sionna.rt.Scene
+        Sionna scene; all TxConfig.name transmitters must already be added.
+    tx_configs : list[TxConfig]
+        One entry per transmitter.  Order must match scene insertion order
+        (determines paths.a axis-1 indexing).
+    map_config : dict
+        Same format as single-TX optimizer: {'center', 'size', 'cell_size'}.
+    scene_xml_path : str
+        Path to scene.xml (for building extraction).
+    learning_rate : float
+        Adam learning rate.
+    num_iterations : int
+        Optimisation iterations.
+    noise_power : float
+        Thermal noise floor (Watts) added to interference in SIR denominator.
+    dead_tail_percentile : float
+        Bottom X % of rays (by power) identified as dead-zone seed.
+    max_dbscan_points : int
+        Cap for HDBSCAN to keep runtime tractable.
+    lds : str
+        Low-discrepancy sequence: "Halton" | "Sobol" | "Latin" | "Uniform".
+    sampler : str
+        Receiver placement backend: "triangulated" | "rejection".
+    sampling_strata : str
+        "proportional" -> sample alive+dead zones proportionally each iteration.
+        "dead_only"    -> existing behaviour (sample dead zones, fall back to full).
+    verbose : bool
+    on_iteration_callback : callable or None
+        Optional callable invoked at the end of every iteration, after dead
+        zones are accumulated and sample points are placed.  Signature::
+
+            callback(iteration, tx_states, tx_configs, jam_positions=...,
+                     jam_state=..., scene=..., jam_scene=..., loss=...,
+                     precoding_vec=...)
+
+        Each state dict will have ``current_tx_position`` set to the
+        transmitter's current [x, y, z] coordinates for that iteration.
+        ``scene``/``jam_scene`` are refreshed with this iteration's post-step
+        values before the callback runs, so a callback can safely run a
+        RadioMapSolver pass against them. ``jam_state`` is a list of dicts
+        (name/azimuth_deg/elevation_deg/position/power_dbm/gate/active), one
+        per jammer, mirroring the final result's jammer entries.
+        ``precoding_vec`` is this iteration's current (normalised) per-TX
+        precoding weights in RadioMapSolver's own ``(TensorXf real, TensorXf
+        imag)`` format — pass it straight through as that solver's
+        ``precoding_vec=`` kwarg to match the training loss's SIR exactly,
+        even under ``learn_precoding=True``.
+        Use ``visualize_multi_tx_strata`` from ``boresight_pathsolver`` or
+        ``make_coverage_gif_callback`` (below) as ready-made callbacks.
+    gamma_db : float
+        Detection threshold in dB. Cells above/below this drive the hinge losses.
+    lambda_in, lambda_out : float
+        Weights for the coverage/leakage hinge terms. Sweep their ratio for the
+        service-hole / leakage Pareto frontier.
+    lambda_uniform : float
+        Weight for the uniformity penalty. When > 0, penalizes variance of
+        inside-cell SINR (hotspot suppression) plus a squared hinge on cells
+        below ``min_sinr_db``. Start around 0.5–2.0 relative to lambda_in.
+    lambda_min_j : float
+        Weight for the jammer gate sparsity penalty. Default 1.0.
+    min_sinr_db : float
+        Minimum acceptable SINR inside the zone in dB. Cells below this
+        contribute a squared hinge to L_uniform. Default 10 dB.
+    outside_half_size : float
+        Half-side of the square outer sampling region in metres. The outside
+        sample count scales with this area, so larger values produce more
+        outside receivers. Default 500 m.
+    learn_precoding : bool
+        If True, per-tx-antenna-element precoding (beamforming) weights are
+        learned jointly with angle/position/power. If False (default), the
+        precoding vector is held fixed at the uniform, zero-phase baseline
+        (1/sqrt(num_tx_ant) per element) that RadioMapSolver also uses by
+        default, so downstream evaluation matches the optimizer exactly.
+    lr_precoding : float or None
+        Adam learning rate for precoding weights when learn_precoding=True.
+        Defaults to learning_rate.
+
+    Returns
+    -------
+    dict with keys per TX name plus "joint":
+        {
+          tx_name: {
+            "best_angles":      [az_deg, el_deg],
+            "final_position":   [x, y, z],
+            "initial_angles":   [az_deg, el_deg],
+            "initial_position": [x, y, z],
+            "best_power_dbm":   float,
+            "az_history":       list,
+            "el_history":       list,
+            "power_history":    list,
+          },
+          "joint": {
+            "loss_history":   list,
+            "elapsed_time_s": float,
+            "num_iterations": int,
+            "noise_power":    float,
+            "sampler":        str,
+            "sampling_strata":str,
+            "lds":            str,
+          }
+        }
+    """
+    N = len(tx_configs)
+    assert N >= 1, "tx_configs must contain at least one TxConfig"
+
+    # Set up randrange boundaries based on map size
+    # Starting with randomly placed receivers
+    lower_bound_x = map_config['center'][0] - map_config['size'][0] / 2
+    print(lower_bound_x)
+    upper_bound_x = map_config['center'][0] + map_config['size'][0] / 2
+    lower_bound_y = map_config['center'][1] - map_config['size'][1] / 2
+    upper_bound_y = map_config['center'][1] + map_config['size'][1] / 2
+
+    if verbose:
+        print(f"\n{'='*70}")
+        print(f"MULTI-TX SIR OPTIMIZATION  ({N} transmitters)")
+        print(f"{'='*70}")
+
+    start_time = time.time()
+
+    # ------------------------------------------------------------------
+    # 1. Build per-TX state dicts
+    # ------------------------------------------------------------------
+    qrand_shared = _make_qrand(lds)  # shared LDS instance
+    obstacles = _load_building_obstacles(scene_xml_path)
+    tx_states = [_setup_tx_state(scene, cfg, scene_xml_path, qrand_shared, obstacles)
+                 for cfg in tx_configs]
+
+    # ------------------------------------------------------------------
+    # 2. Pre-sample fixed receiver positions once for the shared zone.
+    #    Outside count is area-proportional to n_inside so each m² contributes
+    #    equally to the loss (see _sample_outside_zone).
+    #    Receivers 0..n_inside-1        → inside zone
+    #    Receivers n_inside..total_rx-1 → outer ring
+    # ------------------------------------------------------------------
+    n_inside = num_sample_points
+    ground_z = float(map_config["center"][2]) if len(map_config["center"]) > 2 else 0.0
+    pts = _sample_zone_points(tx_states[0], tx_configs[0], n_inside,
+                              sampler, "full", ground_z)
+    out_pts = _sample_outside_zone(tx_states[0], n_inside, ground_z,
+                                   outer_half_size=outside_half_size)
+    n_outside = len(out_pts)
+    total_rx  = n_inside + n_outside
+    shared_slice = slice(0, total_rx)
+    for state in tx_states:
+        state["rx_slice"] = shared_slice
+        state["rx_indices_drjit"] = None
+
+    # ------------------------------------------------------------------
+    # 3. Clear existing receivers; pre-create total_rx receivers at origin
+    # ------------------------------------------------------------------
+    for rx_name in list(scene.receivers.keys()):
+        scene.remove(rx_name)
+
+    rx_objects = {}
+    for idx in range(total_rx):
+        rx_name = f"opt_rx_{idx}"
+        rx = Receiver(name=rx_name, position=[0.0, 0.0, 0.0])
+        scene.add(rx)
+        rx_objects[rx_name] = rx
+
+    # ------------------------------------------------------------------
+    # Build a separate jam_scene for the jammer solve.
+    # Jammers use an isotropic antenna pattern and must be isolated from
+    # the gNB scene so each solve uses a different tx_array.
+    # ------------------------------------------------------------------
+    jam_scene = None
+    jam_objects = {}
+    jam_rx_objects = {}
+    jam_params = []
+
+    if jammer_array is not None and jam_configs is not None:
+        jam_scene = load_scene(scene_xml_path)
+        jam_scene.frequency = scene.frequency
+        for mat_name, mat in scene.radio_materials.items():
+            if mat_name in jam_scene.radio_materials:
+                jam_scene.radio_materials[mat_name].scattering_coefficient = (
+                    mat.scattering_coefficient
+                )
+        jam_scene.tx_array = jammer_array
+        jam_scene.rx_array = scene.rx_array
+
+        # Add jammers as Transmitter objects driven by JammerConfig.
+        # initial_position=None -> sample uniformly from map bounds.
+        jam_objects = {}
+        for jcfg in jam_configs:
+            if jcfg.initial_position is not None:
+                jx, jy = float(jcfg.initial_position[0]), float(jcfg.initial_position[1])
+            else:
+                jx = float(random.randrange(int(lower_bound_x), int(upper_bound_x), 1))
+                jy = float(random.randrange(int(lower_bound_y), int(upper_bound_y), 1))
+            # Seeds (supplied or random) must not start inside a building
+            # volume; jammers start at _JAM_INIT_Z, which clears most roofs.
+            jx, jy, _ = obstacles.push(jx, jy, _JAM_INIT_Z, z_max=_NODE_Z_MAX)
+            pos = mi.Point3f([jx, jy, 25.0])
+            jammer = Transmitter(name=jcfg.name, position=pos,
+                                power_dbm=jcfg.initial_power_dbm)
+            jam_scene.add(jammer)
+            jam_objects[jcfg.name] = jammer
+
+        # Mirror the receiver pool in jam_scene so the second solve has targets.
+        jam_rx_objects = {}
+        for idx in range(total_rx):
+            rx_name = f"opt_rx_{idx}"
+            jam_rx = Receiver(name=rx_name, position=[0.0, 0.0, 0.0])
+            jam_scene.add(jam_rx)
+            jam_rx_objects[rx_name] = jam_rx
+
+        if verbose:
+            print(f"Pre-created {total_rx} receivers ({n_inside} inside + {n_outside} outside) "
+                f"across {N} base stations")
+    for state in tx_states:
+        state["current_sample_points"] = pts
+        state["outside_sample_points"] = out_pts
+    for k, pos in enumerate(pts):
+        rx_name = f"opt_rx_{k}"
+        p3 = mi.Point3f(float(pos[0]), float(pos[1]), float(pos[2]))
+        rx_objects[rx_name].position = p3
+        if jam_rx_objects:
+            jam_rx_objects[rx_name].position = p3
+    for k, pos in enumerate(out_pts):
+        rx_name = f"opt_rx_{n_inside + k}"
+        p3 = mi.Point3f(float(pos[0]), float(pos[1]), float(pos[2]))
+        rx_objects[rx_name].position = p3
+        if jam_rx_objects:
+            jam_rx_objects[rx_name].position = p3
+
+    # ------------------------------------------------------------------
+    # 4. PathSolver + @dr.wrap closure
+    # ------------------------------------------------------------------
+    p_solver = PathSolver()
+    p_solver.loop_mode = "evaluated"
+
+    ref_powers_dbm = [s["tx_ref_power_dbm"] for s in tx_states]
+    num_tx_ant = int(scene.tx_array.num_ant)
+
+    compute_sir_loss = _make_compute_sir_loss(
+        N, tx_configs, tx_states, scene, p_solver,
+        noise_power, rx_objects, ref_powers_dbm,
+        jam_configs, jam_scene, jam_rx_objects, jam_objects,
+        num_inside=n_inside,
+        gamma_db=gamma_db,
+        lambda_in=lambda_in,
+        lambda_out=lambda_out,
+        lambda_uniform=lambda_uniform,
+        lambda_min_j=lambda_min_j,
+        min_sinr_db=min_sinr_db,
+        soft_mean_weight=soft_mean_weight,
+        soft_mean_in_weight=soft_mean_in_weight,
+        lambda_spread=lambda_spread,
+        spread_min_dist=spread_min_dist,
+        inside_margin_db=inside_margin_db,
+        use_gate_logits=use_gate_logits,
+        num_tx_ant=num_tx_ant,
+    )
+
+    # ------------------------------------------------------------------
+    # 5. Initialise PyTorch parameters
+    # ------------------------------------------------------------------
+    _, offsets = _param_strides(tx_configs, num_tx_ant)
+    params = []
+    for i, (cfg, state) in enumerate(zip(tx_configs, tx_states)):
+        params.append(torch.tensor(state["initial_azimuth"],   device="cuda",
+                                   dtype=torch.float32, requires_grad=True))
+        params.append(torch.tensor(state["initial_elevation"], device="cuda",
+                                   dtype=torch.float32, requires_grad=True))
+        params.append(torch.tensor(state["tx_position"][0],   device="cuda",
+                                   dtype=torch.float32, requires_grad=True))
+        params.append(torch.tensor(state["tx_position"][1],   device="cuda",
+                                   dtype=torch.float32, requires_grad=True))
+        params.append(torch.tensor(float(np.clip(state["tx_position"][2], 40.0, 60.0)),
+                                   device="cuda", dtype=torch.float32, requires_grad=True))
+        params.append(torch.tensor(state["initial_power_dbm"], device="cuda",
+                                   dtype=torch.float32, requires_grad=True))
+        # Precoding weights, one (real, imag) pair per tx antenna element.
+        for _m in range(num_tx_ant):
+            params.append(torch.tensor(1.0 / np.sqrt(num_tx_ant), device="cuda",
+                                       dtype=torch.float32, requires_grad=learn_precoding))
+            params.append(torch.tensor(0.0, device="cuda",
+                                       dtype=torch.float32, requires_grad=learn_precoding))
+
+    # Jammer params: [az, el, x, y, z, power_dbm, gate_logit] per jammer.
+    zone_centroid = tx_states[0]["box_polygon"].centroid
+    look_at_xyz   = [zone_centroid.x, zone_centroid.y, 1.5]
+    jam_initial_states = []   # snapshot before optimization for result reporting
+    for jcfg in (jam_configs or []):
+        jammer = jam_objects[jcfg.name]
+        init_pos = jammer.position.numpy().flatten()
+        init_pos_3d = [float(init_pos[0]), float(init_pos[1]), _JAM_INIT_Z]
+        if jcfg.initial_azimuth_deg is not None and jcfg.initial_elevation_deg is not None:
+            init_az = jcfg.initial_azimuth_deg
+            init_el = jcfg.initial_elevation_deg
+        else:
+            init_az, init_el = compute_initial_angles_from_position(
+                init_pos_3d, look_at_xyz, verbose=False
+            )
+        jam_initial_states.append({
+            "initial_azimuth_deg":   init_az,
+            "initial_elevation_deg": init_el,
+            "initial_position":      init_pos_3d,
+            "initial_power_dbm":     jcfg.initial_power_dbm,
+        })
+        jam_params.append(torch.tensor(init_az, device="cuda",
+                                       dtype=torch.float32, requires_grad=True))
+        jam_params.append(torch.tensor(init_el, device="cuda",
+                                       dtype=torch.float32, requires_grad=True))
+        jam_params.append(torch.tensor(float(init_pos[0]), device="cuda",
+                                       dtype=torch.float32, requires_grad=True))
+        jam_params.append(torch.tensor(float(init_pos[1]), device="cuda",
+                                       dtype=torch.float32, requires_grad=True))
+        jam_params.append(torch.tensor(_JAM_INIT_Z, device="cuda",
+                                       dtype=torch.float32, requires_grad=True))
+        jam_params.append(torch.tensor(jcfg.initial_power_dbm, device="cuda",
+                                       dtype=torch.float32, requires_grad=True))
+        # Gate logit: sigmoid(0.0) = 0.5 — jammer starts at half-gate so the
+        # optimizer decides to activate or suppress based on gradient, rather
+        # than starting fully on and immediately disrupting inside coverage.
+        jam_params.append(torch.tensor(0.0, device="cuda",
+                                       dtype=torch.float32, requires_grad=True))
+
+    _lr_pos  = lr_position   if lr_position   is not None else learning_rate
+    _lr_pow  = lr_power      if lr_power      is not None else learning_rate
+    _lr_prec = lr_precoding  if lr_precoding  is not None else learning_rate
+
+    # Split params into groups so position/power can use independent LRs.
+    # Layout: BS params stride 6+2M [az, el, x, y, z, pow, w_real x M, w_imag x M],
+    # jammer stride 7 [az, el, x, y, z, pow, gate].
+    angle_g, pos_g, pow_g, gate_g, prec_g = [], [], [], [], []
+    if not freeze_bs:
+        for i in range(N):
+            b = offsets[i]
+            angle_g.extend([params[b], params[b + 1]])
+            pos_g.extend([params[b + 2], params[b + 3], params[b + 4]])
+            pow_g.append(params[b + 5])
+    # Precoding is decoupled from freeze_bs — it can be learned independently
+    # of whether geometry/power are frozen.
+    for i in range(N):
+        b = offsets[i]
+        prec_g.extend(params[b + 6: b + 6 + 2 * num_tx_ant])
+    for k in range(len(jam_configs or [])):
+        j = k * 7
+        angle_g.extend([jam_params[j], jam_params[j + 1]])
+        pos_g.extend([jam_params[j + 2], jam_params[j + 3], jam_params[j + 4]])
+        pow_g.append(jam_params[j + 5])
+        gate_g.append(jam_params[j + 6])
+
+    param_groups = [g for g in [
+        {'params': angle_g, 'lr': learning_rate},
+        {'params': pos_g,   'lr': _lr_pos},
+        {'params': pow_g,   'lr': _lr_pow},
+        {'params': gate_g,  'lr': learning_rate},
+        {'params': prec_g,  'lr': _lr_prec},
+    ] if g['params']]
+    optimizer = torch.optim.Adam(param_groups, betas=(0.9, 0.999))
+    scheduler = (
+        CosineAnnealingLR(optimizer, T_max=num_iterations, eta_min=0.0)
+        if lr_scheduler == "cosine" else None
+    )
+
+    # ------------------------------------------------------------------
+    # 6. Tracking
+    # ------------------------------------------------------------------
+    loss_history = []
+    rm_solver    = RadioMapSolver()
+
+    # Buffers for final averaging (last 10 iterations). Precoding is
+    # deliberately NOT windowed-averaged here — see the finalization block
+    # below for why.
+    final_bufs = {i: {"az": [], "el": [], "pow": []} for i in range(N)}
+
+    # Building projection for free-roaming nodes. Counts the steps each node's
+    # projection had to move it (the gradient was pushing it into a building),
+    # reported in the result as "building_pinned_steps".
+    pin_total: dict = {}
+
+    def _project_free_node(name, x, y, z):
+        px, py, pz = obstacles.push(x, y, z, z_max=_NODE_Z_MAX)
+        if float(np.sqrt((px - x) ** 2 + (py - y) ** 2 + (pz - z) ** 2)) > _PIN_TOL_M:
+            pin_total[name] = pin_total.get(name, 0) + 1
+        return px, py, pz
+
+    # ------------------------------------------------------------------
+    # 7. Optimisation loop
+    # ------------------------------------------------------------------
+    for iteration in range(num_iterations):
+        iter_start = time.time()
+
+        # Current plain-float parameter values (detached from AD)
+        pvals = [float(p.item()) for p in params]
+
+        # Apply current parameter values to scene (once for all TXs)
+        _, offsets = _param_strides(tx_configs, num_tx_ant)
+        for k, (cfg_k, state_k) in enumerate(zip(tx_configs, tx_states)):
+            b = offsets[k]
+            az_k, el_k = pvals[b], pvals[b + 1]
+            xp_k, yp_k, zp_k = pvals[b + 2], pvals[b + 3], pvals[b + 4]
+            scene.get(cfg_k.name).orientation = [
+                float(np.deg2rad(az_k)), -float(np.deg2rad(el_k)), 0.0
+            ]
+            scene.get(cfg_k.name).position = mi.Point3f(
+                float(xp_k), float(yp_k), float(zp_k)
+            )
+            scene.get(cfg_k.name).power_dbm = [float(pvals[b + 5])]
+
+        # Single RadioMap pass — rm.rss shape (N_tx, H, W) gives per-TX
+        # cell-aggregated power, smoothing out multipath fades.
+        if sampling_strata != "full":
+            # Calculate Coverage
+            rm = rm_solver(
+                scene,
+                max_depth=12,
+                samples_per_tx=int(100e7),
+                cell_size=[1.0, 1.0],
+                center=map_config["center"],
+                orientation=[0, 0, 0],
+                size=map_config["size"],
+                los=True,
+                specular_reflection=True,
+                diffuse_reflection=True,
+                diffraction=True,
+                edge_diffraction=True,
+                refraction=False,
+                stop_threshold=None,
+            )
+            # Cluster and build dead zones
+            for i, (cfg, state) in enumerate(zip(tx_configs, tx_states)):
+                _accumulate_dead_zones(
+                    state, cfg, i, rm,
+                    map_config, dead_tail_percentile, max_dbscan_points,
+                    debug_viz=debug_viz, iteration=iteration,
+                )
+            
+        # Differentiable forward pass
+        loss = compute_sir_loss(*params, *jam_params)
+        loss.backward()
+
+        # Clip gradients before the Adam step to guard against log-gradient
+        # explosions when receivers have near-zero signal (d(log)/dx = 1/x → ∞).
+        torch.nn.utils.clip_grad_norm_(params + jam_params, max_norm=10.0)
+
+        optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
+        optimizer.zero_grad()
+
+        # Per-TX post-step constraints
+        with torch.no_grad():
+            for i, (cfg, state) in enumerate(zip(tx_configs, tx_states)):
+                b = offsets[i]
+                az_t = params[b];     el_t = params[b + 1]
+                x_t  = params[b + 2]; y_t  = params[b + 3]
+
+                # Azimuth: clamp and wrap to [0, 360)
+                az_t.clamp_(0.0, 360.0)
+                if az_t.item() >= 360.0:
+                    az_t.fill_(az_t.item() % 360.0)
+
+                # Elevation: clamp to [-90, 0] (downward-facing only)
+                el_t.clamp_(-90.0, 0.0)
+
+                # Position: project to building polygon if this TX is building-mounted.
+                if cfg.on_building:
+                    proj_x, proj_y = state["tx_placement"].project_to_polygon(
+                        x_t.item(), y_t.item()
+                    )
+                    x_t.data.fill_(proj_x)
+                    y_t.data.fill_(proj_y)
+                else:
+                    # Keep free-roaming TXs out of every building volume: inside
+                    # a footprint AND below the roof. Above the roof is fine.
+                    px, py, pz = _project_free_node(
+                        cfg.name, x_t.item(), y_t.item(), params[b + 4].item()
+                    )
+                    x_t.data.fill_(px)
+                    y_t.data.fill_(py)
+                    params[b + 4].data.fill_(pz)
+
+                # Z clamp [40, 50]
+                params[b + 4].clamp_(40.0, 50.0)
+                # Power clamp
+                params[b + 5].clamp_(*cfg.power_dbm_bounds)
+
+            # Clamp jammer positions outside building volumes and power to bounds.
+            if jam_configs:
+                _, joff = _jam_param_strides(jam_configs)
+                # The coverage zone itself, NOT zone minus buildings: jammers may
+                # fly over buildings, and a jammer over an in-zone building would
+                # sit in one of that polygon's holes and slip past the exclusion.
+                zone_poly = tx_states[0].get("box_polygon") if tx_states else None
+                for j, jcfg in enumerate(jam_configs):
+                    jx = jam_params[joff[j] + 2].item()
+                    jy = jam_params[joff[j] + 3].item()
+                    jz = jam_params[joff[j] + 4].item()
+                    jx, jy, jz = _project_free_node(jcfg.name, jx, jy, jz)
+                    # Keep jammers outside the coverage zone so they can't
+                    # degrade inside SINR, which would starve gate gradients
+                    # and cause sigmoid saturation on the logit.
+                    if zone_poly is not None and zone_poly.contains(
+                        shapely.geometry.Point(jx, jy)
+                    ):
+                        nearest = shapely.ops.nearest_points(
+                            shapely.geometry.Point(jx, jy), zone_poly.boundary
+                        )[1]
+                        jx, jy = nearest.x, nearest.y
+                        # The snap can land on a wall; re-check so the result is
+                        # guaranteed outside every building volume.
+                        jx, jy, jz = obstacles.push(jx, jy, jz, z_max=_NODE_Z_MAX)
+                    jam_params[joff[j] + 2].data.fill_(jx)
+                    jam_params[joff[j] + 3].data.fill_(jy)
+                    jam_params[joff[j] + 4].data.fill_(jz)
+                    # Z clamp [30, 60]
+                    jam_params[joff[j] + 4].clamp_(5.0, 50.0)
+                    jam_params[joff[j] + 5].clamp_(*jcfg.power_dbm_bounds)
+                    jam_params[joff[j] + 1].clamp_(*jcfg.elevation_bounds)
+                    # Clamp gate logit to prevent sigmoid saturation: a logit of
+                    # -4 gives gate≈0.018 (effectively off) while preserving
+                    # enough gradient to reopen if the loss landscape shifts.
+                    jam_params[joff[j] + 6].clamp_(-4.0, 6.0)
+
+        # Track histories
+        loss_val = float(loss.item())
+        loss_history.append(loss_val)
+
+        for i, cfg in enumerate(tx_configs):
+            b = offsets[i]
+            az_val = float(params[b].item())
+            el_val = float(params[b + 1].item())
+            tx_states[i]["az_history"].append(az_val)
+            tx_states[i]["el_history"].append(el_val)
+            pw_val = float(params[b + 5].item())
+            tx_states[i]["power_history"].append(pw_val)
+
+        # Accumulate final-window values (last 10 iters)
+        window_start = max(0, num_iterations - 10)
+        if iteration >= window_start:
+            for i, cfg in enumerate(tx_configs):
+                b = offsets[i]
+                final_bufs[i]["az"].append(float(params[b].item()))
+                final_bufs[i]["el"].append(float(params[b + 1].item()))
+                final_bufs[i]["pow"].append(float(params[b + 5].item()))
+
+        # Expose current TX positions for visualisation callbacks
+        for i, (cfg, state) in enumerate(zip(tx_configs, tx_states)):
+            b = offsets[i]
+            state["current_tx_position"] = [
+                float(params[b + 2].item()),
+                float(params[b + 3].item()),
+                float(params[b + 4].item()),
+            ]
+
+        if on_iteration_callback is not None:
+            # Push this iteration's post-step values into the plain-float
+            # scene objects. The differentiable forward pass above only sets
+            # these from the *pre*-step params (see top of loop), so without
+            # this refresh anything reading `scene`/`jam_scene` here (e.g. a
+            # coverage-map callback) would see values one iteration stale.
+            for i, cfg in enumerate(tx_configs):
+                b = offsets[i]
+                yaw_c, pitch_c = azimuth_elevation_to_yaw_pitch(
+                    float(params[b].item()), float(params[b + 1].item())
+                )
+                scene.get(cfg.name).orientation = mi.Point3f(
+                    float(yaw_c), float(pitch_c), 0.0
+                )
+                scene.get(cfg.name).position = mi.Point3f(
+                    *tx_states[i]["current_tx_position"]
+                )
+                scene.get(cfg.name).power_dbm = [float(params[b + 5].item())]
+
+            # Current (normalised) precoding weights per TX, in the exact
+            # RadioMapSolver `precoding_vec` shape/format so a callback can
+            # feed them straight into a RadioMap pass that matches this
+            # iteration's SIR computation, even mid-training under
+            # learn_precoding=True. Cheap to build even when precoding is
+            # fixed (learn_precoding=False) — those params never move off
+            # the initial uniform value.
+            prec_real = np.empty((len(tx_configs), num_tx_ant), dtype=np.float32)
+            prec_imag = np.empty((len(tx_configs), num_tx_ant), dtype=np.float32)
+            for i, cfg in enumerate(tx_configs):
+                b  = offsets[i]
+                pr = [float(params[b + 6 + 2 * m].item()) for m in range(num_tx_ant)]
+                pi = [float(params[b + 7 + 2 * m].item()) for m in range(num_tx_ant)]
+                pn = float(np.sqrt(sum(r * r + im * im for r, im in zip(pr, pi)) + 1e-12))
+                prec_real[i, :] = [r / pn for r in pr]
+                prec_imag[i, :] = [im / pn for im in pi]
+            precoding_vec = (mi.TensorXf(prec_real), mi.TensorXf(prec_imag))
+
+            jam_positions = []
+            jam_state = []
+            if jam_configs:
+                _, joff = _jam_param_strides(jam_configs)
+                for j, jcfg in enumerate(jam_configs):
+                    b = joff[j]
+                    jaz = float(jam_params[b].item())
+                    jel = float(jam_params[b + 1].item())
+                    jx  = float(jam_params[b + 2].item())
+                    jy  = float(jam_params[b + 3].item())
+                    jz  = float(jam_params[b + 4].item())
+                    jpw = float(jam_params[b + 5].item())
+                    jgl = float(jam_params[b + 6].item())
+                    jgate = 1.0 / (1.0 + np.exp(-jgl)) if use_gate_logits else 1.0
+                    jam_positions.append([jx, jy])
+                    jam_state.append({
+                        "name": jcfg.name,
+                        "azimuth_deg": jaz, "elevation_deg": jel,
+                        "position": [jx, jy, jz],
+                        "power_dbm": jpw,
+                        "gate": jgate,
+                        "active": jgate >= 0.5,
+                    })
+                    if jam_scene is not None:
+                        yaw_j, pitch_j = azimuth_elevation_to_yaw_pitch(jaz, jel)
+                        jam_scene.get(jcfg.name).orientation = mi.Point3f(
+                            float(yaw_j), float(pitch_j), 0.0
+                        )
+                        jam_scene.get(jcfg.name).position = mi.Point3f(jx, jy, jz)
+                        jam_scene.get(jcfg.name).power_dbm = [jpw]
+            on_iteration_callback(iteration, tx_states, tx_configs,
+                                  jam_positions=jam_positions,
+                                  jam_state=jam_state,
+                                  scene=scene, jam_scene=jam_scene,
+                                  loss=loss_val,
+                                  precoding_vec=precoding_vec)
+
+        if verbose:
+            dur = time.time() - iter_start
+            print(f"  Iter {iteration+1:3d}/{num_iterations}  loss={loss_val:.4f}  "
+                  f"({dur:.1f}s)")
+
+        # Make sure there are no memory leaks...    
+        del loss
+        torch.cuda.empty_cache()
+        dr.flush_malloc_cache()
+
+    # ------------------------------------------------------------------
+    # 8. Finalise: reset scene to plain-float state; remove temp receivers
+    # ------------------------------------------------------------------
+    for i, (cfg, state) in enumerate(zip(tx_configs, tx_states)):
+        b      = offsets[i]
+        best_az = float(np.mean(final_bufs[i]["az"])) if final_bufs[i]["az"] else float(params[b].item())
+        best_el = float(np.mean(final_bufs[i]["el"])) if final_bufs[i]["el"] else float(params[b + 1].item())
+        final_x = float(params[b + 2].item())
+        final_y = float(params[b + 3].item())
+        final_z = float(params[b + 4].item())
+
+        yaw_r, pitch_r = azimuth_elevation_to_yaw_pitch(best_az, best_el)
+        scene.get(cfg.name).orientation = mi.Point3f(float(yaw_r), float(pitch_r), 0.0)
+        scene.get(cfg.name).position    = mi.Point3f(float(final_x), float(final_y), float(final_z))
+        best_pow = float(np.mean(final_bufs[i]["pow"])) if final_bufs[i]["pow"] else float(params[b + 5].item())
+        scene.get(cfg.name).power_dbm = [best_pow]
+        state["best_power_dbm"] = best_pow
+        state["best_angles"]    = [best_az, best_el]
+        state["final_position"] = [final_x, final_y, final_z]
+
+        # Use the FINAL iteration's raw precoding values directly — do NOT
+        # window-average them the way az/el/pow are averaged above.
+        #
+        # The loss is exactly invariant under rotating a BS's entire
+        # precoding vector by a common phase (w_m -> w_m * e^{jth} for every
+        # element m simultaneously): |sum_m w_m h_m|^2 is unchanged since
+        # |e^{jth}| = 1. That makes the raw (wr_m, wi_m) vector's overall
+        # phase a flat direction with exactly zero gradient at every point
+        # along the whole trajectory — there is nothing keeping it from
+        # drifting iteration to iteration. Averaging RAW snapshots across a
+        # window before renormalizing sums vectors that may point in that
+        # drifting phase's different directions, which can partially cancel
+        # and land on a vector unrelated to any actual per-iteration weight
+        # (this is exactly what caused the RadioMapSolver eval SINR to
+        # diverge from the training loss's SINR once learn_precoding=True).
+        # Reading straight from the final params avoids the issue entirely,
+        # since it is exactly what the last training step's forward pass
+        # normalized and used.
+        prec_r = [float(params[b + 6 + 2 * m].item()) for m in range(num_tx_ant)]
+        prec_i = [float(params[b + 7 + 2 * m].item()) for m in range(num_tx_ant)]
+        prec_norm = float(np.sqrt(sum(r * r + im * im for r, im in zip(prec_r, prec_i)) + 1e-12))
+        state["best_precoding"] = {
+            "real": [float(r / prec_norm) for r in prec_r],
+            "imag": [float(im / prec_norm) for im in prec_i],
+        }
+
+    # Remove optimization receivers
+    for rx_name in list(rx_objects.keys()):
+        if rx_name in [obj.name for obj in scene.receivers.values()]:
+            scene.remove(rx_name)
+
+    elapsed = time.time() - start_time
+
+    # ------------------------------------------------------------------
+    # 9. Build result dict
+    # ------------------------------------------------------------------
+    result = {}
+    for i, (cfg, state) in enumerate(zip(tx_configs, tx_states)):
+        entry = {
+            "best_angles":      state["best_angles"],
+            "final_position":   state["final_position"],
+            "initial_angles":   [state["initial_azimuth"], state["initial_elevation"]],
+            "initial_position": state["tx_position"],
+            "az_history":       state["az_history"],
+            "el_history":       state["el_history"],
+        }
+        entry["best_power_dbm"]   = state["best_power_dbm"]
+        entry["initial_power_dbm"] = state["initial_power_dbm"]
+        entry["power_history"]    = state["power_history"]
+        entry["best_precoding"]   = state["best_precoding"]
+        result[cfg.name] = entry
+
+    result["joint"] = {
+        "loss_history":    loss_history,
+        "elapsed_time_s":  elapsed,
+        "num_iterations":  num_iterations,
+        "noise_power":     noise_power,
+        "sampler":         sampler,
+        "sampling_strata": sampling_strata,
+        "lds":             lds,
+        "use_gate_logits": use_gate_logits,
+        "learn_precoding": learn_precoding,
+        "num_tx_ant":      num_tx_ant,
+        # Steps each node's building projection had to move it, i.e. steps the
+        # gradient pushed it into a building volume. Nodes that never touched
+        # one are absent.
+        "building_pinned_steps": dict(pin_total),
+    }
+
+    # ------------------------------------------------------------------
+    # 10. Persist final jammer state into result and jam_scene
+    # ------------------------------------------------------------------
+    if jam_configs:
+        _, joff = _jam_param_strides(jam_configs)
+        jammers_final = {}
+        for j, jcfg in enumerate(jam_configs):
+            b    = joff[j]
+            azf  = float(jam_params[b].item())
+            elf  = float(jam_params[b + 1].item())
+            xf   = float(jam_params[b + 2].item())
+            yf   = float(jam_params[b + 3].item())
+            zf   = float(jam_params[b + 4].item())
+            pf   = float(jam_params[b + 5].item())
+            glf    = float(jam_params[b + 6].item())
+            gate_f = 1.0 / (1.0 + np.exp(-glf)) if use_gate_logits else 1.0
+            jam_scene.get(jcfg.name).orientation = [
+                float(np.deg2rad(azf)), -float(np.deg2rad(elf)), 0.0
+            ]
+            jam_scene.get(jcfg.name).position  = mi.Point3f(xf, yf, zf)
+            jam_scene.get(jcfg.name).power_dbm = [pf]
+            init_snap = jam_initial_states[j]
+            jammers_final[jcfg.name] = {
+                "initial_azimuth_deg":   init_snap["initial_azimuth_deg"],
+                "initial_elevation_deg": init_snap["initial_elevation_deg"],
+                "initial_position":      init_snap["initial_position"],
+                "initial_power_dbm":     init_snap["initial_power_dbm"],
+                "final_azimuth_deg":     azf,
+                "final_elevation_deg":   elf,
+                "final_position":        [xf, yf, zf],
+                "final_power_dbm":       pf,
+                "final_gate":            gate_f,
+                "active":                gate_f >= 0.5,
+            }
+        result["joint"]["jammers"] = jammers_final
+
+    if verbose:
+        print(f"\n{'='*70}")
+        print(f"OPTIMIZATION COMPLETE  ({elapsed:.1f}s)")
+        for cfg in tx_configs:
+            r = result[cfg.name]
+            print(f"  {cfg.name}: Az={r['best_angles'][0]:.1f}°, "
+                  f"El={r['best_angles'][1]:.1f}°, "
+                  f"pos=({r['final_position'][0]:.1f}, {r['final_position'][1]:.1f})")
+        if jam_configs:
+            for jcfg in jam_configs:
+                jd = result["joint"]["jammers"][jcfg.name]
+                status = "ON " if jd.get("active", True) else "OFF"
+                gate   = jd.get("final_gate", float("nan"))
+                print(f"  {jcfg.name} [{status} gate={gate:.3f}]: "
+                      f"Az={jd['final_azimuth_deg']:.1f}°, El={jd['final_elevation_deg']:.1f}°, "
+                      f"pos=({jd['final_position'][0]:.1f}, {jd['final_position'][1]:.1f}, {jd['final_position'][2]:.1f}), "
+                      f"pwr={jd['final_power_dbm']:.1f} dBm")
+        print(f"{'='*70}\n")
+
+    return result, jam_scene if jam_configs else None
+
+
+# Solid building fill shared by every figure; matches the raster-mask plots
+# (plot_results_from_file / plot_multi_shape_grid), which use this same gray.
+_BUILDING_FILL_COLOR = "#797878"
+
+
+def _draw_building_footprints(ax, building_polygons, zorder=3):
+    """Draw footprints as one solid-filled artist with a thin black outline.
+
+    Courtyard holes stay open. Adds a single "Buildings" legend entry.
+    """
+    from matplotlib.patches import PathPatch
+    from matplotlib.path import Path
+    from shapely.geometry.polygon import orient
+
+    verts, codes = [], []
+    for geom in building_polygons:
+        for bp in getattr(geom, "geoms", [geom]):
+            # Exterior CCW / holes CW, so the fill leaves holes unfilled.
+            bp = orient(bp, 1.0)
+            for ring in (bp.exterior, *bp.interiors):
+                xy = np.asarray(ring.coords)
+                verts.extend(xy)
+                codes.extend([Path.MOVETO] + [Path.LINETO] * (len(xy) - 2)
+                             + [Path.CLOSEPOLY])
+    if verts:
+        ax.add_patch(PathPatch(Path(verts, codes), facecolor=_BUILDING_FILL_COLOR,
+                               edgecolor="black", linewidth=0.5, zorder=zorder,
+                               label="Buildings"))
+
+
+# ---------------------------------------------------------------------------
+# Public API: compare_multi_tx_performance
+# ---------------------------------------------------------------------------
+
+def compare_multi_tx_performance(
+    scene,
+    tx_configs: list,
+    multi_result: dict,
+    map_config: dict,
+    zone_masks: dict,
+    noise_power: float = 1e-10,
+    fig: bool = True,
+    gamma_db: float = 0.0,
+    jam_scene=None,
+    jammer_configs: list = None,
+    sinr_bs_only_ref: "np.ndarray | None" = None,
+    building_polygons: list = None,
+    outside_half_size: float = None,
+    save_arrays_to: str = None,
+) -> tuple:
+    """Evaluate the optimised multi-TX configuration for coverage shaping.
+
+    Reports how well SINR is contained within the target zone:
+      rho_leak : fraction of OUTSIDE cells with SINR >= gamma  (lower is better)
+      rho_hole : fraction of INSIDE  cells with SINR <  gamma  (lower is better)
+
+    Signal = highest BS signal at each cell (jammers never count as signal).
+    Interference = other BSs + friendly jammer power (if jam_scene provided).
+    SINR formula mirrors the loss function exactly:
+      SINR_i(r) = P_BS_i / (noise + Σ_{j≠i} P_BS_j + Σ_k P_jam_k)
+      best_SINR  = max_i(SINR_i)
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import TwoSlopeNorm
+
+    N = len(tx_configs)
+    gamma_db = float(gamma_db)
+
+    # Precoding vector for the optimized BS RadioMap pass, built from each
+    # TX's best_precoding so RadioMapSolver combines antenna elements with
+    # exactly the same weights the optimizer's own loss used — falls back to
+    # RadioMapSolver's own uniform default for any TX missing the key (e.g.
+    # results produced before this field existed).
+    num_tx_ant = int(scene.tx_array.num_ant)
+    prec_real = np.full((N, num_tx_ant), 1.0 / np.sqrt(num_tx_ant), dtype=np.float32)
+    prec_imag = np.zeros((N, num_tx_ant), dtype=np.float32)
+    for i, cfg in enumerate(tx_configs):
+        bp = multi_result[cfg.name].get("best_precoding")
+        if bp is not None:
+            prec_real[i, :] = bp["real"]
+            prec_imag[i, :] = bp["imag"]
+    precoding_vec = (mi.TensorXf(prec_real), mi.TensorXf(prec_imag))
+
+    def _watts_to_db(w):
+        return 10.0 * np.log10(np.maximum(w, 1e-18))
+
+    def _set_scene_optimized():
+        for cfg in tx_configs:
+            r = multi_result[cfg.name]
+            angles  = r["best_angles"]
+            pos     = r["final_position"]
+            pow_dbm = r.get("best_power_dbm", None)
+            yaw_r, pitch_r = azimuth_elevation_to_yaw_pitch(angles[0], angles[1])
+            scene.get(cfg.name).orientation = mi.Point3f(float(yaw_r), float(pitch_r), 0.0)
+            scene.get(cfg.name).position    = mi.Point3f(float(pos[0]), float(pos[1]), float(pos[2]))
+            if pow_dbm is not None:
+                scene.get(cfg.name).power_dbm = [float(pow_dbm)]
+
+    def _run_radiomap():
+        solver = RadioMapSolver()
+        n_bs = max(1, len(tx_configs))
+        return solver(
+            scene,
+            max_depth=8,
+            samples_per_tx=max(1, int(1e9) // n_bs),
+            cell_size=list(map_config["cell_size"]),
+            center=map_config["center"],
+            orientation=[0, 0, 0],
+            size=map_config["size"],
+            los=True,
+            specular_reflection=True,
+            diffuse_reflection=True,
+            diffraction=True,
+            edge_diffraction=True,
+            refraction=False,
+            stop_threshold=None,
+            precoding_vec=precoding_vec,
+        )
+
+    def _bs_sinr_field(rss_list_2d, jam_map=None):
+        """Best-SINR (max over BSs) over the full 2-D grid, in dB.
+
+        Signal = P_BS_i; Interference = other BSs + optional jammer map.
+        """
+        best = None
+        for i in range(N):
+            p_sig = rss_list_2d[i]
+            p_int = sum(rss_list_2d[j] for j in range(N) if j != i)
+            denom = p_int + noise_power
+            if jam_map is not None:
+                denom = denom + jam_map
+            sinr_i = p_sig / denom
+            best = sinr_i if best is None else np.maximum(best, sinr_i)
+        return _watts_to_db(best)
+
+    def _summarize_sinr(values_db):
+        if values_db.size == 0:
+            return None
+        return {
+            "sinr_mean_db":   float(np.mean(values_db)),
+            "sinr_median_db": float(np.median(values_db)),
+            "sinr_p10_db":    float(np.percentile(values_db, 10)),
+            "sinr_p90_db":    float(np.percentile(values_db, 90)),
+            "sinr_values_db": values_db.tolist(),
+        }
+
+    # ------------------------------------------------------------------
+    # Masks: inside = target zone, outside = complement of union
+    # ------------------------------------------------------------------
+    grid_shape   = next(iter(zone_masks.values())).shape
+    inside_masks = {cfg.name: (zone_masks[cfg.name] == 1.0) for cfg in tx_configs}
+    union_inside = np.zeros(grid_shape, dtype=bool)
+    for cfg in tx_configs:
+        union_inside |= inside_masks[cfg.name]
+    outside_mask = ~union_inside
+
+    # Restrict outside region to the same bounding box used during optimisation.
+    # Without this, the full grid complement (~99% of cells far from the zone)
+    # dilutes outside SINR stats with naturally low-power distant cells.
+    if outside_half_size is not None:
+        cx_m, cy_m = map_config["center"][0], map_config["center"][1]
+        sx_m, sy_m = map_config["size"][0],   map_config["size"][1]
+        cw,   ch   = map_config["cell_size"][0], map_config["cell_size"][1]
+        H, W = grid_shape
+        xs = np.linspace(cx_m - sx_m / 2 + cw / 2, cx_m + sx_m / 2 - cw / 2, W)
+        ys = np.linspace(cy_m - sy_m / 2 + ch / 2, cy_m + sy_m / 2 - ch / 2, H)
+        Xg, Yg = np.meshgrid(xs, ys)
+        h = float(outside_half_size)
+        bbox_mask = (
+            (np.abs(Xg - cx_m) <= h) &
+            (np.abs(Yg - cy_m) <= h)
+        )
+        outside_mask = outside_mask & bbox_mask
+
+    # Build a mask of grid cells that fall inside building footprints so they
+    # can be excluded from outdoor statistics.
+    _building_mask = np.zeros(grid_shape, dtype=bool)
+    if building_polygons:
+        from shapely.geometry import Point
+        from shapely.prepared import prep as shp_prep
+        cx_m, cy_m = map_config["center"][0], map_config["center"][1]
+        sx_m, sy_m = map_config["size"][0],   map_config["size"][1]
+        cw,   ch   = map_config["cell_size"][0], map_config["cell_size"][1]
+        H, W = grid_shape
+        xs = np.linspace(cx_m - sx_m / 2 + cw / 2, cx_m + sx_m / 2 - cw / 2, W)
+        ys = np.linspace(cy_m - sy_m / 2 + ch / 2, cy_m + sy_m / 2 - ch / 2, H)
+        Xg, Yg = np.meshgrid(xs, ys)
+        pts  = np.column_stack((Xg.ravel(), Yg.ravel()))
+        flat = np.zeros(H * W, dtype=bool)
+        for bp in building_polygons:
+            minx, miny, maxx, maxy = bp.bounds
+            in_bbox = (
+                (pts[:, 0] >= minx) & (pts[:, 0] <= maxx) &
+                (pts[:, 1] >= miny) & (pts[:, 1] <= maxy)
+            )
+            idxs = np.where(in_bbox)[0]
+            if len(idxs) > 0:
+                pbp = shp_prep(bp)
+                for idx in idxs:
+                    if pbp.contains(Point(pts[idx, 0], pts[idx, 1])):
+                        flat[idx] = True
+        _building_mask = flat.reshape(H, W)
+
+    # Outdoor-only masks: exclude cells inside building footprints.
+    outdoor_outside = outside_mask & ~_building_mask
+    outdoor_inside  = union_inside  & ~_building_mask
+
+    # ------------------------------------------------------------------
+    # Print parameter before/after table
+    # ------------------------------------------------------------------
+    print(f"\n{'='*70}")
+    print("BS PARAMETERS  —  BEFORE / AFTER")
+    print(f"{'='*70}")
+    print(f"  {'Name':<14} {'Param':<10} {'Initial':>10}  {'Optimised':>10}  {'Delta':>10}")
+    print(f"  {'-'*64}")
+    for cfg in tx_configs:
+        r  = multi_result[cfg.name]
+        ia, ie = r["initial_angles"]
+        oa, oe = r["best_angles"]
+        ip = r["initial_position"]
+        op = r["final_position"]
+        rows = [
+            ("Azimuth",   f"{ia:+8.2f}°",   f"{oa:+8.2f}°",   f"{oa-ia:+8.2f}°"),
+            ("Elevation", f"{ie:+8.2f}°",   f"{oe:+8.2f}°",   f"{oe-ie:+8.2f}°"),
+            ("X (m)",     f"{ip[0]:+8.1f}", f"{op[0]:+8.1f}", f"{op[0]-ip[0]:+8.1f}"),
+            ("Y (m)",     f"{ip[1]:+8.1f}", f"{op[1]:+8.1f}", f"{op[1]-ip[1]:+8.1f}"),
+        ]
+        if "best_power_dbm" in r:
+            init_pow = r.get("initial_power_dbm", float("nan"))
+            opt_pow  = r["best_power_dbm"]
+            rows.append(("Power dBm", f"{init_pow:+8.2f}", f"{opt_pow:+8.2f}",
+                          f"{opt_pow - init_pow:+8.2f}"))
+        for k, (param, iv, ov, dv) in enumerate(rows):
+            name_col = cfg.name if k == 0 else ""
+            print(f"  {name_col:<14} {param:<10} {iv:>10}  {ov:>10}  {dv:>10}")
+        print(f"  {'-'*64}")
+    print(f"{'='*70}\n")
+
+    # ------------------------------------------------------------------
+    # Run RadioMapSolver for optimized BS configuration
+    # ------------------------------------------------------------------
+    print("Computing RadioMap for optimized BS configuration...")
+    _set_scene_optimized()
+    rm          = _run_radiomap()
+    # NaN = no propagation path → treat as 0 received power
+    rss_list_2d = [np.nan_to_num(rm.rss.numpy()[i], nan=0.0) for i in range(N)]
+
+    # ------------------------------------------------------------------
+    # Run RadioMapSolver for jammers (if provided)
+    # ------------------------------------------------------------------
+    jam_interference_map = None
+    if jam_scene is not None and jammer_configs:
+        jammers_data = multi_result["joint"].get("jammers", {})
+        active_indices = []
+        for j, jcfg in enumerate(jammer_configs):
+            if jcfg.name not in jammers_data:
+                continue
+            jd  = jammers_data[jcfg.name]
+            pos = jd["final_position"]
+            if "final_azimuth_deg" in jd and "final_elevation_deg" in jd:
+                jam_scene.get(jcfg.name).orientation = [
+                    float(np.deg2rad(jd["final_azimuth_deg"])),
+                    -float(np.deg2rad(jd["final_elevation_deg"])),
+                    0.0,
+                ]
+            jam_scene.get(jcfg.name).position = mi.Point3f(*[float(v) for v in pos])
+            if jd.get("active", True):
+                jam_scene.get(jcfg.name).power_dbm = [float(jd["final_power_dbm"])]
+                active_indices.append(j)
+            else:
+                jam_scene.get(jcfg.name).power_dbm = [-200.0]  # effectively zero
+
+        if active_indices:
+            print(f"Computing RadioMap for {len(active_indices)}/{len(jammer_configs)} active jammers...")
+            jam_solver = RadioMapSolver()
+            n_jam = max(1, len(active_indices))
+            n_tx_scene = len(tx_configs) + len(jammer_configs)
+            _max_spt = 4_294_967_295 // max(1, n_tx_scene)
+            with dr.suspend_grad():
+                jam_rm = jam_solver(
+                    jam_scene,
+                    max_depth=8,
+                    samples_per_tx=min(max(1, int(1e9) // n_jam), _max_spt),
+                    cell_size=list(map_config["cell_size"]),
+                    center=map_config["center"],
+                    orientation=[0, 0, 0],
+                    size=map_config["size"],
+                    los=True,
+                    specular_reflection=True,
+                    diffuse_reflection=True,
+                    diffraction=True,
+                    edge_diffraction=True,
+                    refraction=False,
+                    stop_threshold=None,
+                )
+            jam_rss = np.nan_to_num(jam_rm.rss.numpy(), nan=0.0)  # (J_total, H, W)
+            jam_interference_map = np.sum(jam_rss[active_indices], axis=0)  # (H, W)
+        else:
+            # All gates closed — use a zero interference map so the BS+Jammer
+            # panel still renders and greyed-out jammer positions remain visible.
+            print("All jammers inactive — rendering positions only (zero interference).")
+            H, W = grid_shape
+            jam_interference_map = np.zeros((H, W), dtype=np.float32)
+
+    has_jammers = jam_interference_map is not None
+    sinr_bs_only = _bs_sinr_field(rss_list_2d, jam_map=None)
+    sinr_bs_jam  = _bs_sinr_field(rss_list_2d, jam_map=jam_interference_map) if has_jammers else None
+
+    if has_jammers:
+        mean_jam_W  = float(np.mean(jam_interference_map))
+        mean_delta  = float(np.mean(sinr_bs_only - sinr_bs_jam))
+        print(f"[verify] jam_interference_map: mean={mean_jam_W:.3e} W  "
+              f"| mean SINR shift (BS-only − BS+Jam) = {mean_delta:+.3f} dB")
+
+    # ------------------------------------------------------------------
+    # Optional: persist raw SINR fields + masks for post-processing
+    # ------------------------------------------------------------------
+    if save_arrays_to is not None:
+        import pathlib as _pl
+        _out = _pl.Path(save_arrays_to)
+        _out.mkdir(parents=True, exist_ok=True)
+        np.save(_out / "sinr_bs_only.npy",  sinr_bs_only.astype(np.float32))
+        np.save(_out / "building_mask.npy", _building_mask)
+        np.save(_out / "outside_mask.npy",  outdoor_outside)
+        # union_inside covers all TX zones combined
+        np.save(_out / "zone_union_mask.npy", (union_inside & ~_building_mask))
+        if sinr_bs_jam is not None:
+            np.save(_out / "sinr_bs_jam.npy", sinr_bs_jam.astype(np.float32))
+
+    # ------------------------------------------------------------------
+    # Per-TX containment metrics — always report BS-only; add jam when present
+    # ------------------------------------------------------------------
+    stats = {}
+    def _fmt(v): return f"{100*v:5.1f}%" if v is not None else "  n/a "
+
+    for cfg in tx_configs:
+        r       = multi_result[cfg.name]
+        in_mask = inside_masks[cfg.name]
+
+        in_bs   = sinr_bs_only[in_mask & ~_building_mask]
+        out_bs  = sinr_bs_only[outdoor_outside]
+        rho_leak_bs = float(np.mean(out_bs >= gamma_db)) if out_bs.size else None
+        rho_hole_bs = float(np.mean(in_bs  <  gamma_db)) if in_bs.size  else None
+
+        init_params = {"azimuth": r["initial_angles"][0], "elevation": r["initial_angles"][1],
+                       "position": r["initial_position"]}
+        opt_params  = {"azimuth": r["best_angles"][0],    "elevation": r["best_angles"][1],
+                       "position": r["final_position"]}
+        if "best_power_dbm" in r:
+            init_params["power_dbm"] = r.get("initial_power_dbm", float("nan"))
+            opt_params["power_dbm"]  = r["best_power_dbm"]
+
+        entry = {
+            "initial_params":   init_params,
+            "optimized_params": opt_params,
+            "sinr_inside":      _summarize_sinr(in_bs),
+            "sinr_outside":     _summarize_sinr(out_bs),
+            "containment":      {"rho_leak": rho_leak_bs, "rho_hole": rho_hole_bs},
+            "az_history":       r.get("az_history", []),
+            "el_history":       r.get("el_history", []),
+            "power_history":    r.get("power_history", []),
+        }
+
+        if has_jammers:
+            in_jam  = sinr_bs_jam[in_mask & ~_building_mask]
+            out_jam = sinr_bs_jam[outdoor_outside]
+            rho_leak_jam = float(np.mean(out_jam >= gamma_db)) if out_jam.size else None
+            rho_hole_jam = float(np.mean(in_jam  <  gamma_db)) if in_jam.size  else None
+            entry["sinr_inside_jam"]  = _summarize_sinr(in_jam)
+            entry["sinr_outside_jam"] = _summarize_sinr(out_jam)
+            entry["containment_jam"]  = {"rho_leak": rho_leak_jam, "rho_hole": rho_hole_jam}
+
+        stats[cfg.name] = entry
+
+    # ------------------------------------------------------------------
+    # Print containment summary
+    # ------------------------------------------------------------------
+    print(f"\n{'='*70}")
+    print(f"BS-ONLY SINR CONTAINMENT  (gamma = {gamma_db:+.1f} dB)")
+    print(f"{'='*70}")
+    for cfg in tx_configs:
+        s  = stats[cfg.name]
+        c  = s["containment"]
+        si = s["sinr_inside"]
+        so = s["sinr_outside"]
+        print(f"  {cfg.name}:")
+        print(f"    rho_leak  (outside >= gamma): {_fmt(c['rho_leak'])}")
+        print(f"    rho_hole  (inside  <  gamma): {_fmt(c['rho_hole'])}")
+        if si: print(f"    SINR inside  mean / p10: {si['sinr_mean_db']:+.1f} / {si['sinr_p10_db']:+.1f} dB")
+        if so: print(f"    SINR outside mean / p10: {so['sinr_mean_db']:+.1f} / {so['sinr_p10_db']:+.1f} dB")
+        print()
+
+    if has_jammers:
+        print(f"{'='*70}")
+        print(f"BS+JAMMER SINR CONTAINMENT  (gamma = {gamma_db:+.1f} dB)")
+        print(f"{'='*70}")
+        for cfg in tx_configs:
+            s  = stats[cfg.name]
+            cj = s["containment_jam"]
+            sij = s["sinr_inside_jam"]
+            soj = s["sinr_outside_jam"]
+            print(f"  {cfg.name}:")
+            print(f"    rho_leak  (outside >= gamma): {_fmt(cj['rho_leak'])}")
+            print(f"    rho_hole  (inside  <  gamma): {_fmt(cj['rho_hole'])}")
+            if sij: print(f"    SINR inside  mean / p10: {sij['sinr_mean_db']:+.1f} / {sij['sinr_p10_db']:+.1f} dB")
+            if soj: print(f"    SINR outside mean / p10: {soj['sinr_mean_db']:+.1f} / {soj['sinr_p10_db']:+.1f} dB")
+            print()
+
+    print(f"{'='*70}\n")
+
+    jnt = multi_result.get("joint", {})
+    stats["joint"] = {
+        "loss_history":          jnt.get("loss_history", []),
+        "gamma_db":              gamma_db,
+        "jammers":               jnt.get("jammers", {}),
+        "jam_interference_used": has_jammers,
+        "sinr_bs_only_map":      sinr_bs_only,
+    }
+
+    # ------------------------------------------------------------------
+    # Plots
+    # ------------------------------------------------------------------
+    if not fig:
+        return None, stats
+
+    _step = 8  # downsample before imshow/contour — increase to speed up rendering
+    vmin, vmax = gamma_db - 20, gamma_db + 20
+    norm = TwoSlopeNorm(vmin=vmin, vcenter=gamma_db, vmax=vmax)
+    _lw_cycle = [2.0, 1.4, 1.0, 0.7]
+
+    def _draw_sinr_map(ax, sinr_field, title, show_jammers=False):
+        cx_m, cy_m = map_config["center"][0], map_config["center"][1]
+        sx_m, sy_m = map_config["size"][0],   map_config["size"][1]
+        cw, ch     = map_config["cell_size"][0], map_config["cell_size"][1]
+        x_min, x_max = cx_m - sx_m / 2, cx_m + sx_m / 2
+        y_min, y_max = cy_m - sy_m / 2, cy_m + sy_m / 2
+
+        # rss and zone_mask both store row 0 = south; origin='lower' + extent
+        # puts the image in world coordinates without any manual coordinate math.
+        im = ax.imshow(sinr_field[::_step, ::_step], cmap="RdBu_r",
+                       norm=norm, interpolation="nearest",
+                       aspect="equal", rasterized=True,
+                       origin="lower",
+                       extent=[x_min, x_max, y_min, y_max])
+
+        # Zone boundary contour — pass explicit world-coordinate X/Y so the
+        # contour aligns with the extent-based imshow regardless of map center.
+        for tx_idx, cfg in enumerate(tx_configs):
+            lw = _lw_cycle[tx_idx % len(_lw_cycle)]
+            mask_ds = inside_masks[cfg.name][::_step, ::_step].astype(float)
+            H_ds, W_ds = mask_ds.shape
+            x_coords = np.linspace(x_min + _step * cw / 2, x_max - _step * cw / 2, W_ds)
+            y_coords = np.linspace(y_min + _step * ch / 2, y_max - _step * ch / 2, H_ds)
+            # zorder 4: zone boundary stays visible on top of the solid buildings.
+            ax.contour(x_coords, y_coords, mask_ds, levels=[0.5],
+                       colors=["black"], linewidths=lw, linestyles="-", zorder=4)
+            ax.plot([], [], color="black", linestyle="-", linewidth=lw, label=cfg.name)
+
+        # Solid building footprints, drawn in world coordinates from the
+        # Shapely polygons, so no rasterization step is needed.
+        if building_polygons:
+            _draw_building_footprints(ax, building_polygons, zorder=3)
+
+        # BS and jammer markers plotted directly in world coordinates.
+        _bs_colors = ["lime", "cyan", "orange", "hotpink"]
+        for tx_idx, cfg in enumerate(tx_configs):
+            r = multi_result.get(cfg.name, {})
+            if "final_position" in r:
+                bx, by = r["final_position"][:2]
+                color = _bs_colors[tx_idx % len(_bs_colors)]
+                ax.scatter(bx, by, marker="*", color=color, s=160,
+                           edgecolors="black", linewidths=0.6, zorder=6,
+                           label=f"{cfg.name} (BS)")
+        if show_jammers and jam_scene is not None and jammer_configs:
+            jammers_data = multi_result["joint"].get("jammers", {})
+            for jcfg in jammer_configs:
+                if jcfg.name in jammers_data:
+                    jd = jammers_data[jcfg.name]
+                    jx, jy = jd["final_position"][:2]
+                    is_active = jd.get("active", True)
+                    color  = "yellow" if is_active else "grey"
+                    label  = jcfg.name if is_active else f"{jcfg.name} (off)"
+                    alpha  = 1.0 if is_active else 0.4
+                    ax.scatter(jx, jy, marker="x", color=color, s=80,
+                               linewidths=2, zorder=5, label=label, alpha=alpha)
+
+        # Auto-zoom: tight view around the union zone with a margin sized to
+        # keep all jammers (placed ~60-150 m outside the boundary) in frame.
+        rows, cols = np.where(union_inside)
+        if len(rows) > 0:
+            x_z_min = x_min + cols.min() * cw
+            x_z_max = x_min + (cols.max() + 1) * cw
+            y_z_min = y_min + rows.min() * ch
+            y_z_max = y_min + (rows.max() + 1) * ch
+            margin = max(x_z_max - x_z_min, y_z_max - y_z_min) * 0.5
+            ax.set_xlim(max(x_min, x_z_min - margin), min(x_max, x_z_max + margin))
+            ax.set_ylim(max(y_min, y_z_min - margin), min(y_max, y_z_max + margin))
+
+        ax.set_title(title, fontsize=11)
+        ax.set_xlabel("X (m)", fontsize=9)
+        ax.set_ylabel("Y (m)", fontsize=9)
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="SINR (dB)")
+        ax.legend(fontsize=8, loc="upper right")
+        return im
+
+    # ------------------------------------------------------------------
+    # Figure 1: SINR map(s) — single column (BS-only) or two columns when
+    #           jammers are present so both conditions are visible at once
+    # ------------------------------------------------------------------
+    n_map_cols = 2 if has_jammers else 1
+    fig_map, map_axes = plt.subplots(1, n_map_cols, figsize=(7 * n_map_cols, 6), squeeze=False)
+
+    _left_sinr = sinr_bs_only_ref if (sinr_bs_only_ref is not None and has_jammers) else sinr_bs_only
+    _left_title = (f"BS-only SINR (dB)  —  γ = {gamma_db:+.1f} dB"
+                   if sinr_bs_only_ref is None or not has_jammers
+                   else f"BS-only result  —  γ = {gamma_db:+.1f} dB")
+    _draw_sinr_map(map_axes[0, 0], _left_sinr, _left_title, show_jammers=False)
+    if has_jammers:
+        _draw_sinr_map(map_axes[0, 1], sinr_bs_jam,
+                       f"BS+Jammer SINR (dB)  —  γ = {gamma_db:+.1f} dB",
+                       show_jammers=True)
+
+    fig_map.tight_layout()
+
+    # ------------------------------------------------------------------
+    # Figure 2: single CDF — best-SINR inside union-of-zones vs outside
+    # ------------------------------------------------------------------
+    in_bs  = sinr_bs_only[outdoor_inside]
+    out_bs = sinr_bs_only[outdoor_outside]
+    ls_bs  = "--" if has_jammers else "-"
+
+    fig_cdf, ax_cdf = plt.subplots(1, 1, figsize=(6, 4))
+
+    def _plot_cdf(ax, vals, color, ls, label):
+        arr = np.sort(vals)
+        med = float(np.median(arr))
+        ax.plot(arr, np.arange(1, len(arr) + 1) / len(arr),
+                color=color, linewidth=1.8, linestyle=ls, label=label)
+        ax.axvline(med, color=color, linewidth=1.0, linestyle=":", alpha=0.8, zorder=5)
+        ax.annotate(f"{med:+.1f}", xy=(med, 0.5), xytext=(med, 0.55),
+                    color=color, fontsize=7, ha="center", va="bottom")
+        return med
+
+    # Horizontal reference at the 50th percentile (median)
+    ax_cdf.axhline(0.5, color="gray", linestyle=":", linewidth=0.8, alpha=0.45)
+
+    _plot_cdf(ax_cdf, in_bs,  "blue", ls_bs,
+              f"BS-only Inside  (N={in_bs.size})"  if has_jammers else f"Inside  (N={in_bs.size})")
+    _plot_cdf(ax_cdf, out_bs, "red",     ls_bs,
+              f"BS-only Outside (N={out_bs.size})" if has_jammers else f"Outside (N={out_bs.size})")
+
+    if has_jammers:
+        in_jam  = sinr_bs_jam[outdoor_inside]
+        out_jam = sinr_bs_jam[outdoor_outside]
+        _plot_cdf(ax_cdf, in_jam,  "blue", "-", f"BS+Jam Inside  (N={in_jam.size})")
+        _plot_cdf(ax_cdf, out_jam, "red",     "-", f"BS+Jam Outside (N={out_jam.size})")
+
+    ax_cdf.axvline(gamma_db, color="black", linestyle="--", linewidth=1.0, alpha=0.7,
+                   label=f"γ = {gamma_db:+.1f} dB")
+    cdf_title = "BS-only vs BS+Jammer SINR CDF" if has_jammers else "BS-only SINR CDF"
+    ax_cdf.set_title(f"{cdf_title}  (γ = {gamma_db:+.1f} dB)", fontsize=11)
+    ax_cdf.set_xlabel("Best-cell SINR (dB)"); ax_cdf.set_ylabel("CDF")
+    ax_cdf.set_xlim(gamma_db - 30, gamma_db + 30)
+    ax_cdf.legend(fontsize=8, loc="lower right"); ax_cdf.grid(True, alpha=0.3)
+    fig_cdf.tight_layout()
+    return fig_map, fig_cdf, stats
+
+
+# ---------------------------------------------------------------------------
+# Per-iteration coverage-map GIF
+# ---------------------------------------------------------------------------
+#
+# render_coverage_frame() draws one SINR map in the same visual style as
+# compare_multi_tx_performance()'s map panel (RdBu_r SINR field, zone
+# contours, building outlines, BS/jammer markers, autozoom). It is kept
+# independent from compare_multi_tx_performance() rather than refactored out
+# of it, so that function's tested output for reproducing paper results
+# can't be affected by this add-on.
+#
+# make_coverage_gif_callback() wraps it into an `on_iteration_callback` for
+# optimize_multi_tx(), and frames_to_gif() assembles the saved PNGs into an
+# animated GIF at a chosen frame rate.
+
+# Marker colors are defined once and shared by the frame renderer and the GIF
+# encoder: frames_to_gif() reserves these exact colors in its shared palette so
+# they can't drift between frames (see its docstring).
+_BS_MARKER_COLORS = ["lime", "cyan", "orange", "hotpink"]
+_JAM_ON_COLOR, _JAM_OFF_COLOR = "yellow", "grey"
+
+
+def _sinr_field_from_rss(rss_list_2d, noise_power, jam_map=None):
+    """Best-SINR-over-TX field in dB, mirroring the training loss's formula:
+    SINR_i(r) = P_BS_i / (noise + sum_{j!=i} P_BS_j + jammer power).
+    """
+    best = None
+    n = len(rss_list_2d)
+    for i in range(n):
+        p_sig = rss_list_2d[i]
+        p_int = sum(rss_list_2d[j] for j in range(n) if j != i)
+        denom = p_int + noise_power
+        if jam_map is not None:
+            denom = denom + jam_map
+        sinr_i = p_sig / denom
+        best = sinr_i if best is None else np.maximum(best, sinr_i)
+    return 10.0 * np.log10(np.maximum(best, 1e-18))
+
+
+def _draw_coverage_ax(
+    ax, sinr_field, tx_configs, inside_masks, union_inside, map_config,
+    tx_positions: dict, building_polygons=None, jam_state: "list | None" = None,
+    title: str = "", step: int = 2, norm=None,
+):
+    """Draw one SINR coverage panel. Mirrors compare_multi_tx_performance's
+    map-drawing conventions, generalised to take plain positions instead of
+    a finished `multi_result` dict so it can be called mid-optimisation.
+    """
+    import matplotlib.pyplot as plt
+
+    cx_m, cy_m = map_config["center"][0], map_config["center"][1]
+    sx_m, sy_m = map_config["size"][0],   map_config["size"][1]
+    cw, ch     = map_config["cell_size"][0], map_config["cell_size"][1]
+    x_min, x_max = cx_m - sx_m / 2, cx_m + sx_m / 2
+    y_min, y_max = cy_m - sy_m / 2, cy_m + sy_m / 2
+
+    im = ax.imshow(sinr_field[::step, ::step], cmap="coolwarm",
+                   norm=norm, interpolation="nearest",
+                   aspect="equal", rasterized=True,
+                   origin="lower",
+                   extent=[x_min, x_max, y_min, y_max])
+
+    _lw_cycle = [2.0, 1.4, 1.0, 0.7]
+    for tx_idx, cfg in enumerate(tx_configs):
+        lw = _lw_cycle[tx_idx % len(_lw_cycle)]
+        mask_ds = inside_masks[cfg.name][::step, ::step].astype(float)
+        H_ds, W_ds = mask_ds.shape
+        x_coords = np.linspace(x_min + step * cw / 2, x_max - step * cw / 2, W_ds)
+        y_coords = np.linspace(y_min + step * ch / 2, y_max - step * ch / 2, H_ds)
+        # zorder 4: zone boundary stays visible on top of the solid buildings.
+        ax.contour(x_coords, y_coords, mask_ds, levels=[0.5],
+                   colors=["black"], linewidths=lw, linestyles="-", zorder=4)
+        ax.plot([], [], color="black", linestyle="-", linewidth=lw, label=cfg.name)
+
+    if building_polygons:
+        _draw_building_footprints(ax, building_polygons, zorder=3)
+
+    for tx_idx, cfg in enumerate(tx_configs):
+        pos = tx_positions.get(cfg.name)
+        if pos is not None:
+            bx, by = pos[0], pos[1]
+            color = _BS_MARKER_COLORS[tx_idx % len(_BS_MARKER_COLORS)]
+            ax.scatter(bx, by, marker="*", color=color, s=160,
+                       edgecolors="black", linewidths=0.6, zorder=6,
+                       label=f"{cfg.name} (BS)")
+
+    if jam_state:
+        for jd in jam_state:
+            jx, jy = jd["position"][0], jd["position"][1]
+            is_active = jd.get("active", True)
+            color = _JAM_ON_COLOR if is_active else _JAM_OFF_COLOR
+            label = jd["name"] if is_active else f"{jd['name']} (off)"
+            alpha = 1.0 if is_active else 0.4
+            ax.scatter(jx, jy, marker="x", color=color, s=80,
+                       linewidths=2, zorder=5, label=label, alpha=alpha)
+
+    # Auto-zoom to the union zone, same margin heuristic as
+    # compare_multi_tx_performance so frames line up with its final figure.
+    rows, cols = np.where(union_inside)
+    if len(rows) > 0:
+        x_z_min = x_min + cols.min() * cw
+        x_z_max = x_min + (cols.max() + 1) * cw
+        y_z_min = y_min + rows.min() * ch
+        y_z_max = y_min + (rows.max() + 1) * ch
+        margin = max(x_z_max - x_z_min, y_z_max - y_z_min) * 0.5
+        ax.set_xlim(max(x_min, x_z_min - margin), min(x_max, x_z_max + margin))
+        ax.set_ylim(max(y_min, y_z_min - margin), min(y_max, y_z_max + margin))
+
+    ax.set_title(title, fontsize=11)
+    ax.set_xlabel("X (m)", fontsize=9)
+    ax.set_ylabel("Y (m)", fontsize=9)
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="SINR (dB)")
+    ax.legend(fontsize=8, loc="upper right")
+    return im
+
+
+def render_coverage_frame(
+    scene,
+    tx_configs: list,
+    tx_states: list,
+    map_config: dict,
+    zone_masks: dict,
+    iteration: int,
+    output_dir: str,
+    jam_scene=None,
+    jam_configs: "list | None" = None,
+    jam_state: "list | None" = None,
+    noise_power: float = 1e-10,
+    gamma_db: float = 0.0,
+    building_polygons: "list | None" = None,
+    samples_per_tx: int = int(2e7),
+    max_depth: int = 6,
+    cell_size=(2.0, 2.0),
+    step: int = 2,
+    dpi: int = 100,
+    loss: "float | None" = None,
+    precoding_vec=None,
+) -> str:
+    """Render and save one SINR coverage-map PNG for the optimiser's current
+    (post-step) state, in the same visual style as
+    compare_multi_tx_performance()'s map panel.
+
+    Runs its own RadioMapSolver pass(es) against `scene` (and `jam_scene`,
+    if active jammers are present), so it adds real cost per call — tune
+    `samples_per_tx`/`max_depth`/`cell_size` for speed, and call this only
+    every few iterations (see `make_coverage_gif_callback`'s `frame_every`)
+    rather than on every one for a long run.
+
+    precoding_vec : (mi.TensorXf, mi.TensorXf) or None
+        Per-TX (real, imag) precoding weights, shape (N_tx, num_tx_ant) each
+        — RadioMapSolver's own `precoding_vec` format. Pass the current
+        value from `optimize_multi_tx`'s callback (see its docstring) to
+        make the BS RadioMap pass match the training loss's SIR exactly,
+        including under `learn_precoding=True`. `None` falls back to
+        RadioMapSolver's own uniform default.
+
+    Returns the path to the saved PNG.
+    """
+    import os
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import TwoSlopeNorm
+
+    os.makedirs(output_dir, exist_ok=True)
+    n = len(tx_configs)
+
+    solver = RadioMapSolver()
+    rm = solver(
+        scene, max_depth=max_depth, samples_per_tx=samples_per_tx,
+        cell_size=list(cell_size), center=map_config["center"],
+        orientation=[0, 0, 0], size=map_config["size"],
+        los=True, specular_reflection=True, diffuse_reflection=True,
+        diffraction=True, edge_diffraction=True, refraction=False,
+        stop_threshold=None,
+        precoding_vec=precoding_vec,
+    )
+    rss_list_2d = [np.nan_to_num(rm.rss.numpy()[i], nan=0.0) for i in range(n)]
+
+    has_jammers = bool(jam_configs) and jam_scene is not None
+    jam_map = None
+    if has_jammers:
+        active_names = {jd["name"] for jd in (jam_state or []) if jd.get("active", True)}
+        if active_names:
+            jam_solver = RadioMapSolver()
+            jrm = jam_solver(
+                jam_scene, max_depth=max_depth, samples_per_tx=samples_per_tx,
+                cell_size=list(cell_size), center=map_config["center"],
+                orientation=[0, 0, 0], size=map_config["size"],
+                los=True, specular_reflection=True, diffuse_reflection=True,
+                diffraction=True, edge_diffraction=True, refraction=False,
+                stop_threshold=None,
+            )
+            jrss = jrm.rss.numpy()
+            jam_map = np.zeros_like(rss_list_2d[0])
+            for j, jcfg in enumerate(jam_configs):
+                if jcfg.name in active_names:
+                    jam_map = jam_map + np.nan_to_num(jrss[j], nan=0.0)
+
+    sinr_field = _sinr_field_from_rss(rss_list_2d, noise_power, jam_map=jam_map)
+
+    grid_shape   = next(iter(zone_masks.values())).shape
+    inside_masks = {cfg.name: (zone_masks[cfg.name] == 1.0) for cfg in tx_configs}
+    union_inside = np.zeros(grid_shape, dtype=bool)
+    for cfg in tx_configs:
+        union_inside |= inside_masks[cfg.name]
+
+    tx_positions = {
+        cfg.name: tx_states[i]["current_tx_position"][:2]
+        for i, cfg in enumerate(tx_configs)
+    }
+
+    vmin, vmax = gamma_db - 20, gamma_db + 20
+    norm = TwoSlopeNorm(vmin=vmin, vcenter=gamma_db, vmax=vmax)
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    title = f"Iteration {iteration}"
+    if loss is not None:
+        title += f"   loss={loss:.4f}"
+    _draw_coverage_ax(
+        ax, sinr_field, tx_configs, inside_masks, union_inside, map_config,
+        tx_positions, building_polygons=building_polygons,
+        jam_state=jam_state if has_jammers else None,
+        title=title, step=step, norm=norm,
+    )
+    fig.tight_layout()
+    out_path = os.path.join(output_dir, f"frame_{iteration:05d}.png")
+    fig.savefig(out_path, dpi=dpi)
+    plt.close(fig)
+    return out_path
+
+
+def make_coverage_gif_callback(
+    map_config: dict,
+    zone_masks: dict,
+    output_dir: str,
+    jam_configs: "list | None" = None,
+    frame_every: int = 1,
+    noise_power: float = 1e-10,
+    gamma_db: float = 0.0,
+    building_polygons: "list | None" = None,
+    samples_per_tx: int = int(2e7),
+    max_depth: int = 6,
+    cell_size=(2.0, 2.0),
+    step: int = 2,
+    dpi: int = 100,
+) -> callable:
+    """Build an `on_iteration_callback` for optimize_multi_tx() that renders
+    one coverage-map PNG (via render_coverage_frame) every `frame_every`
+    iterations.
+
+    Example
+    -------
+        cb = make_coverage_gif_callback(map_config, zone_masks_dict,
+                                         "gif_frames/run1", jam_configs=jam_configs,
+                                         frame_every=2)
+        result, jam_scene = optimize_multi_tx(..., on_iteration_callback=cb)
+        frames_to_gif(cb.frame_paths, "run1_progress.gif", fps=12)
+
+    The returned callback exposes the ordered list of saved frame paths as
+    `.frame_paths`, ready to pass straight to `frames_to_gif`.
+    """
+    frame_paths: list = []
+
+    def _callback(iteration, tx_states, tx_configs, jam_positions=None,
+                  jam_state=None, scene=None, jam_scene=None, loss=None,
+                  precoding_vec=None):
+        if iteration % frame_every != 0:
+            return
+        path = render_coverage_frame(
+            scene, tx_configs, tx_states, map_config, zone_masks, iteration,
+            output_dir, jam_scene=jam_scene, jam_configs=jam_configs,
+            jam_state=jam_state, noise_power=noise_power, gamma_db=gamma_db,
+            building_polygons=building_polygons, samples_per_tx=samples_per_tx,
+            max_depth=max_depth, cell_size=cell_size, step=step, dpi=dpi,
+            loss=loss, precoding_vec=precoding_vec,
+        )
+        frame_paths.append(path)
+
+    _callback.frame_paths = frame_paths
+    return _callback
+
+
+def frames_to_gif(
+    frames, output_path: str, fps: float = 10.0, loop: int = 0,
+    protected_colors: "list | None" = None,
+) -> str:
+    """Assemble PNG frames into an animated GIF at a given playback rate.
+
+    A GIF holds at most 256 colors. Left to Pillow, each frame gets its own
+    adaptive palette dominated by the SINR heatmap, so the few pixels of a
+    base-station or jammer marker get remapped to whatever palette entry is
+    nearest in that frame and the marker's color visibly shifts between
+    frames. Instead, every frame here is mapped onto ONE palette shared by
+    the whole GIF, with `protected_colors` reserved as exact entries, and no
+    dithering, so a given color renders identically in every frame.
+
+    Parameters
+    ----------
+    frames : str, os.PathLike, or list[str]
+        Either a directory of PNGs (sorted by filename, so name frames with
+        a zero-padded index) or an explicit ordered list of file paths, e.g.
+        `make_coverage_gif_callback(...).frame_paths`.
+    output_path : str
+        Destination .gif path.
+    fps : float
+        Playback rate in frames per second (converted to a per-frame
+        duration in ms, floored at 20ms/frame to stay within what most GIF
+        viewers honour).
+    loop : int
+        Number of times the GIF repeats; 0 loops forever.
+    protected_colors : list of matplotlib color specs, or None
+        Colors kept exact in the shared palette. None (default) protects the
+        coverage-frame annotation colors: the BS and jammer markers, the
+        building fill, black and white. Pass [] to disable.
+
+    Returns
+    -------
+    str : output_path, once written.
+    """
+    import os
+    from matplotlib.colors import to_rgb
+    from PIL import Image
+
+    if isinstance(frames, (str, os.PathLike)):
+        frame_dir = str(frames)
+        paths = sorted(
+            os.path.join(frame_dir, f) for f in os.listdir(frame_dir)
+            if f.lower().endswith(".png")
+        )
+    else:
+        paths = list(frames)
+
+    if not paths:
+        raise ValueError("No frames to assemble into a GIF.")
+
+    images = [Image.open(p).convert("RGB") for p in paths]
+
+    if protected_colors is None:
+        protected_colors = [*_BS_MARKER_COLORS, _JAM_ON_COLOR, _JAM_OFF_COLOR,
+                            _BUILDING_FILL_COLOR, "black", "white"]
+    protected = []
+    for c in protected_colors:
+        rgb = tuple(int(round(255 * v)) for v in to_rgb(c))
+        if rgb not in protected:
+            protected.append(rgb)
+
+    # Adaptive palette for everything else, learned from a sample of frames
+    # spread across the whole run so it covers the heatmap's full range.
+    n_adaptive = 256 - len(protected)
+    picks = sorted(set(np.linspace(0, len(images) - 1, min(16, len(images))).astype(int)))
+    montage = Image.fromarray(
+        np.concatenate([np.asarray(images[i])[::2, ::2] for i in picks], axis=0)
+    )
+    adaptive = montage.quantize(colors=n_adaptive, method=Image.Quantize.MEDIANCUT)
+    flat = list(adaptive.getpalette()[: 3 * n_adaptive])
+    for rgb in protected:
+        flat.extend(rgb)
+    flat.extend([0] * (768 - len(flat)))
+    palette_img = Image.new("P", (1, 1))
+    palette_img.putpalette(flat)
+
+    # Nearest-color mapping is deterministic per RGB value, so with a shared
+    # palette and no dithering a pixel color always lands on the same entry.
+    quantized = [im.quantize(palette=palette_img, dither=Image.Dither.NONE)
+                 for im in images]
+
+    duration_ms = max(20, int(round(1000.0 / fps)))
+    quantized[0].save(
+        output_path, format="GIF", save_all=True,
+        append_images=quantized[1:], duration=duration_ms, loop=loop,
+        optimize=False,
+    )
+    return output_path
+
+
+def plot_results_from_file(
+    run_dir: str,
+    gamma_db: float = 0.0,
+    standoff_m: float = 200.0,
+    fig: bool = True,
+    save_pdf: str = None,
+) -> tuple:
+    """Load saved experiment arrays and reproduce the SINR plots.
+
+    Expected layout under *run_dir*::
+
+        run_dir/
+          sinr_bs_only.npy      (H, W) float32 — BS-only best-SINR field in dB
+          sinr_bs_jam.npy       (H, W) float32 — BS+Jammer field in dB  [optional]
+          zone_union_mask.npy   (H, W) bool    — cells inside any coverage zone
+          building_mask.npy     (H, W) bool    — cells inside building footprints
+          results.json                         — pre-computed statistics
+        run_dir/../
+          map_config.json                      — grid geometry (center/size/cell_size)
+
+    Parameters
+    ----------
+    run_dir   : path to one experiment run (e.g. ``results/exp/boulder/circle_large_n1000``)
+    gamma_db  : SINR threshold in dB for containment metrics
+    standoff_m: distance (metres) beyond the zone's furthest XY extent that defines
+                the outer edge of the outside-region bounding square
+    fig       : if False, skip plotting and return (None, None, stats)
+    save_pdf  : if given, write both figures to a multi-page PDF at this path
+
+    Returns
+    -------
+    fig_map, fig_cdf, stats
+        Matplotlib figures and a dict with computed containment statistics.
+        When *fig* is False both figures are None.
+    """
+    import json
+    import pathlib
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
+    from matplotlib.colors import TwoSlopeNorm, CenteredNorm
+
+    run_path = pathlib.Path(run_dir)
+
+    # ------------------------------------------------------------------
+    # Load arrays
+    # ------------------------------------------------------------------
+    sinr_bs_only = np.load(run_path / "sinr_bs_only.npy")
+    zone_mask    = np.load(run_path / "zone_union_mask.npy")
+    bldg_mask    = np.load(run_path / "building_mask.npy")
+
+    jam_path = run_path / "sinr_bs_jam.npy"
+    sinr_bs_jam = np.load(jam_path) if jam_path.exists() else None
+    has_jammers = sinr_bs_jam is not None
+
+    # map_config lives one level up (scene directory)
+    map_cfg_path = run_path.parent / "map_config.json"
+    if not map_cfg_path.exists():
+        map_cfg_path = run_path / "map_config.json"
+    with open(map_cfg_path) as f:
+        map_config = json.load(f)
+
+    cx_m, cy_m = map_config["center"][0], map_config["center"][1]
+    sx_m, sy_m = map_config["size"][0],   map_config["size"][1]
+    cw,   ch   = map_config["cell_size"][0], map_config["cell_size"][1]
+    H, W = sinr_bs_only.shape
+    x_min, x_max = cx_m - sx_m / 2, cx_m + sx_m / 2
+    y_min, y_max = cy_m - sy_m / 2, cy_m + sy_m / 2
+    xs = np.linspace(x_min + cw / 2, x_max - cw / 2, W)
+    ys = np.linspace(y_min + ch / 2, y_max - ch / 2, H)
+
+    # ------------------------------------------------------------------
+    # Outside region: square whose half-size = (max zone XY extent from
+    # center) + standoff_m.  This means standoff_m is the gap between
+    # the zone's furthest point and the edge of the evaluated region.
+    # ------------------------------------------------------------------
+    Xg, Yg = np.meshgrid(xs, ys)
+    zone_bool = zone_mask.astype(bool)
+    rows, cols = np.where(zone_bool)
+    if len(rows) > 0:
+        max_extent = max(
+            float(np.abs(xs[cols] - cx_m).max()),
+            float(np.abs(ys[rows] - cy_m).max()),
+        )
+    else:
+        max_extent = 0.0
+    half_size = max_extent + standoff_m
+    bbox_mask = (np.abs(Xg - cx_m) <= half_size) & (np.abs(Yg - cy_m) <= half_size)
+
+    outdoor_inside  = zone_bool & ~bldg_mask
+    outdoor_outside = ~zone_bool & ~bldg_mask & bbox_mask
+
+    # ------------------------------------------------------------------
+    # Compute containment statistics
+    # ------------------------------------------------------------------
+    gamma = float(gamma_db)
+
+    def _stats(field_db, mask):
+        vals = field_db[mask]
+        if vals.size == 0:
+            return None
+        return {
+            "mean_db":   float(np.mean(vals)),
+            "median_db": float(np.median(vals)),
+            "p10_db":    float(np.percentile(vals, 10)),
+            "p90_db":    float(np.percentile(vals, 90)),
+        }
+
+    def _uniformity(field_db, mask):
+        """IQR-based uniformity: lower is more uniform."""
+        vals = field_db[mask]
+        if vals.size < 2:
+            return None
+        return float(np.percentile(vals, 75) - np.percentile(vals, 25))
+
+    def _containment(field_db):
+        out_vals = field_db[outdoor_outside]
+        in_vals  = field_db[outdoor_inside]
+        rho_leak = float(np.mean(out_vals >= gamma)) if out_vals.size else None
+        rho_hole = float(np.mean(in_vals  <  gamma)) if in_vals.size  else None
+        return rho_leak, rho_hole
+
+    rho_leak_bs, rho_hole_bs = _containment(sinr_bs_only)
+
+    stats = {
+        "gamma_db": gamma,
+        "standoff_m": standoff_m,
+        "bs_only": {
+            "sinr_inside":   _stats(sinr_bs_only, outdoor_inside),
+            "sinr_outside":  _stats(sinr_bs_only, outdoor_outside),
+            "rho_leak":      rho_leak_bs,
+            "rho_hole":      rho_hole_bs,
+            "uniformity_iqr_inside": _uniformity(sinr_bs_only, outdoor_inside),
+        },
+    }
+
+    if has_jammers:
+        rho_leak_jam, rho_hole_jam = _containment(sinr_bs_jam)
+        stats["with_jammers"] = {
+            "sinr_inside":   _stats(sinr_bs_jam, outdoor_inside),
+            "sinr_outside":  _stats(sinr_bs_jam, outdoor_outside),
+            "rho_leak":      rho_leak_jam,
+            "rho_hole":      rho_hole_jam,
+            "uniformity_iqr_inside": _uniformity(sinr_bs_jam, outdoor_inside),
+        }
+
+    # ------------------------------------------------------------------
+    # Print summary
+    # ------------------------------------------------------------------
+    def _fmt(v):
+        return f"{100 * v:5.1f}%" if v is not None else "  n/a "
+
+    print(f"\n{'='*65}")
+    print(f"SINR CONTAINMENT  (gamma = {gamma:+.1f} dB, standoff = {standoff_m:.0f} m)")
+    print(f"{'='*65}")
+    for label, key in [("BS-only", "bs_only"), ("BS+Jammer", "with_jammers")]:
+        if key not in stats:
+            continue
+        s = stats[key]
+        si, so = s["sinr_inside"], s["sinr_outside"]
+        print(f"  {label}:")
+        print(f"    rho_leak  (outside >= gamma): {_fmt(s['rho_leak'])}")
+        print(f"    rho_hole  (inside  <  gamma): {_fmt(s['rho_hole'])}")
+        if si:
+            print(f"    SINR inside  mean / p10 / p90: "
+                  f"{si['mean_db']:+.1f} / {si['p10_db']:+.1f} / {si['p90_db']:+.1f} dB")
+        if so:
+            print(f"    SINR outside mean / p10 / p90: "
+                  f"{so['mean_db']:+.1f} / {so['p10_db']:+.1f} / {so['p90_db']:+.1f} dB")
+        if s.get("uniformity_iqr_inside") is not None:
+            print(f"    Uniformity IQR (inside):  {s['uniformity_iqr_inside']:.2f} dB")
+        print()
+    print(f"{'='*65}\n")
+
+    if not fig:
+        return None, None, stats
+
+    # ------------------------------------------------------------------
+    # Load BS / jammer positions from results.json (opt_params key)
+    # ------------------------------------------------------------------
+    results_json_path = run_path / "results.json"
+    _bs_positions      = []   # list of [x, y]
+    _jammer_positions  = []   # list of (x, y, active:bool)
+    if results_json_path.exists():
+        with open(results_json_path) as _f:
+            _rj = json.load(_f)
+        opt = _rj.get("opt_params", {})
+        for _bd in opt.get("bs", {}).values():
+            _p = _bd.get("final_position", _bd.get("initial_position"))
+            if _p:
+                _bs_positions.append([float(_p[0]), float(_p[1])])
+        for _jd in opt.get("jammers", {}).values():
+            _p = _jd.get("final_position")
+            if _p:
+                _jammer_positions.append(
+                    (float(_p[0]), float(_p[1]), bool(_jd.get("active", True)))
+                )
+
+    # ------------------------------------------------------------------
+    # Plotting helpers
+    # ------------------------------------------------------------------
+    _step = 8
+    vmin, vmax = gamma - 20, gamma + 20
+    norm  = TwoSlopeNorm(vmin=vmin, vcenter=gamma, vmax=vmax)
+
+    def _draw_map(ax, sinr_field, title, show_jammers=False):
+        im = ax.imshow(
+            sinr_field[::_step, ::_step],
+            cmap="RdBu", norm=norm,
+            interpolation="nearest", aspect="equal", rasterized=True,
+            origin="lower", extent=[x_min, x_max, y_min, y_max],
+        )
+
+        # Downsampled coordinate axes shared by contour layers
+        zone_ds = zone_mask[::_step, ::_step].astype(float)
+        H_ds, W_ds = zone_ds.shape
+        xc = np.linspace(x_min + _step * cw / 2, x_max - _step * cw / 2, W_ds)
+        yc = np.linspace(y_min + _step * ch / 2, y_max - _step * ch / 2, H_ds)
+
+        # Zone boundary — white dashed line so it reads over the red/blue field
+        ax.contour(xc, yc, zone_ds, levels=[0.5],
+                   colors=["black"], linewidths=2.0, linestyles="-", zorder=6)
+
+        # Buildings: solid black fill + crisp outline
+        bldg_ds = bldg_mask[::_step, ::_step].astype(float)
+        ax.contourf(xc, yc, bldg_ds, levels=[0.5, 1.5],
+                    colors=["#797878"], alpha=1.0, zorder=4)
+        ax.contour(xc, yc, bldg_ds, levels=[0.5],
+                   colors=["black"], linewidths=2.0, linestyles="-", zorder=5)
+
+        # BS markers: white star with black outline
+        for bx, by in _bs_positions:
+            ax.scatter(bx, by, marker="*", s=420,
+                       color="white", edgecolors="white", linewidths=3.0,
+                       zorder=7)
+            ax.scatter(bx, by, marker="*", s=300,
+                       color="#0DD525", edgecolors="black", linewidths=1.2,
+                       zorder=8)
+
+        # Jammer markers: active = bright yellow "+" ; inactive = grey "x"
+        if show_jammers:
+            for jx, jy, active in _jammer_positions:
+                if active:
+                    ax.scatter(jx, jy, marker="+", s=200,
+                               color="white", linewidths=4.0, zorder=6)
+                    ax.scatter(jx, jy, marker="+", s=120,
+                               color="#FF0000", linewidths=2.2, zorder=7)
+                else:
+                    ax.scatter(jx, jy, marker="x", s=160,
+                               color="white", linewidths=3.5, zorder=6,
+                               alpha=0.6)
+                    ax.scatter(jx, jy, marker="x", s=80,
+                               color="#888888", linewidths=1.5, zorder=7,
+                               alpha=0.6)
+
+        # Auto-zoom around zone
+        rows, cols = np.where(zone_mask)
+        if len(rows) > 0:
+            x_z_min = x_min + cols.min() * cw
+            x_z_max = x_min + (cols.max() + 1) * cw
+            y_z_min = y_min + rows.min() * ch
+            y_z_max = y_min + (rows.max() + 1) * ch
+            margin = max(x_z_max - x_z_min, y_z_max - y_z_min) * 0.5
+            ax.set_xlim(max(x_min, x_z_min - margin), min(x_max, x_z_max + margin))
+            ax.set_ylim(max(y_min, y_z_min - margin), min(y_max, y_z_max + margin))
+
+        ax.set_title(title, fontsize=11)
+        ax.set_xlabel("X (m)", fontsize=9)
+        ax.set_ylabel("Y (m)", fontsize=9)
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="SINR (dB)")
+
+    def _draw_diff_map(ax, diff_field, title):
+        abs_max = float(np.nanpercentile(np.abs(diff_field), 98))
+        abs_max = max(abs_max, 1.0)
+        diff_norm = CenteredNorm(vcenter=0.0, halfrange=abs_max)
+
+        im = ax.imshow(
+            diff_field[::_step, ::_step],
+            cmap="RdBu", norm=diff_norm,
+            interpolation="nearest", aspect="equal", rasterized=True,
+            origin="lower", extent=[x_min, x_max, y_min, y_max],
+        )
+
+        zone_ds = zone_mask[::_step, ::_step].astype(float)
+        H_ds, W_ds = zone_ds.shape
+        xc = np.linspace(x_min + _step * cw / 2, x_max - _step * cw / 2, W_ds)
+        yc = np.linspace(y_min + _step * ch / 2, y_max - _step * ch / 2, H_ds)
+
+        ax.contour(xc, yc, zone_ds, levels=[0.5],
+                   colors=["black"], linewidths=2.0, linestyles="-", zorder=6)
+        bldg_ds = bldg_mask[::_step, ::_step].astype(float)
+        ax.contourf(xc, yc, bldg_ds, levels=[0.5, 1.5],
+                    colors=["#797878"], alpha=1.0, zorder=4)
+        ax.contour(xc, yc, bldg_ds, levels=[0.5],
+                   colors=["black"], linewidths=2.0, linestyles="-", zorder=5)
+
+        for bx, by in _bs_positions:
+            ax.scatter(bx, by, marker="*", s=420,
+                       color="white", edgecolors="white", linewidths=3.0, zorder=7)
+            ax.scatter(bx, by, marker="*", s=300,
+                       color="#0DD525", edgecolors="black", linewidths=1.2, zorder=8)
+
+        for jx, jy, active in _jammer_positions:
+            if active:
+                ax.scatter(jx, jy, marker="+", s=200,
+                           color="white", linewidths=4.0, zorder=6)
+                ax.scatter(jx, jy, marker="+", s=120,
+                           color="#FF0000", linewidths=2.2, zorder=7)
+            else:
+                ax.scatter(jx, jy, marker="x", s=160,
+                           color="white", linewidths=3.5, zorder=6, alpha=0.6)
+                ax.scatter(jx, jy, marker="x", s=80,
+                           color="#888888", linewidths=1.5, zorder=7, alpha=0.6)
+
+        rows, cols = np.where(zone_mask)
+        if len(rows) > 0:
+            x_z_min = x_min + cols.min() * cw
+            x_z_max = x_min + (cols.max() + 1) * cw
+            y_z_min = y_min + rows.min() * ch
+            y_z_max = y_min + (rows.max() + 1) * ch
+            margin = max(x_z_max - x_z_min, y_z_max - y_z_min) * 0.5
+            ax.set_xlim(max(x_min, x_z_min - margin), min(x_max, x_z_max + margin))
+            ax.set_ylim(max(y_min, y_z_min - margin), min(y_max, y_z_max + margin))
+
+        ax.set_title(title, fontsize=11)
+        ax.set_xlabel("X (m)", fontsize=9)
+        ax.set_ylabel("Y (m)", fontsize=9)
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="ΔSINR (dB)")
+
+    # ------------------------------------------------------------------
+    # Figure 1: SINR map(s)
+    # ------------------------------------------------------------------
+    n_cols = 3 if has_jammers else 1
+    fig_map, axes = plt.subplots(1, n_cols, figsize=(7 * n_cols, 6), squeeze=False)
+    _draw_map(axes[0, 0],
+              sinr_bs_only,
+              f"BS-only SINR  —  γ = {gamma:+.1f} dB",
+              show_jammers=False)
+    if has_jammers:
+        _draw_map(axes[0, 1],
+                  sinr_bs_jam,
+                  f"BS+Jammer SINR  —  γ = {gamma:+.1f} dB",
+                  show_jammers=True)
+        _draw_diff_map(axes[0, 2],
+                       sinr_bs_jam - sinr_bs_only,
+                       "Jammer degradation  (BS+Jam − BS-only)")
+    fig_map.suptitle(run_path.name, fontsize=12, y=1.01)
+    fig_map.tight_layout()
+
+    # ------------------------------------------------------------------
+    # Figure 2: CDF
+    # ------------------------------------------------------------------
+    in_bs  = sinr_bs_only[outdoor_inside]
+    out_bs = sinr_bs_only[outdoor_outside]
+    ls_bs  = "--" if has_jammers else "-"
+
+    fig_cdf, ax_cdf = plt.subplots(1, 1, figsize=(6, 4))
+
+    def _plot_cdf(ax, vals, color, ls, label):
+        arr = np.sort(vals)
+        med = float(np.median(arr))
+        ax.plot(arr, np.arange(1, len(arr) + 1) / len(arr),
+                color=color, linewidth=1.8, linestyle=ls, label=label)
+        ax.axvline(med, color=color, linewidth=1.0, linestyle=":", alpha=0.8)
+        ax.annotate(f"{med:+.1f}", xy=(med, 0.5), xytext=(med, 0.55),
+                    color=color, fontsize=7, ha="center", va="bottom")
+
+    ax_cdf.axhline(0.5, color="gray", linestyle=":", linewidth=0.8, alpha=0.45)
+    _plot_cdf(ax_cdf, in_bs,  "blue", ls_bs,
+              f"BS-only Inside  (N={in_bs.size})"  if has_jammers else f"Inside  (N={in_bs.size})")
+    _plot_cdf(ax_cdf, out_bs, "red",  ls_bs,
+              f"BS-only Outside (N={out_bs.size})" if has_jammers else f"Outside (N={out_bs.size})")
+
+    if has_jammers:
+        in_jam  = sinr_bs_jam[outdoor_inside]
+        out_jam = sinr_bs_jam[outdoor_outside]
+        _plot_cdf(ax_cdf, in_jam,  "blue", "-", f"BS+Jam Inside  (N={in_jam.size})")
+        _plot_cdf(ax_cdf, out_jam, "red",  "-", f"BS+Jam Outside (N={out_jam.size})")
+
+    ax_cdf.axvline(gamma, color="black", linestyle="--", linewidth=1.0, alpha=0.7,
+                   label=f"γ = {gamma:+.1f} dB")
+    cdf_title = "BS-only vs BS+Jammer SINR CDF" if has_jammers else "BS-only SINR CDF"
+    ax_cdf.set_title(f"{cdf_title}  (γ = {gamma:+.1f} dB)", fontsize=11)
+    ax_cdf.set_xlabel("Best-cell SINR (dB)")
+    ax_cdf.set_ylabel("CDF")
+    ax_cdf.set_xlim(gamma - 30, gamma + 30)
+    ax_cdf.legend(fontsize=8, loc="lower right")
+    ax_cdf.grid(True, alpha=0.3)
+    fig_cdf.tight_layout()
+
+    if save_pdf is not None:
+        with PdfPages(save_pdf) as pdf:
+            pdf.savefig(fig_map, bbox_inches="tight")
+            pdf.savefig(fig_cdf, bbox_inches="tight")
+        print(f"Saved plots to {save_pdf}")
+
+    return fig_map, fig_cdf, stats
+
+
+def plot_multi_shape_grid(
+    scene_dir: str,
+    gamma_db: float = 0.0,
+    standoff_m: float = 200.0,
+    save_pdf: str = None,
+    col0_col1_extra_pad: float = 0.0,
+    hspace: float = 0.06,
+    wspace: float = 0.35,
+    sinr_zone: float = 0.35,
+    bottom: float = 0.10,
+    left: float = 0.12,
+    n_ticks: int = 3,
+):
+    """
+    Build an N×3 publication figure from all shape runs under *scene_dir*.
+
+    Auto-discovers subdirectories that contain ``sinr_bs_only.npy`` and sorts
+    them alphabetically — one row per shape.
+
+    Columns: BS-only SINR (viridis) | BS+Jammer SINR (viridis) | ΔSINR (RdBu)
+    One shared viridis colorbar per row (right of col 1); one RdBu colorbar
+    per row (right of col 2).
+
+    Parameters
+    ----------
+    scene_dir  : directory containing shape subdirs + map_config.json
+    gamma_db   : SINR threshold (dB) — norm centre for viridis panels
+    standoff_m : outer-region standoff (m) — for autozoom margin
+    save_pdf   : write to PDF at this path when given
+    hspace     : row gap as a fraction of image height (not figure height).
+                 Figure height is auto-computed so each row cell == image
+                 height, preventing aspect='equal' stretching at small values.
+    wspace     : column gap as a fraction of column width. Reduce to tighten
+                 all column pairs (image↔colorbar and colorbar↔image gaps).
+    sinr_zone  : width of the SINR colorbar zone as a fraction of one image
+                 column.  Increasing this widens the gap between the first and
+                 second image (more white space around the colorbar label);
+                 decreasing it tightens that gap.  Default 0.35.
+    bottom     : figure fraction reserved below the plot area for the X tick
+                 labels and the "X (m)" supxlabel.  Reduce to pull the X label
+                 closer to the graphs; increase to push it away.  Default 0.10.
+    left       : figure fraction reserved left of the plot area for the Y tick
+                 labels and the "Y (m)" supylabel.  Same semantics as bottom.
+                 Default 0.12.
+    n_ticks    : maximum number of tick intervals on each axis.  Reduce to 2
+                 when plots are small and labels crowd; increase for larger
+                 figures.  Edge ticks are always pruned automatically.
+                 Default 3.
+    col0_col1_extra_pad : legacy parameter, no longer applied.
+
+    Returns
+    -------
+    fig : matplotlib Figure
+    """
+    import json, pathlib
+    import matplotlib.pyplot as plt
+    import matplotlib.gridspec as gridspec
+    import matplotlib.ticker as mticker
+    from matplotlib.backends.backend_pdf import PdfPages
+    from matplotlib.colors import TwoSlopeNorm, CenteredNorm
+
+    FS = 9   # axis / colorbar labels (~10 pt in IEEE two-column)
+    FS_T = 8 # tick labels
+
+    # Serif font matches typical LaTeX document fonts (Times/Computer Modern).
+    # Thin spines and ticks keep the figure light at small print sizes.
+    plt.rcParams.update({
+        "font.family":        "sans-serif",
+        "font.sans-serif":    ["Arial", "Helvetica", "DejaVu Sans"],
+        "axes.linewidth":     0.5,
+        "xtick.major.width":  0.5,
+        "ytick.major.width":  0.5,
+        "xtick.major.size":   2.5,
+        "ytick.major.size":   2.5,
+        "xtick.direction":    "in",
+        "ytick.direction":    "in",
+        "pdf.fonttype":       42,
+        "ps.fonttype":        42,
+    })
+
+    scene_path = pathlib.Path(scene_dir)
+
+    run_dirs = sorted([
+        d for d in scene_path.iterdir()
+        if d.is_dir() and (d / "sinr_bs_only.npy").exists()
+    ])
+    if not run_dirs:
+        raise FileNotFoundError(f"No run subdirs with sinr_bs_only.npy under {scene_dir}")
+
+    map_cfg_path = scene_path / "map_config.json"
+    with open(map_cfg_path) as f:
+        mc = json.load(f)
+    cx_m, cy_m = mc["center"][0], mc["center"][1]
+    sx_m, sy_m = mc["size"][0],   mc["size"][1]
+    cw,   ch   = mc["cell_size"][0], mc["cell_size"][1]
+    x_min = cx_m - sx_m / 2;  x_max = cx_m + sx_m / 2
+    y_min = cy_m - sy_m / 2;  y_max = cy_m + sy_m / 2
+
+    rows = []
+    for rd in run_dirs:
+        sinr_bs   = np.load(rd / "sinr_bs_only.npy")
+        jam_path  = rd / "sinr_bs_jam.npy"
+        sinr_jam  = np.load(jam_path) if jam_path.exists() else None
+        zone_mask = np.load(rd / "zone_union_mask.npy")
+        bldg_mask = np.load(rd / "building_mask.npy")
+
+        bs_pos, jam_pos, initial_bs_pos = [], [], []
+        bs_azimuths, initial_bs_azimuths = [], []
+        rj_path = rd / "results.json"
+        if rj_path.exists():
+            with open(rj_path) as f:
+                rj = json.load(f)
+            opt = rj.get("opt_params", {})
+            for bd in opt.get("bs", {}).values():
+                p = bd.get("final_position", bd.get("initial_position"))
+                if p:
+                    bs_pos.append((float(p[0]), float(p[1])))
+                    fa = bd.get("final_angles", bd.get("initial_angles", [0.0, 0.0]))
+                    bs_azimuths.append(float(fa[0]))
+                p0 = bd.get("initial_position")
+                if p0:
+                    initial_bs_pos.append((float(p0[0]), float(p0[1])))
+                    ia = bd.get("initial_angles", [0.0, 0.0])
+                    initial_bs_azimuths.append(float(ia[0]))
+            for jd in opt.get("jammers", {}).values():
+                p = jd.get("final_position")
+                if p:
+                    jam_pos.append((float(p[0]), float(p[1]), bool(jd.get("active", True))))
+
+        init_path = rd / "sinr_initial.npy"
+        sinr_initial = np.load(init_path) if init_path.exists() else None
+
+        rows.append(dict(
+            sinr_initial=sinr_initial,
+            sinr_bs=sinr_bs, sinr_jam=sinr_jam,
+            zone_mask=zone_mask, bldg_mask=bldg_mask,
+            bs_pos=bs_pos, jam_pos=jam_pos,
+            initial_bs_pos=initial_bs_pos,
+            bs_azimuths=bs_azimuths,
+            initial_bs_azimuths=initial_bs_azimuths,
+        ))
+
+    N = len(rows)
+    gamma = float(gamma_db)
+    sinr_norm = TwoSlopeNorm(vmin=gamma - 20, vcenter=gamma, vmax=gamma + 20)
+    _step = 8
+
+    # Layout: 6-column GridSpec per row —
+    #   [img_init | img0 | img1 | sinr_zone | img2 | cb_delta]
+    #
+    # img_init: initial (pre-optimization) BS-only SINR
+    # img0:     optimized BS-only SINR
+    # img1:     optimized BS+Jammer SINR
+    # sinr_zone: shared SINR colorbar for first 3 panels (wider than bare strip
+    #            so ticks/label never bleed into images; subdivided via nested
+    #            GridSpec)
+    # img2:     ΔSINR (jam − bs_only)
+    # cb_delta: delta colorbar (narrow, ticks overflow into right margin)
+    _CB_ZONE = sinr_zone  # SINR zone width ratio relative to one image column
+    _CB_BAR  = 0.25  # fraction of _CB_ZONE used for the actual gradient strip
+    _CB_DELT = 0.08  # delta colorbar column ratio
+
+    _FW, _L, _R, _T, _B = 7.16, left, 0.92, 0.98, bottom
+    _sum_r = 4 + _CB_ZONE + _CB_DELT
+    # GridSpec col width: unit = inner_w / (sum_ratios * (1 + (ncols-1)*wspace/ncols))
+    _img_col_w_in = (_R - _L) * _FW / (_sum_r * (1 + 5 * wspace / 6))
+    _fig_h = _img_col_w_in * (N + (N - 1) * hspace) / (_T - _B)
+    # Pre-compute a fixed label x-coord (in axes fraction) for the delta colorbar
+    # so all rows align regardless of per-row tick label widths.  Uses the
+    # worst-case 3-character tick label (e.g. "-10") as the reference width.
+    _delt_cbar_w_pt = _img_col_w_in * _CB_DELT * 72          # colorbar width in pt
+    _delt_label_x   = 1.0 + (1.8 * FS_T + 8.0) / _delt_cbar_w_pt
+
+    fig = plt.figure(figsize=(_FW, _fig_h))
+    gs = gridspec.GridSpec(
+        N, 6,
+        width_ratios=[1, 1, 1, _CB_ZONE, 1, _CB_DELT],
+        left=_L, right=_R, top=_T, bottom=_B,
+        hspace=hspace, wspace=wspace,
+    )
+
+    def _imshow(ax, field, norm, cmap):
+        return ax.imshow(
+            field[::_step, ::_step],
+            cmap=cmap, norm=norm, interpolation="nearest",
+            aspect="equal", rasterized=True, origin="lower",
+            extent=[x_min, x_max, y_min, y_max],
+        )
+
+    _arrow_len = min(sx_m, sy_m) * 0.12  # azimuth arrow length in map units
+
+    def _overlays(ax, zone_mask, bldg_mask, bs_pos, jam_pos, xc, yc, show_j,
+                  bs_azimuths=None, show_inactive_j=True):
+        zone_ds = zone_mask[::_step, ::_step].astype(float)
+        bldg_ds = bldg_mask[::_step, ::_step].astype(float)
+        ax.contour(xc, yc, zone_ds, levels=[0.5],
+                   colors=["black"], linewidths=1.0, linestyles="-", zorder=6)
+        ax.contourf(xc, yc, bldg_ds, levels=[0.5, 1.5],
+                    colors=["#797878"], alpha=1.0, zorder=4)
+        ax.contour(xc, yc, bldg_ds, levels=[0.5],
+                   colors=["black"], linewidths=1.0, linestyles="-", zorder=5)
+        _az = bs_azimuths if bs_azimuths is not None else [None] * len(bs_pos)
+        for (bx, by), az_deg in zip(bs_pos, _az):
+            ax.scatter(bx, by, marker="*", s=100, color="white",
+                       edgecolors="white", linewidths=2.0, zorder=7)
+            ax.scatter(bx, by, marker="*", s=60, color="#0DD525",
+                       edgecolors="black", linewidths=0.6, zorder=8)
+            if az_deg is not None:
+                az_rad = np.radians(az_deg)
+                dx = np.cos(az_rad) * _arrow_len
+                dy = np.sin(az_rad) * _arrow_len
+                ax.annotate("", xy=(bx + dx, by + dy), xytext=(bx, by),
+                            arrowprops=dict(arrowstyle="-|>", mutation_scale=8,
+                                           lw=1.5, color="black"), zorder=9)
+        if show_j:
+            for jx, jy, active in jam_pos:
+                if active:
+                    ax.scatter(jx, jy, marker="+", s=60, color="white",
+                               linewidths=2.2, zorder=6)
+                    ax.scatter(jx, jy, marker="+", s=35, color="#FF0000",
+                               linewidths=1.4, zorder=7)
+                elif show_inactive_j:
+                    ax.scatter(jx, jy, marker="x", s=50, color="white",
+                               linewidths=2.0, zorder=6, alpha=0.6)
+                    ax.scatter(jx, jy, marker="x", s=28, color="#888888",
+                               linewidths=1.0, zorder=7, alpha=0.6)
+
+    def _autozoom(ax, zone_mask):
+        r, c = np.where(zone_mask.astype(bool))
+        if len(r) == 0:
+            return
+        x_z0 = x_min + c.min() * cw;  x_z1 = x_min + (c.max() + 1) * cw
+        y_z0 = y_min + r.min() * ch;  y_z1 = y_min + (r.max() + 1) * ch
+        margin = max(x_z1 - x_z0, y_z1 - y_z0) * 0.5
+        ax.set_xlim(max(x_min, x_z0 - margin), min(x_max, x_z1 + margin))
+        ax.set_ylim(max(y_min, y_z0 - margin), min(y_max, y_z1 + margin))
+
+    for ri, row in enumerate(rows):
+        ds = row["sinr_bs"][::_step, ::_step]
+        H_ds, W_ds = ds.shape
+        xc = np.linspace(x_min + _step * cw / 2, x_max - _step * cw / 2, W_ds)
+        yc = np.linspace(y_min + _step * ch / 2, y_max - _step * ch / 2, H_ds)
+
+        ax_init = fig.add_subplot(gs[ri, 0])
+        ax0     = fig.add_subplot(gs[ri, 1])
+        ax1     = fig.add_subplot(gs[ri, 2])
+        # Narrow bar on the left of the SINR zone; right portion stays empty
+        # white space so ticks and label never overlap ax1 or ax2.
+        _sinr_inner = gridspec.GridSpecFromSubplotSpec(
+            1, 2,
+            subplot_spec=gs[ri, 3],
+            width_ratios=[_CB_BAR, 1 - _CB_BAR],
+            wspace=0,
+        )
+        cax_sinr = fig.add_subplot(_sinr_inner[0, 0])
+        ax2      = fig.add_subplot(gs[ri, 4])
+        cax_delt = fig.add_subplot(gs[ri, 5])
+
+        if row["sinr_initial"] is not None:
+            _imshow(ax_init, row["sinr_initial"], sinr_norm, "viridis")
+            _overlays(ax_init, row["zone_mask"], row["bldg_mask"],
+                      row["initial_bs_pos"], [], xc, yc, show_j=False,
+                      bs_azimuths=row["initial_bs_azimuths"])
+            _autozoom(ax_init, row["zone_mask"])
+        else:
+            ax_init.axis("off")
+
+        im0 = _imshow(ax0, row["sinr_bs"], sinr_norm, "viridis")
+        _overlays(ax0, row["zone_mask"], row["bldg_mask"],
+                  row["bs_pos"], row["jam_pos"], xc, yc, show_j=False,
+                  bs_azimuths=row["bs_azimuths"])
+        _autozoom(ax0, row["zone_mask"])
+
+        if row["sinr_jam"] is not None:
+            im1 = _imshow(ax1, row["sinr_jam"], sinr_norm, "viridis")
+            _overlays(ax1, row["zone_mask"], row["bldg_mask"],
+                      row["bs_pos"], row["jam_pos"], xc, yc, show_j=True,
+                      bs_azimuths=row["bs_azimuths"])
+            _autozoom(ax1, row["zone_mask"])
+        else:
+            ax1.axis("off")
+            im1 = None
+
+        if row["sinr_jam"] is not None:
+            diff = row["sinr_jam"] - row["sinr_bs"]
+            abs_max = max(float(np.nanpercentile(np.abs(diff), 98)), 1.0)
+            im2 = _imshow(ax2, diff,
+                          CenteredNorm(vcenter=0.0, halfrange=abs_max), "RdBu")
+            _overlays(ax2, row["zone_mask"], row["bldg_mask"],
+                      row["bs_pos"], row["jam_pos"], xc, yc, show_j=True,
+                      bs_azimuths=row["bs_azimuths"], show_inactive_j=False)
+            _autozoom(ax2, row["zone_mask"])
+        else:
+            ax2.axis("off")
+            im2 = None
+
+        # Shared SINR colorbar — ticks and label on the right, flowing into the
+        # empty white-space half of the SINR zone (never touching either image).
+        def _cb(cax, im, label):
+            cb = fig.colorbar(im, cax=cax)
+            cb.set_label(label, fontsize=FS_T)
+            cb.ax.tick_params(labelsize=FS_T)
+            cb.locator = mticker.MaxNLocator(nbins=5)
+            cb.update_ticks()
+            return cb
+
+        _cb(cax_sinr, im1 if im1 is not None else im0, "SINR (dB)")
+        if im2 is not None:
+            _cb(cax_delt, im2, "ΔSINR (dB)").ax.yaxis.set_label_coords(_delt_label_x, 0.5)
+        else:
+            cax_delt.set_visible(False)
+
+        _loc = mticker.MaxNLocator(n_ticks, integer=False, prune="both")
+
+        # Y-axis ticks on leftmost column only (no per-row label — handled by supylabel)
+        ax_init.tick_params(axis="y", labelsize=FS_T, length=3)
+        ax_init.yaxis.set_major_locator(_loc)
+        for ax in [ax0, ax1, ax2]:
+            ax.tick_params(axis="y", labelleft=False, length=3)
+            ax.yaxis.set_major_locator(mticker.MaxNLocator(n_ticks, integer=False, prune="both"))
+
+        # X-axis ticks on bottom row only (no per-col label — handled by supxlabel)
+        for ax in [ax_init, ax0, ax1, ax2]:
+            ax.xaxis.set_major_locator(mticker.MaxNLocator(n_ticks, integer=False, prune="both"))
+            if ri == N - 1:
+                ax.tick_params(axis="x", labelsize=FS_T, length=3)
+            else:
+                ax.tick_params(axis="x", labelbottom=False, length=3)
+
+    fig.supxlabel("X (m)", fontsize=FS)
+    fig.supylabel("Y (m)", fontsize=FS)
+
+    if save_pdf:
+        with PdfPages(save_pdf) as pdf:
+            pdf.savefig(fig, bbox_inches="tight", dpi=300)
+        print(f"Saved to {save_pdf}")
+
+    return fig
